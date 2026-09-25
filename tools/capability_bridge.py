@@ -54,6 +54,55 @@ def trusted_model_context(embedded: Any) -> dict:
             if key not in UNTRUSTED_PROVENANCE_KEYS}
 
 
+# ---------------------------------------------------------------------------
+# Context dispatch contract.
+#
+# Trusted provenance lives on CapabilityRequest.context and is delivered by the
+# capability adapters that support it. Model-supplied context travels separately
+# in params["context"] and may only be forwarded to operations whose dispatch
+# contract actually declares a ``context`` parameter; otherwise the layer raises
+# TypeError (or, where a layer takes ``**extra``, silently swallows the payload).
+#
+# This is a statement of the cross-layer interface, not of S2 internals.
+# ---------------------------------------------------------------------------
+
+# Capabilities on which no operation declares a context parameter. The S2.1
+# Blender layer takes no context on any operation and the plain layer adapter
+# forwards params verbatim, so a context kwarg is always unexpected there.
+CONTEXT_FREE_CAPABILITIES = frozenset({"blender"})
+
+# Individual operations on otherwise context-aware capabilities that declare no
+# context parameter.
+CONTEXT_FREE_OPERATIONS = frozenset({
+    ("vision", "validate_image"),
+    ("vision", "inspect"),
+})
+
+
+def operation_accepts_context(capability: str, operation: str) -> bool:
+    """Whether the dispatch contract for this operation accepts ``context``."""
+    if str(capability) in CONTEXT_FREE_CAPABILITIES:
+        return False
+    return (str(capability), str(operation)) not in CONTEXT_FREE_OPERATIONS
+
+
+def dispatch_params(capability: str, operation: str, params: dict) -> dict:
+    """Return operation params with the model context payload applied per contract.
+
+    Unrelated params are never altered. When the operation does not accept a
+    context payload the key is removed entirely rather than forwarded blindly.
+    """
+    if "context" not in params:
+        return params
+    if not isinstance(params.get("context"), dict):
+        return params
+    if operation_accepts_context(capability, operation):
+        params["context"] = trusted_model_context(params["context"])
+    else:
+        params.pop("context", None)
+    return params
+
+
 class CapabilityBridge:
     def __init__(
         self,
@@ -116,9 +165,8 @@ class CapabilityBridge:
         capability_name = str(args["capability"])
         operation = str(args["operation"])
         params = dict(args.get("params") or {})
-        embedded_context = params.get("context")
-        if isinstance(embedded_context, dict):
-            params["context"] = trusted_model_context(embedded_context)
+        if isinstance(params.get("context"), dict):
+            params = dispatch_params(capability_name, operation, params)
         request = CapabilityRequest(
             capability=capability_name,
             operation=operation,
