@@ -18,6 +18,7 @@ Transform convention: location/scale are ``[x, y, z]`` floats in Blender units;
 """
 
 import tempfile
+import threading
 from pathlib import Path
 
 from core.logging_setup import get_logger
@@ -35,7 +36,32 @@ log = get_logger("blender.capabilities")
 
 
 class BlenderCapabilityLayer:
-    """High-level Blender scene capabilities for Diablo (production track)."""
+    """High-level Blender scene capabilities for Diablo (production track).
+
+    Concurrency contract
+    --------------------
+    A layer owns exactly one session ``.blend`` file. Every mutating operation
+    is a read-modify-write of that file: the dispatch runner opens the session
+    and then saves it back to the same path. Two Blender processes doing that
+    concurrently invalidate each other's handle, and the second save fails with
+    "Cannot change old file (file saved with @)".
+
+    Operations on a layer are therefore serialized behind a per-instance
+    re-entrant lock. Concurrent callers queue rather than collide:
+
+    * operations never interleave, so no request can observe another request's
+      partially written session;
+    * only one process ever writes the session file at a time;
+    * scene state still accumulates across calls, which is what the workflow
+      layer depends on when it builds a scene over several operations.
+
+    Separate layers are independent: each owns a private ``work_dir`` and
+    session file, so two layers must not be pointed at the same ``work_dir``.
+
+    Cancellation is observed at the capability boundary, before a subprocess is
+    started. An operation that is already running is never interrupted, because
+    killing Blender mid-save is precisely what would corrupt the session.
+    """
 
     def __init__(
         self,
@@ -52,6 +78,9 @@ class BlenderCapabilityLayer:
         )
         self._work_dir.mkdir(parents=True, exist_ok=True)
         self.session_file = self._work_dir / "session.blend"
+        # Serializes the read-modify-write of session_file. Held for the whole
+        # subprocess invocation so concurrent callers queue instead of racing.
+        self._session_lock = threading.RLock()
 
     # -------------------------------------------------------------- helpers
 
@@ -74,41 +103,60 @@ class BlenderCapabilityLayer:
         return self._last_error
 
     def _run(self, operation: str, params: dict | None = None, timeout: float | None = None) -> dict:
-        request = build_request(
-            operation,
-            params,
-            session={
-                "open_file": str(self.session_file) if self.session_file.is_file() else "",
-                "save_file": str(self.session_file),
-            },
-        )
-        try:
-            result = self._runner.run(
-                request, timeout=timeout or self.timeout, scene_file=self.session_file
+        # The whole operation is serialized: build_request stats session_file to
+        # decide whether Blender opens it, and the runner then reads and rewrites
+        # it. Both must happen with exclusive access to avoid a torn session.
+        with self._session_lock:
+            request = build_request(
+                operation,
+                params,
+                session={
+                    "open_file": str(self.session_file) if self.session_file.is_file() else "",
+                    "save_file": str(self.session_file),
+                },
             )
-        except BlenderError as exc:
-            self._last_error = exc.to_dict()
-            raise
-        if not result.success:
-            exc = BlenderScriptError(
-                operation=operation,
-                message=result.error_message or "blender script failed",
-                command=None,
-                return_code=result.return_code,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                code=result.error_code or C_SCRIPT_ERROR,
-            )
-            self._last_error = exc.to_dict()
-            raise exc
-        self._last_error = None
-        return result.data if result.data is not None else {}
+            try:
+                result = self._runner.run(
+                    request, timeout=timeout or self.timeout, scene_file=self.session_file
+                )
+            except BlenderError as exc:
+                self._last_error = exc.to_dict()
+                raise
+            if not result.success:
+                exc = BlenderScriptError(
+                    operation=operation,
+                    message=result.error_message or "blender script failed",
+                    command=None,
+                    return_code=result.return_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    code=result.error_code or C_SCRIPT_ERROR,
+                )
+                self._last_error = exc.to_dict()
+                raise exc
+            self._last_error = None
+            return result.data if result.data is not None else {}
+
+    def _session_artifacts(self) -> list[Path]:
+        """The session file plus the Blender-generated backups beside it.
+
+        Blender writes a ``.blend1`` backup on every re-save of the session, so a
+        layer that performed more than one mutating operation owns those files
+        too. Anything else in the work directory belongs to the caller.
+        """
+        artifacts: list[Path] = []
+        if self.session_file.exists():
+            artifacts.append(self.session_file)
+        parent = self.session_file.parent
+        if parent.is_dir():
+            artifacts.extend(sorted(parent.glob(f"{self.session_file.name}[0-9]*")))
+        return artifacts
 
     def close(self) -> None:
-        """Release the session scratch file. Saved renders/exports are preserved."""
+        """Release the session scratch files. Saved renders/exports are preserved."""
         try:
-            if self.session_file.exists():
-                self.session_file.unlink()
+            for path in self._session_artifacts():
+                path.unlink()
         except OSError:
             pass
 
