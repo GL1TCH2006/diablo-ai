@@ -1,0 +1,880 @@
+from __future__ import annotations
+
+from config.permissions import PermissionLevel, path_is_within
+from config.settings import Settings
+from core.logging_setup import get_logger
+
+from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal
+from .registry import ToolRegistry, ToolSpec
+
+log = get_logger("tools")
+
+
+class runtime_context:
+    router = None
+    prefs = None
+
+
+def build_registry(
+    settings: Settings,
+    capability_registry=None,
+    capability_events=None,
+    event_bus=None,
+) -> ToolRegistry:
+    registry = ToolRegistry()
+    if capability_events is None:
+        capability_events = event_bus
+
+    registry.register(
+        ToolSpec(
+            name="filesystem.read_file",
+            description="Read a text file and return its contents. Restricted to allowed project roots unless confirmed.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: filesystem.read_file(kw["path"]),
+            describe=lambda args: f"Read file: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="filesystem.list_dir",
+            description="List the entries of a directory.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: filesystem.list_dir(kw["path"]),
+            describe=lambda args: f"List directory: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="filesystem.write_file",
+            description="Create or overwrite a text file with the given contents. Overwrites create a backup first.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+            required=["path", "content"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: filesystem.write_file(kw["path"], kw.get("content", ""), settings),
+            describe=lambda args: f"Write file: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="filesystem.delete_file",
+            description="Permanently delete a single file. Always requires confirmation; directories are refused.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SENSITIVE,
+            fn=lambda **kw: filesystem.delete_file(kw["path"], settings),
+            describe=lambda args: f"Delete file: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="terminal.execute",
+            description="Run a PowerShell command and return its output. Commands matching the destructive blocklist are never allowed.",
+            parameters={
+                "type": "object",
+                "properties": {"command": {"type": "string"}, "working_dir": {"type": "string"}, "timeout": {"type": "integer"}},
+                "required": ["command"],
+            },
+            required=["command"],
+            level=PermissionLevel.SENSITIVE,
+            fn=lambda **kw: terminal.run_command(kw["command"], kw.get("working_dir"), int(kw.get("timeout", 60) or 60), settings),
+            describe=lambda args: f"Run shell command: {args.get('command')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="python.run_script",
+            description=(
+                "Run a Python script and return stdout/stderr. NOT a sandbox - a script has Diablo's "
+                "privileges, so execution is gated by permissions and working-directory restrictions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"script": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}},
+                "required": ["script"],
+            },
+            required=["script"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("script")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: python_tool.run_script(kw["script"], kw.get("args"), int(kw.get("timeout", 120) or 120)),
+            describe=lambda args: f"Run Python script: {args.get('script')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="applications.open",
+            description="Open a desktop application. Whitelisted apps launch automatically; other installed apps launch after confirmation.",
+            parameters={"type": "object", "properties": {"app": {"type": "string"}}, "required": ["app"]},
+            required=["app"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if _in_whitelist(args.get("app"), settings)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: applications.open_app(kw["app"], settings),
+            describe=lambda args: f"Open application: {args.get('app')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="system.info",
+            description="Read system information: CPU usage, memory usage, and OS version.",
+            parameters={"type": "object", "properties": {"components": {"type": "array", "items": {"type": "string"}}}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: system.system_info(kw.get("components")),
+            describe=lambda args: "Read system information",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="task.info",
+            description="Read one persisted task with outcome, status, Git summary, snapshots, and change steps. Read-only.",
+            parameters={
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Canonical task ID"}},
+                "required": ["task_id"],
+            },
+            required=["task_id"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: tasks_tool.task_info(kw["task_id"], settings),
+            describe=lambda args: f"Inspect task: {args.get('task_id')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="task.list",
+            description="List persisted tasks newest first, optionally filtered by exact project and task status. Read-only.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Exact project name"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "active", "completed", "failed", "cancelled"],
+                    },
+                    "limit": {"type": "integer", "minimum": 0, "description": "Maximum recent tasks; default 20"},
+                },
+                "required": [],
+            },
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: tasks_tool.task_list(
+                project=kw.get("project", ""),
+                status=kw.get("status", ""),
+                limit=kw.get("limit", 20),
+                settings=settings,
+            ),
+            describe=lambda args: f"List tasks (project={args.get('project', '')}, status={args.get('status', '')})",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="project.info",
+            description="Analyse a project and return its profile: language, framework, entry points, dependencies, test/build/run commands, git branch.",
+            parameters={"type": "object", "properties": {"path": {"type": "string", "description": "Project root directory"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: coding_tool.project_info(kw["path"], settings),
+            describe=lambda args: f"Analyse project: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="project.files",
+            description="List files in a project, optionally filtered by filename substring or top-level folder.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string", "description": "Project root directory"},
+                    "pattern": {"type": "string", "description": "Optional filename substring filter"},
+                    "folder": {"type": "string", "description": "Optional subfolder filter"},
+                },
+                "required": ["root"],
+            },
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: coding_tool.project_files(kw["root"], kw.get("pattern", ""), kw.get("folder", ""), settings),
+            describe=lambda args: f"List project files: {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="project.grep",
+            description="Search file contents in a project with a regular expression. Returns file:line matches.",
+            parameters={
+                "type": "object",
+                "properties": {"root": {"type": "string", "description": "Project root directory"}, "pattern": {"type": "string", "description": "Regular expression"}},
+                "required": ["root", "pattern"],
+            },
+            required=["root", "pattern"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: coding_tool.project_grep(kw["root"], kw["pattern"], settings),
+            describe=lambda args: f"Grep project {args.get('root')} for {args.get('pattern')}",
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="git.status",
+            description="Show working-tree status and current branch. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_status(kw["root"]),
+            describe=lambda args: f"Git status in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.diff",
+            description="Show uncommitted changes (working tree vs HEAD). Read-only.",
+            parameters={
+                "type": "object",
+                "properties": {"root": {"type": "string"}, "stat": {"type": "boolean"}},
+                "required": ["root"],
+            },
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_diff(kw["root"], include_staged=False, stat=bool(kw.get("stat", False))),
+            describe=lambda args: f"Git diff in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.log",
+            description="Show recent commit history. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_log(kw["root"]),
+            describe=lambda args: f"Git log in {args.get('root')}",
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="code.patch_file",
+            description=(
+                "Apply a targeted, anchored patch to source files. Format per section:\n"
+                "=== <path> ===\n"
+                "replace <exact existing line to anchor on>\n"
+                "-<line you expect, optional for validation>\n"
+                "+<new line(s)>\n"
+                "Actions: replace, insert_after <anchor>, insert_before <anchor>, delete <anchor>.\n"
+                "Anchors must match exactly one line. All changes for a file apply atomically; "
+                "a backup is created before writing. Use dry_run=true to preview."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string", "description": "Patch text in Diablo anchored syntax"},
+                    "dry_run": {"type": "boolean", "description": "Validate without writing (default false)"},
+                    "workspace": {"type": "string", "description": "Root used to resolve relative paths"},
+                },
+                "required": ["patch"],
+            },
+            required=["patch"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("workspace") or ""), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: patches_tool.patch_file(kw["patch"], bool(kw.get("dry_run", False)), kw.get("workspace", ""), settings),
+            describe=lambda args: f"Patch code files ({'dry run' if args.get('dry_run') else 'apply'})",
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="git.add",
+            description="Stage files for the next commit (git add). Recoverable.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}, "all": {"type": "boolean"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_stage(kw["root"], kw.get("paths"), bool(kw.get("all", False))),
+            describe=lambda args: f"git add in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.commit",
+            description="Create a local commit with the given message (git commit -m).",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "message": {"type": "string"}}, "required": ["root", "message"]},
+            required=["root", "message"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_commit(kw["root"], kw["message"]),
+            describe=lambda args: f"git commit in {args.get('root')}: {args.get('message')[:80]}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.push",
+            description="Push commits to a remote. DISABLED by default (config [git] push). Enabling requires confirmation each time.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "remote": {"type": "string"}, "branch": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_push_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_push(kw["root"], kw.get("remote", "origin"), kw.get("branch", ""), settings),
+            describe=lambda args: f"git push in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.restore",
+            description="Discard uncommitted changes in the working tree. DISABLED by default (config [git] restore). A backup patch is created first.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}, "all": {"type": "boolean"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_restore_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_restore(kw["root"], kw.get("paths"), bool(kw.get("all", False)), settings),
+            describe=lambda args: f"git restore in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.reset",
+            description="Reset repository state (soft/mixed/hard). hard mode DISABLED by default and creates a backup patch first.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "mode": {"type": "string"}, "target": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_restore_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_reset(kw["root"], kw.get("mode", "mixed"), kw.get("target", "HEAD"), settings),
+            describe=lambda args: f"git reset --{args.get('mode', 'mixed')} in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.pull",
+            description="Fetch and merge changes from a remote branch.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "remote": {"type": "string"}, "branch": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_pull(kw["root"], kw.get("remote", "origin"), kw.get("branch", "")),
+            describe=lambda args: f"git pull in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.rebase",
+            description="Rebase the current branch onto another commit/branch. DISABLED by default; backup-first.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "onto": {"type": "string"}}, "required": ["root", "onto"]},
+            required=["root", "onto"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_restore_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_rebase(kw["root"], kw["onto"], settings),
+            describe=lambda args: f"git rebase onto {args.get('onto')} in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.fetch",
+            description="Download objects from a remote without merging. Read-only for the working tree.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "remote": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_fetch(kw["root"], kw.get("remote", "origin")),
+            describe=lambda args: f"git fetch in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.branch",
+            description="Show the current branch name. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_branch(kw["root"]),
+            describe=lambda args: f"git current branch in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.branch.list",
+            description="List all branches. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_branch_list(kw["root"]),
+            describe=lambda args: f"git list branches in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.branch.create",
+            description="Create a new branch from the current HEAD and switch to it. Gated by policy (config [git] branch_policy).",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "name": {"type": "string"}}, "required": ["root", "name"]},
+            required=["root", "name"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_branch_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_branch_create(kw["root"], kw["name"], settings),
+            describe=lambda args: f"git branch create {args.get('name')} in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.branch.switch",
+            description="Switch to an existing branch. Gated by policy (config [git] branch_policy).",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "name": {"type": "string"}}, "required": ["root", "name"]},
+            required=["root", "name"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_branch_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_branch_switch(kw["root"], kw["name"], settings),
+            describe=lambda args: f"git switch {args.get('name')} in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.snapshot",
+            description="Create a workspace snapshot (git commit, branch, status, diff) for the current task. Read-only.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "creation_reason": {"type": "string"},
+                },
+                "required": ["root", "task_id", "label"],
+            },
+            required=["root", "task_id", "label"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: git_tool.git_snapshot(
+                kw["root"], kw["task_id"], kw["label"], settings, kw.get("creation_reason", "manual")
+            ),
+            describe=lambda args: f"git snapshot {args.get('label')} for task {args.get('task_id')} in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.snapshot.list",
+            description="List all snapshots for a task. Read-only.",
+            parameters={
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+            required=["task_id"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: git_tool.git_snapshot_list(kw["task_id"], settings),
+            describe=lambda args: f"list git snapshots for task {args.get('task_id')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="git.snapshot.restore",
+            description="Restore a workspace snapshot. DISABLED by default (config [git] restore). Requires confirmation.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "snapshot_id": {"type": "string"},
+                },
+                "required": ["root", "task_id", "snapshot_id"],
+            },
+            required=["root", "task_id", "snapshot_id"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: _git_policy_level(
+                settings, settings.git_restore_policy, args.get("root")
+            ),
+            fn=lambda **kw: git_tool.git_snapshot_restore(
+                kw["root"],
+                kw["task_id"],
+                kw["snapshot_id"],
+                settings,
+                confirmer=(lambda _prompt: True) if settings.git_restore_policy == "confirm" else None,
+            ),
+            describe=lambda args: f"git snapshot restore {args.get('snapshot_id')} for task {args.get('task_id')} in {args.get('root')}",
+        )
+    )
+
+    for spec in _memory_tools(settings):
+        registry.register(spec)
+    for spec in _rules_tools(settings):
+        registry.register(spec)
+    registry.register(
+        ToolSpec(
+            name="models.status",
+            description="Show current model router state: mode, fast/strong model identity, installed Ollama models. Read-only.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: models_tool.models_status(settings),
+            describe=lambda args: "Show model router status",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="models.set_mode",
+            description=(
+                "Change the model routing mode: auto (adaptive), force8b, force14b, project "
+                "(uses project preference). Optionally set the fast/strong model names. "
+                "Persistent across sessions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"mode": {"type": "string", "enum": list(models_tool._MODES)}, "fast": {"type": "string"}, "strong": {"type": "string"}},
+                "required": ["mode"],
+            },
+            required=["mode"],
+            level=PermissionLevel.NORMAL,
+            fn=lambda **kw: models_tool.models_set_mode(kw["mode"], kw.get("fast", ""), kw.get("strong", ""), settings),
+            describe=lambda args: f"Set model mode: {args.get('mode')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.status",
+            description="Check GitHub CLI auth status. Read-only.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: gh_tool.gh_status(),
+            describe=lambda args: "Check gh auth status",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.issue_list",
+            description="List issues of the current repository. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "state": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_issue_list(kw["root"], kw.get("state", "open"), int(kw.get("limit", 20))),
+            describe=lambda args: f"List issues in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.pr_list",
+            description="List pull requests of the current repository. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "state": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_pr_list(kw["root"], kw.get("state", "open"), int(kw.get("limit", 20))),
+            describe=lambda args: f"List PRs in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.repo_view",
+            description="Show repository metadata. Read-only.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
+            required=["root"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_repo_view(kw["root"]),
+            describe=lambda args: f"View repo in {args.get('root')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.issue_create",
+            description="Create a GitHub issue. Requires confirmation; must not be used to spam.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["root", "title"]},
+            required=["root", "title"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_issue_create(kw["root"], kw["title"], kw.get("body", "")),
+            describe=lambda args: f"Create GitHub issue: {args.get('title')[:80]}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.pr_create",
+            description="Create a pull request from the current branch. Requires confirmation; never pushes commits by itself.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "title": {"type": "string"}, "head": {"type": "string"}, "base": {"type": "string"}, "body": {"type": "string"}}, "required": ["root", "title"]},
+            required=["root", "title"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_pr_create(kw["root"], kw["title"], kw.get("head", ""), kw.get("base", ""), kw.get("body", "")),
+            describe=lambda args: f"Create PR: {args.get('title')[:80]}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="gh.release_create",
+            description="Create a GitHub release for a tag. Requires confirmation.",
+            parameters={"type": "object", "properties": {"root": {"type": "string"}, "tag": {"type": "string"}, "title": {"type": "string"}}, "required": ["root", "tag"]},
+            required=["root", "tag"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: gh_tool.gh_release_create(kw["root"], kw["tag"], kw.get("title", "")),
+            describe=lambda args: f"Create release {args.get('tag')}",
+        )
+    )
+
+    if capability_registry is not None:
+        from .capability_bridge import build_capability_tool
+        registry.register(
+            build_capability_tool(
+                capability_registry,
+                events=capability_events,
+                allowed_roots=settings.allowed_roots,
+            )
+        )
+
+    log.info("registered tools: %s", ", ".join(registry.names()))
+    return registry
+
+
+def _memory_tools(settings: Settings) -> list[ToolSpec]:
+    m = memory_tool
+    return [
+        ToolSpec(
+            name="memory.remember",
+            description="Explicitly store a fact in long-term memory. Diablo never does this implicitly. Category: facts, preferences, tasks, notes, projects.",
+            parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "category": {"type": "string"}, "note": {"type": "string"}}, "required": ["key", "value"]},
+            required=["key", "value"],
+            level=PermissionLevel.NORMAL,
+            fn=lambda **kw: m.memory_remember(kw["key"], kw["value"], kw.get("category", "notes"), kw.get("note", ""), settings),
+            describe=lambda args: f"Remember: {args.get('key')}",
+        ),
+        ToolSpec(
+            name="memory.search",
+            description="Search stored memory by text, optionally in one category.",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}, "category": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
+            required=["query"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: m.memory_search(kw["query"], kw.get("category", ""), kw.get("limit", 15), settings),
+            describe=lambda args: f"Search memory for {args.get('query')}",
+        ),
+        ToolSpec(
+            name="memory.get",
+            description="Read one stored memory entry by exact key.",
+            parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
+            required=["key"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: m.memory_get(kw["key"], settings),
+            describe=lambda args: f"Get memory: {args.get('key')}",
+        ),
+        ToolSpec(
+            name="memory.update",
+            description="Update the value of an existing memory entry.",
+            parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]},
+            required=["key", "value"],
+            level=PermissionLevel.NORMAL,
+            fn=lambda **kw: m.memory_update(kw["key"], kw["value"], settings),
+            describe=lambda args: f"Update memory: {args.get('key')}",
+        ),
+        ToolSpec(
+            name="memory.delete",
+            description="Delete one memory entry by key.",
+            parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
+            required=["key"],
+            level=PermissionLevel.NORMAL,
+            fn=lambda **kw: m.memory_delete(kw["key"], settings),
+            describe=lambda args: f"Delete memory: {args.get('key')}",
+        ),
+        ToolSpec(
+            name="memory.list",
+            description="List memory keys, optionally filtered by category.",
+            parameters={"type": "object", "properties": {"category": {"type": "string"}}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: m.memory_list(kw.get("category", ""), settings),
+            describe=lambda args: "List memory",
+        ),
+        ToolSpec(
+            name="memory.categories",
+            description="List the available memory categories.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: m.memory_categories(settings),
+            describe=lambda args: "List memory categories",
+        ),
+    ]
+
+
+def _rules_tools(settings: Settings) -> list[ToolSpec]:
+    r = rules_tool
+    return [
+        ToolSpec(
+            name="rules.create",
+            description="Create a restrict-only rule (block or confirm) matched by tool name and/or content. Rules can only restrict, never broaden permissions.",
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "action": {"type": "string", "enum": ["block", "confirm"]}, "description": {"type": "string"}, "scope": {"type": "string", "enum": ["global", "project", "tool", "task"]}, "priority": {"type": "integer"}, "if_tool": {"type": "string"}, "if_content": {"type": "string"}, "reason": {"type": "string"}, "project": {"type": "string"}},
+                "required": ["name"],
+            },
+            required=["name"],
+            level=PermissionLevel.NORMAL,
+            fn=lambda **kw: r.rules_create(kw["name"], kw.get("action", "block"), kw.get("description", ""), kw.get("scope", "global"), int(kw.get("priority", 50)), kw.get("if_tool", ""), kw.get("if_content", ""), kw.get("reason", ""), kw.get("project", ""), settings),
+            describe=lambda args: f"Create rule: {args.get('name')}",
+        ),
+        ToolSpec(
+            name="rules.list",
+            description="List all rules with their state, action, and priority.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: r.rules_list(settings),
+            describe=lambda args: "List rules",
+        ),
+        ToolSpec(
+            name="rules.get",
+            description="Show one rule in detail.",
+            parameters={"type": "object", "properties": {"rule_id": {"type": "string"}}, "required": ["rule_id"]},
+            required=["rule_id"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: r.rules_get(kw["rule_id"], settings),
+            describe=lambda args: f"Get rule {args.get('rule_id')}",
+        ),
+        ToolSpec(
+            name="rules.update",
+            description="Update a rule. Only restrict rules remain enforceable.",
+            parameters={
+                "type": "object",
+                "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "action": {"type": "string"}, "description": {"type": "string"}, "priority": {"type": "integer"}, "if_tool": {"type": "string"}, "if_content": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["rule_id"],
+            },
+            required=["rule_id"],
+            level=PermissionLevel.NORMAL,
+            explicit_confirmation=True,
+            fn=lambda **kw: r.rules_update(kw["rule_id"], kw.get("name", ""), kw.get("action", ""), kw.get("description", ""), int(kw.get("priority", -1)), kw.get("if_tool", ""), kw.get("if_content", ""), kw.get("reason", ""), settings),
+            describe=lambda args: f"Update rule {args.get('rule_id')}",
+        ),
+        ToolSpec(
+            name="rules.enable",
+            description="Enable or disable a rule.",
+            parameters={"type": "object", "properties": {"rule_id": {"type": "string"}, "enabled": {"type": "boolean"}}, "required": ["rule_id"]},
+            required=["rule_id"],
+            level=PermissionLevel.NORMAL,
+            explicit_confirmation=True,
+            fn=lambda **kw: r.rules_enable(kw["rule_id"], bool(kw.get("enabled", True)), settings),
+            describe=lambda args: f"Set rule {args.get('rule_id')} enabled={args.get('enabled', True)}",
+        ),
+        ToolSpec(
+            name="rules.delete",
+            description="Delete a rule immediately.",
+            parameters={"type": "object", "properties": {"rule_id": {"type": "string"}}, "required": ["rule_id"]},
+            required=["rule_id"],
+            level=PermissionLevel.SENSITIVE,
+            explicit_confirmation=True,
+            fn=lambda **kw: r.rules_delete(kw["rule_id"], settings),
+            describe=lambda args: f"Delete rule {args.get('rule_id')}",
+        ),
+        ToolSpec(
+            name="rules.check",
+            description="Check whether a rule is currently enforced.",
+            parameters={"type": "object", "properties": {"rule_id": {"type": "string"}}, "required": ["rule_id"]},
+            required=["rule_id"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: r.rules_check(kw["rule_id"], settings),
+            describe=lambda args: f"Check rule {args.get('rule_id')}",
+        ),
+        ToolSpec(
+            name="rules.conflicts",
+            description="Detect overlapping rules that would silently override each other.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: r.rules_conflicts(settings),
+            describe=lambda args: "Check rule conflicts",
+        ),
+    ]
+
+
+def _git_policy_level(settings: Settings, policy: str, path: str) -> PermissionLevel:
+    if policy not in ("allow", "confirm"):
+        return PermissionLevel.BLOCKED
+    if not path_is_within(_p(path), settings.allowed_roots):
+        return PermissionLevel.SENSITIVE
+    if policy == "confirm":
+        return PermissionLevel.SENSITIVE
+    return PermissionLevel.NORMAL
+
+
+def _p(value: str):
+    from pathlib import Path
+    try:
+        return Path(value)
+    except TypeError:
+        return Path("")
+
+
+def _in_whitelist(app: str, settings: Settings) -> bool:
+    key = (app or "").strip().lower()
+    return key in {k.lower() for k in settings.app_whitelist} or key in {k.lower() for k in settings.app_known_paths}

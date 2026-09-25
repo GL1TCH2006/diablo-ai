@@ -1,0 +1,123 @@
+# DIABLO default configuration.
+# Values here can be overridden through environment variables / .env.
+
+[ai]
+provider = "ollama"
+
+[ollama]
+host = "http://localhost:11434"
+allow_remote = false
+preferred_models = ["qwen3:8b", "qwen3:14b", "qwen3:latest"]
+
+[project]
+workspace_root = "C:/PROJECTS"
+
+[paths]
+sessions_dir = "data/sessions"
+
+[agent]
+max_turns = 4
+max_tool_calls = 32
+max_recovery_attempts = 3
+
+[memory]
+max_conversation_turns = 20
+write_policy = "explicit"
+
+[rules]
+max_active_in_prompt = 8
+
+[tools]
+max_result_chars = 8000
+
+[context]
+max_tokens = 8000
+relevant_files = 8
+excerpt_lines = 200
+
+[debug]
+max_attempts = 3
+max_steps = 12
+
+[models]
+default_mode = "auto"              # auto | force8b | force14b | project
+fast_model = "qwen3:8b"
+strong_model = "qwen3:14b"
+complexity_threshold = 0.6
+max_attempts_before_escalate = 1
+max_escalations = 1
+
+[resources]
+check_enabled = false              # placeholder until a reliable local check exists
+
+[git]
+push = "blocked"
+restore = "blocked"
+branch = "blocked"
+
+[filesystem]
+allowed_roots = ["C:/PROJECTS"]
+
+[terminal]
+auto_allow_patterns = [
+  "git status",
+  "git diff",
+  "git log",
+  "git branch",
+  "git help",
+  "python --version",
+  "python3 --version",
+  "node --version",
+  "npm --version",
+  "pip --version",
+  "pip list",
+  "pytest",
+  "dir",
+  "ls",
+  "where",
+  "Get-ChildItem",
+  "Get-Process",
+  "Get-StartApps",
+]
+blocklist = [
+  "format",
+  "diskpart",
+  "bcdedit",
+  "shutdown",
+  "reboot",
+  "restart",
+  "deltree",
+  "rd /s",
+  "rmdir /s",
+  "remove-item -recurse",
+  "remove-item -r",
+  "del /s",
+  "del /f /s",
+  "clear-content",
+  "erase",
+  "rm -rf",
+  "rm -fr",
+  "mkfs",
+  "reg delete",
+  "cipher /w",
+  "wmic volume",
+]
+
+[apps.whitelist]
+calculator = "calc"
+notepad = "notepad"
+"file explorer" = "explorer"
+chrome = "chrome"
+edge = "msedge"
+"vs code" = "code"
+blender = "blender"
+
+[apps.known_paths]
+blender = "C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"
+"vs code" = "C:/Users/raumaan/AppData/Local/Programs/Microsoft VS Code/Code.exe"
+
+[voice]
+enabled = false
+
+[logging]
+level = "INFO"

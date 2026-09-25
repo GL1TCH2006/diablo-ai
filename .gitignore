@@ -1,0 +1,47 @@
+# --- secrets / local configuration ---------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- python bytecode / caches -------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- generated runtime data (kept out of the baseline on purpose) ---------
+# Logs, long-term memory and file backups are runtime state written by the
+# agent; only their .gitkeep placeholders are tracked.
+data/logs/
+data/memory/
+data/backups/
+# data/sessions holds TaskStore records, coding sessions and snapshots that
+# the agent writes at runtime (thousands of generated JSON files, containing
+# machine-specific absolute paths). It is regenerated on demand, so it is
+# runtime state rather than source.
+data/sessions/
+data/blender/
+# Output of `main.py --demo`; recreated by the demo itself.
+workspace/hello_world.py
+workspace/generated/
+
+# Blender scratch
+*.blend
+*.blend1
+
+# --- editor / OS noise ----------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

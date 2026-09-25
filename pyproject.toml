@@ -1,0 +1,9 @@
+[project]
+name = "diablo-ai"
+version = "0.1.0"
+description = "DIABLO - personal AI assistant and development agent (Phase 1 core)"
+requires-python = ">=3.11"
+dependencies = ["rich>=13.7", "httpx>=0.28", "Pillow>=10.0", "numpy>=1.24"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
