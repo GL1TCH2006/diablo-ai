@@ -52,6 +52,9 @@ def detect_commands(root: Path) -> ProjectCommands:
 
     files = {p.name for p in entries if p.is_file()}
 
+    # An unrecognised project has no marker; keep language empty rather than
+    # leaving it unbound so this function honours its "never raises" contract.
+    language = ""
     for marker, lang in (("pyproject.toml", "python"), ("requirements.txt", "python"), ("setup.py", "python"),
                          ("pytest.ini", "python"), ("manage.py", "python"),
                          ("package.json", "node"), ("pom.xml", "java"), ("build.gradle", "java"),
