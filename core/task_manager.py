@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from core.logging_setup import get_logger
-from core.verification import VerificationState
+from core.verification import VerificationResult, VerificationState
+from core.verification_ledger import VerificationEntry, VerificationLedger
 
 log = get_logger("task_manager")
 
@@ -157,6 +158,12 @@ class TaskManager:
     verification_detail: str = ""
     verification_evidence: dict = field(default_factory=dict)
     verification_history: list[dict] = field(default_factory=list)
+    #: Authoritative adjudication ledger (M2.12 P3). Every verification verdict
+    #: for this task is appended here first, and the scalar ``verification``
+    #: field above is set from the ledger's *adjudicated* state. The ledger is
+    #: the boundary that decides whether PASSED is legitimate; these scalars are
+    #: the existing durable projection of that decision, not a second authority.
+    ledger: VerificationLedger = field(default_factory=VerificationLedger)
     recovery_attempts: int = 0
     partial: bool = False
     failure_reason: str = ""
@@ -171,6 +178,7 @@ class TaskManager:
         self.verification_detail = ""
         self.verification_evidence = {}
         self.verification_history = []
+        self.ledger = VerificationLedger()
         self.recovery_attempts = 0
         self.partial = False
         self.failure_reason = ""
@@ -212,6 +220,48 @@ class TaskManager:
                     type(evidence).__name__,
                 )
                 self.verification_evidence = {}
+
+    def record_verification(
+        self,
+        result: VerificationResult,
+        *,
+        subject_kind=None,
+        method_kind=None,
+        trust=None,
+        legacy_kind: str | None = None,
+        step_id: str = "",
+    ) -> VerificationEntry:
+        """Adjudicate ``result`` through the ledger and apply the outcome.
+
+        This is the single funnel every verification writer goes through (M2.12
+        P3 Phase 2). The ledger is authoritative: a requested ``PASSED`` that
+        fails the invariant is downgraded here, and the scalar
+        :attr:`verification` / :attr:`verification_evidence` fields are set from
+        the *adjudicated* entry, never from the writer's request.
+
+        Unset axes are resolved from the legacy ``kind`` via
+        ``LEGACY_KIND_AXES``, so an unmigrated writer keeps its vocabulary and
+        gains the invariant for free.
+
+        Returns the appended :class:`VerificationEntry` so the caller can emit
+        the downgrade reason.
+        """
+        entry = self.ledger.record(
+            result=result,
+            subject_kind=subject_kind,
+            method_kind=method_kind,
+            trust=trust,
+            legacy_kind=legacy_kind,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            step_id=step_id,
+        )
+        self.set_verification(entry.state, entry.detail, dict(entry.evidence))
+        return entry
+
+    def verification_ledger_snapshot(self) -> dict:
+        """Bounded ledger projection for the persisted task record."""
+        return self.ledger.to_persisted_dict()
 
     def invalidate_verification(self, detail: str) -> None:
         if self.verification != VerificationState.NOT_RUN:

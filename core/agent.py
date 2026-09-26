@@ -29,6 +29,7 @@ from core.request_context import (
 )
 from core.task_manager import StepStatus, TaskState
 from core.verification import VerificationResult, VerificationState, Verifier
+from core.verification_ledger import VerificationEntry
 from coding.change_tracker import ChangeTracker
 from coding.snapshot_manager import SnapshotManager
 from memory.rule_engine import RuleEngine
@@ -305,18 +306,45 @@ class Agent:
         self._transition(TaskState.VERIFYING)
         self._emit_lifecycle("verification_started", state="verifying")
 
-    def _record_verification(self, result: VerificationResult) -> None:
-        self._tasks.set_verification(result.state, result.detail, result.evidence)
-        if result.state == VerificationState.FAILED:
-            self._emit_lifecycle("verification_failed", verification=result.state.value, detail=result.detail)
+    def _record_verification(self, result: VerificationResult, **axes) -> VerificationEntry:
+        """Adjudicate a verification result and apply it to the task.
+
+        The ledger (``TaskManager.record_verification``) is the authoritative
+        boundary: it decides whether a requested PASSED is legitimate and
+        returns the adjudicated entry. The scalar task fields are set from that
+        entry, never from the writer's request, so a writer can no longer
+        assert PASSED without valid, non-empty, trusted evidence.
+        """
+        entry = self._tasks.record_verification(result, **axes)
+        if entry.state == VerificationState.FAILED:
+            self._emit_lifecycle("verification_failed", verification=entry.state.value, detail=entry.detail)
             self._transition(TaskState.FAILED)
         else:
             self._emit_lifecycle(
                 "verification_completed",
-                verification=result.state.value,
-                detail=result.detail,
-                kind=result.kind,
+                verification=entry.state.value,
+                detail=entry.detail,
+                kind=entry.legacy_kind,
+                subject_kind=entry.subject_kind.value,
+                method_kind=entry.method_kind.value,
+                trust=entry.trust.value,
             )
+        if entry.downgraded:
+            # A writer asked for PASSED and the ledger refused. Surfaced
+            # explicitly so a silent downgrade can never hide in the logs.
+            log.info(
+                "verification downgraded: kind=%s requested=passed reason=%s",
+                entry.legacy_kind or "<none>",
+                entry.reason,
+            )
+            self._emit_lifecycle(
+                "verification_downgraded",
+                kind=entry.legacy_kind,
+                requested=VerificationState.PASSED.value,
+                adjudicated=entry.state.value,
+                reason=entry.reason,
+            )
+        return entry
 
     def _lifecycle_metadata(self) -> dict:
         tasks = self._tasks
@@ -328,6 +356,11 @@ class Agent:
             "verification_detail": getattr(tasks, "verification_detail", ""),
             "verification_evidence": dict(getattr(tasks, "verification_evidence", {}) or {}),
             "verification_history": list(getattr(tasks, "verification_history", []) or [])[-20:],
+            # Bounded ledger projection (M2.12 P3). Rides in the existing
+            # lifecycle metadata rather than a second persistence system.
+            # Read defensively for the same reason as every other field here:
+            # tests substitute partial task doubles for this object.
+            "verification_ledger": _ledger_snapshot(tasks),
             "recovery_attempts": int(getattr(tasks, "recovery_attempts", 0) or 0),
             "partial": bool(getattr(tasks, "partial", False)),
             "failure_reason": getattr(tasks, "failure_reason", ""),
@@ -1630,21 +1663,47 @@ class Agent:
             self._begin_verification()
             exists, detail = self._verifier.check_file(path)
             output_ok = self._verifier.check_output(run_out.output, "Hello World")
+            # M2.12 P3: PASSED needs real, observed evidence. Both halves of the
+            # claim are observable here, so record them rather than asserting.
+            evidence = {
+                "path": str(path),
+                "exists": exists,
+                "size": path.stat().st_size if path.is_file() else 0,
+                "expected_output": "Hello World",
+                "output_matched": output_ok,
+                "exit_code": run_out.exit_code,
+            }
             if exists and output_ok:
-                self._record_verification(VerificationResult(VerificationState.PASSED, detail, "file_and_output"))
+                self._record_verification(VerificationResult(VerificationState.PASSED, detail, "file_and_output", evidence))
                 return f"Created {path}, executed and verified. Output: Hello World"
             detail = detail if not exists else "Expected output was not found."
-            self._record_verification(VerificationResult(VerificationState.FAILED, detail, "file_and_output"))
+            self._record_verification(VerificationResult(VerificationState.FAILED, detail, "file_and_output", evidence))
             return "File was created and executed but the output could not be verified."
 
         if intent_name == "system_info":
             outcome = outcomes[0] if outcomes else None
             if outcome is None:
                 return "Could not read system information: task cancelled."
-            if outcome.success:
+            # The claim is "system information was returned", so the returned
+            # text *is* the evidence. Success alone is not evidence, so an empty
+            # observation must not be reported as PASSED.
+            observed = str(getattr(outcome, "output", "") or "").strip()
+            if outcome.success and observed:
                 self._begin_verification()
-                self._record_verification(VerificationResult(VerificationState.PASSED, "System information was returned.", "tool_observation"))
-                return f"System check: {outcome.output.strip()}"
+                self._record_verification(VerificationResult(
+                    VerificationState.PASSED,
+                    "System information was returned.",
+                    "tool_observation",
+                    {
+                        "tool": "system_info",
+                        "output_chars": len(observed),
+                        "output_excerpt": observed[:280],
+                        "exit_code": outcome.exit_code,
+                    },
+                ))
+                return f"System check: {observed}"
+            if outcome.success:
+                return "Could not read system information: the tool reported success but returned no output."
             return f"Could not read system information: {outcome.error or outcome.reason}"
 
         return "; ".join(o.display for o in outcomes) if outcomes else "Done."
@@ -1819,7 +1878,15 @@ class Agent:
             verification_state = VerificationState.UNVERIFIED
         if report.verified and verification_state == VerificationState.PASSED:
             self._begin_verification()
-            self._record_verification(VerificationResult(VerificationState.PASSED, "Debug verification passed.", "debug"))
+            # Evidence comes from the auto-verify run itself. Without it the
+            # ledger refuses PASSED, because "debug verification passed" on its
+            # own is a claim, not evidence.
+            self._record_verification(VerificationResult(
+                VerificationState.PASSED,
+                "Debug verification passed.",
+                "debug",
+                dict(getattr(report, "verification_evidence", {}) or {}),
+            ))
         elif not report.exhausted:
             self._begin_verification()
             state = VerificationState.FAILED if self._tasks.state == TaskState.FAILED else verification_state
@@ -1869,6 +1936,23 @@ class Agent:
                 self._conversation.append_assistant(reply)
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("Could not persist conversation: %s", exc)
+
+
+def _ledger_snapshot(tasks) -> dict:
+    """Bounded verification-ledger projection, tolerant of partial task doubles.
+
+    ``_lifecycle_metadata`` is called on every task sync, and tests substitute
+    lightweight stand-ins for the task object. A missing ledger must degrade to
+    an empty projection rather than break persistence.
+    """
+    snapshot = getattr(tasks, "verification_ledger_snapshot", None)
+    if not callable(snapshot):
+        return {}
+    try:
+        return snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("could not snapshot verification ledger: %s", exc)
+        return {}
 
 
 def _plan_result_summary(outcome: ExecutionOutcome) -> str:

@@ -405,20 +405,72 @@ losslessly; it simply cannot support `PASSED`.
 
 ### Migration status
 
-Phase 1 is greenfield. The 27 existing `VerificationResult` construction sites
-(`core/agent.py`, `tools/capability_bridge.py`) are **not** migrated.
-`core/verification.py`, `Agent._record_verification`,
-`TaskManager.set_verification`, the `capability_bridge` writers, `DebugLoop` and
-`_llm_loop` recovery are all untouched.
-
-Phase 2 routes writers through:
+Phase 2 routes every verification writer through the ledger:
 
 ```
-Agent._record_verification -> VerificationLedger -> TaskManager.set_verification
+Agent._record_verification -> TaskManager.record_verification -> VerificationLedger
+                             -> TaskManager.set_verification (adjudicated state)
 ```
 
-Recovery unification (`RecoveryPolicy`, `FailureObservation`) and
-`Agent.resume()` are later phases and are explicitly out of scope here.
+`TaskManager.record_verification` is the single funnel. The ledger adjudicates;
+the scalar `verification` / `verification_evidence` fields are set from the
+*adjudicated* entry, never from the writer's request, so a writer can no longer
+assert `PASSED` without valid, non-empty, trusted evidence. A downgrade is
+logged and emitted as a `verification_downgraded` lifecycle event.
+
+### Phase 2 compatibility findings, resolved
+
+**CASE A — list/tuple evidence.** `capability_bridge` used to promote any
+non-empty list/tuple evidence payload to `PASSED`, and that payload then reached
+`dict(evidence)` in `TaskManager.set_verification` and **raised**, aborting task
+persistence. The evidence contract is object-shaped by design:
+`integration/workflows.py` always builds evidence dicts and explicitly rejects a
+verification callback that supplies evidence without a boolean verdict. A bare
+sequence is therefore *malformed*, not an alternate valid shape. It is no longer
+promoted, and it is preserved under `malformed_evidence` for diagnosis instead
+of being silently coerced. Object-shaped evidence is unaffected and still
+promotes.
+
+**CASE B — empty-evidence `PASSED` writers.** Three writers requested `PASSED`
+with `evidence={}`. Real observable evidence existed nearby for all three, so it
+is now constructed rather than fabricated:
+
+| Writer | Evidence now recorded |
+| --- | --- |
+| `file_and_output` | `path`, `exists`, `size`, `expected_output`, `output_matched`, `exit_code` |
+| `tool_observation` | `tool`, `output_chars`, `output_excerpt`, `exit_code` — and `PASSED` additionally requires non-empty observed output, because a tool returning success is not itself evidence |
+| `debug` | `command`, `working_dir`, `exit_code`, `failure_signature`, `output_excerpt` from the auto-verify run |
+
+A writer with no real evidence available now stays non-`PASSED` rather than
+fabricating evidence to preserve an old verdict.
+
+### Persistence
+
+The ledger is **not** a second persistence system. `TaskManager` owns one
+in-memory ledger and projects a bounded slice into the existing
+`TaskRecord.metadata["lifecycle"]["verification_ledger"]`, alongside the
+pre-existing `verification`, `verification_detail`, `verification_evidence` and
+`verification_history` fields, all of which are unchanged and still written.
+
+Three bounds exist at three different layers, deliberately not merged:
+
+| Bound | Value | Layer |
+| --- | --- | --- |
+| `VerificationLedger.MAX_ENTRIES` | 200 | in-memory adjudication ledger, so recovery can ask what the last verdict established |
+| `VerificationLedger.PERSISTED_TAIL` | 20 | projection written into the task record, which is re-serialised on every sync |
+| `TaskManager.verification_history` | 20 | *invalidations* ("what was true before a later operation invalidated it"), not adjudications |
+
+Records written before P3 have no `verification_ledger` key and load unchanged.
+`VerificationEntry.from_dict` / `VerificationLedger.from_dict` are total: a
+truncated, hand-edited or older projection degrades field-by-field instead of
+raising, unreadable entries are skipped and counted in `dropped`, and a stored
+`PASSED` that no longer satisfies the invariant is loaded as `UNVERIFIED` with
+the original record retained for audit.
+
+### Still out of scope
+
+`DebugLoop` planning/dedup, `_llm_loop` recovery structure, `Agent.resume()`,
+`RecoveryPolicy` and `FailureObservation` are untouched by Phase 2.
 
 ---
 
@@ -426,6 +478,7 @@ Recovery unification (`RecoveryPolicy`, `FailureObservation`) and
 
 * S1 invariants: `tests/test_cross_layer_contracts.py`
 * P3 Phase 1 ledger schema: `tests/test_verification_ledger.py`
+* P3 Phase 2 writer migration: `tests/test_p3_verification_migration.py`
 * Pre-existing boundary coverage, unchanged:
   `tests/test_capability_provenance.py` (identity/provenance),
   `tests/test_capability_context_contract.py` (context propagation),

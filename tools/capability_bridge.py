@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -341,12 +342,29 @@ class CapabilityBridge:
                 "capability_evidence",
                 self._json_safe({"evidence": data.get("evidence")}),
             )
-        if data.get("verified") is True and self._valid_evidence(data.get("evidence")):
+        raw_evidence = data.get("evidence")
+        if data.get("verified") is True and not isinstance(raw_evidence, Mapping) and raw_evidence is not None:
+            # M2.12 P3: the evidence contract is object-shaped by design
+            # (integration/workflows.py builds dicts and rejects a callback that
+            # supplies evidence without a boolean verdict). A bare list/tuple/
+            # string is malformed, not an alternate valid shape, so it is not
+            # promoted to PASSED. The payload is still preserved for diagnosis.
+            return VerificationResult(
+                VerificationState.UNVERIFIED,
+                "Capability reported a malformed evidence contract; evidence must be an object.",
+                "capability_execution",
+                self._json_safe({
+                    "capability": capability,
+                    "operation": operation,
+                    "malformed_evidence": raw_evidence,
+                }),
+            )
+        if data.get("verified") is True and self._valid_evidence(raw_evidence):
             return VerificationResult(
                 VerificationState.PASSED,
                 "Capability returned an explicit verification contract.",
                 "capability_evidence",
-                self._json_safe(data["evidence"]),
+                self._json_safe(raw_evidence),
             )
         return VerificationResult(
             VerificationState.UNVERIFIED,
@@ -446,7 +464,11 @@ class CapabilityBridge:
 
     @staticmethod
     def _valid_evidence(value: Any) -> bool:
-        return isinstance(value, (dict, list, tuple)) and bool(value)
+        # Mapping-only since M2.12 P3. The evidence contract is object-shaped;
+        # a bare sequence carries no defined semantics and cannot be persisted
+        # as `verification_evidence`. Kept as a method so the contract stays in
+        # one place.
+        return isinstance(value, Mapping) and bool(value)
 
 
 def build_capability_tool(

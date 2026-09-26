@@ -187,13 +187,22 @@ class EvidenceTrust(str, Enum):
         No defined evidence semantics: empty/default verification, free text, a
         bare narration string, or a source the ledger cannot place.
     ``CLAIMED``
-        Self-reported success that the ledger cannot independently confirm: a
-        model asserting it finished, or a capability reporting
-        ``verified=True`` about itself. A claim may be recorded, never believed.
+        Self-reported success the ledger cannot independently confirm: a model
+        asserting it finished, or any assertion whose supporting evidence is
+        itself only asserted. A claim may be recorded, never believed.
     ``OBSERVED``
         Established by an independent observation the ledger can name and check:
-        a filesystem probe, a process exit code, an image decode, a capability
-        evidence contract. This is the only level that may support ``PASSED``.
+        a filesystem probe, a process exit code, an image decode, or a declared
+        evidence contract that is object-shaped and substantive (the
+        ``capability_evidence`` contract). This is the only level that may
+        support ``PASSED``.
+
+    Note the distinction from Phase 1's first draft, which listed "a capability
+    reporting ``verified=True`` about itself" under ``CLAIMED``. Phase 2 settled
+    this against the real architecture: a capability evidence contract that
+    carries a substantive, object-shaped, non-contradictory payload is a
+    *declared contract* and is ``OBSERVED``, while a bare or malformed payload
+    has no defined semantics and is rejected outright rather than believed.
     """
 
     UNTRUSTED = "untrusted"
@@ -258,6 +267,14 @@ def _coerce_ex(value: Any, kind: type[Enum], fallback: Enum) -> tuple[Any, bool]
 def _coerce(value: Any, kind: type[Enum], fallback: Enum) -> Any:
     """Best-effort coercion to an enum member. Never raises."""
     return _coerce_ex(value, kind, fallback)[0]
+
+
+def _safe_int(value: Any, fallback: int) -> int:
+    """Coerce to int, tolerating malformed persisted data."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _is_substantive(value: Any) -> bool:
@@ -480,24 +497,37 @@ class VerificationEntry:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "VerificationEntry":
-        """Rebuild an entry from :meth:`to_dict` output, preserving adjudication."""
+        """Rebuild an entry from :meth:`to_dict` output, preserving adjudication.
+
+        Total by design: persisted data may be truncated, hand-edited or written
+        by an older schema, so every field degrades to its safe default instead
+        of raising. A malformed record must never abort loading a task, and must
+        never be able to manufacture a PASSED.
+        """
+        if not isinstance(data, Mapping):
+            return cls(
+                state=VerificationState.UNVERIFIED,
+                reason=f"unreadable verification entry of type {type(data).__name__}",
+            )
+        evidence = data.get("evidence")
+        requested = data.get("requested_state")
         return cls(
             state=_coerce(data.get("state"), VerificationState, VerificationState.UNVERIFIED),
             subject_kind=_coerce(data.get("subject_kind"), VerificationSubject, VerificationSubject.UNKNOWN),
             method_kind=_coerce(data.get("method_kind"), VerificationMethod, VerificationMethod.NONE),
             trust=_coerce(data.get("trust"), EvidenceTrust, EvidenceTrust.UNTRUSTED),
             detail=str(data.get("detail") or ""),
-            evidence=dict(data.get("evidence") or {}),
+            evidence=dict(evidence) if isinstance(evidence, Mapping) else {},
             legacy_kind=str(data.get("legacy_kind") or ""),
-            requested_state=_coerce(data["requested_state"], VerificationState, VerificationState.UNVERIFIED)
-            if data.get("requested_state")
+            requested_state=_coerce(requested, VerificationState, VerificationState.UNVERIFIED)
+            if requested
             else None,
             reason=str(data.get("reason") or ""),
             task_id=str(data.get("task_id") or ""),
             run_id=str(data.get("run_id") or ""),
             request_id=str(data.get("request_id") or ""),
             step_id=str(data.get("step_id") or ""),
-            seq=int(data.get("seq", -1)),
+            seq=_safe_int(data.get("seq"), -1),
             recorded_at=str(data.get("recorded_at") or ""),
         )
 
@@ -577,6 +607,25 @@ class VerificationLedger:
     #: Upper bound on retained entries. Mirrors the bounded-history habit in
     #: ``TaskManager.invalidate_verification`` (``[-20:]``) at a larger scale.
     MAX_ENTRIES = 200
+
+    #: Upper bound on the slice written into a persisted task record.
+    #:
+    #: This is a *different layer* from :attr:`MAX_ENTRIES` and from
+    #: ``TaskManager.verification_history``, and the two are deliberately not
+    #: merged:
+    #:
+    #: * :attr:`MAX_ENTRIES` bounds the **in-memory adjudication ledger** - every
+    #:   verdict ever requested for this task, kept so recovery can ask "what
+    #:   did the last verification actually establish?".
+    #: * :attr:`PERSISTED_TAIL` bounds the **persisted projection** written into
+    #:   ``TaskRecord.metadata["lifecycle"]``. Records are re-serialised on every
+    #:   ``_sync_task_metadata`` call, so this stays small on purpose.
+    #: * ``TaskManager.verification_history`` is a third thing again: it records
+    #:   *invalidations* ("what was true before a later operation invalidated
+    #:   it?"), not adjudications.
+    #:
+    #: All three are bounded, so no layer can grow without limit.
+    PERSISTED_TAIL = 20
 
     def __init__(self, max_entries: int | None = None) -> None:
         limit = self.MAX_ENTRIES if max_entries is None else int(max_entries)
@@ -712,10 +761,58 @@ class VerificationLedger:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "VerificationLedger":
-        """Rebuild a ledger from :meth:`to_dict` output."""
-        ledger = cls(max_entries=int(data.get("max_entries") or cls.MAX_ENTRIES))
-        for raw in data.get("entries") or ():
-            ledger.append(VerificationEntry.from_dict(raw))
-        ledger.dropped = int(data.get("dropped") or 0)
-        ledger._next_seq = max(ledger._next_seq, int(data.get("next_seq") or 0))
+        """Rebuild a ledger from :meth:`to_dict` output.
+
+        Total by design. Anything unreadable is skipped rather than raised, so a
+        corrupt or older persisted projection cannot stop a task from loading.
+        Skipped entries are not silently lost: the reconstructed ledger reports
+        them through :attr:`dropped`.
+        """
+        if not isinstance(data, Mapping):
+            return cls()
+        limit = _safe_int(data.get("max_entries"), cls.MAX_ENTRIES)
+        ledger = cls(max_entries=limit if limit > 0 else cls.MAX_ENTRIES)
+        raw_entries = data.get("entries")
+        if isinstance(raw_entries, Mapping) or not isinstance(raw_entries, (list, tuple)):
+            raw_entries = ()
+        skipped = 0
+        for raw in raw_entries:
+            if not isinstance(raw, Mapping):
+                skipped += 1
+                continue
+            entry = VerificationEntry.from_dict(raw)
+            try:
+                ledger.append(entry)
+            except VerificationLedgerError as exc:
+                # A persisted PASSED that no longer satisfies the invariant must
+                # not be trusted on load. Keep the record for audit, but never as
+                # a PASSED: fail closed rather than refuse to load the task.
+                ledger.append(
+                    replace(
+                        entry,
+                        state=VerificationState.UNVERIFIED,
+                        reason=f"persisted entry failed the PASSED invariant on load: {exc}",
+                    )
+                )
+        ledger.dropped = _safe_int(data.get("dropped"), 0) + skipped
+        ledger._next_seq = max(ledger._next_seq, _safe_int(data.get("next_seq"), 0))
         return ledger
+
+    def to_persisted_dict(self, limit: int | None = None) -> dict[str, Any]:
+        """Bounded projection for storage inside an existing task record.
+
+        Carries only the newest ``limit`` (default :attr:`PERSISTED_TAIL`)
+        entries plus the counters needed to show that truncation happened. The
+        oldest entries stay in memory; this is a projection, not a second store.
+        """
+        keep = self.PERSISTED_TAIL if limit is None else max(0, int(limit))
+        tail = self._entries[-keep:] if keep else []
+        return {
+            "schema": "verification_ledger/1",
+            "max_entries": self._max_entries,
+            "persisted_tail": keep,
+            "next_seq": self._next_seq,
+            "dropped": self.dropped,
+            "entry_count": len(self._entries),
+            "entries": [entry.to_dict() for entry in tail],
+        }

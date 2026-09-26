@@ -58,7 +58,12 @@ def test_set_verification_rejects_non_mapping_evidence_without_raising():
 
 
 def test_capability_list_evidence_crash_is_reachable_and_now_survivable():
-    """Regression: the real bridge used to emit list evidence that crashed here."""
+    """Regression: the real bridge used to emit list evidence that crashed here.
+
+    P3 Phase 2 additionally fixed this at the source, so the bridge no longer
+    emits a bare list at all. The payload is still preserved for diagnosis and
+    must not be promoted to PASSED, and persisting it must not raise.
+    """
     from integration.contracts import (
         CapabilityRegistry,
         CapabilityRequest,
@@ -78,7 +83,11 @@ def test_capability_list_evidence_crash_is_reachable_and_now_survivable():
         result, CapabilityRequest(capability="mock", operation="execute")
     )
     assert verification is not None
+    # A non-mapping evidence contract is malformed, not a PASSED verdict.
+    assert verification.state == VerificationState.UNVERIFIED
+    assert verification.evidence["malformed_evidence"] == [1, 2, 3]
+
     tasks = TaskManager()
     # Must not raise: this is the exact path that aborted persistence.
     tasks.set_verification(verification.state, verification.detail, verification.evidence)
-    assert tasks.verification_evidence == {}
+    assert tasks.verification_evidence["malformed_evidence"] == [1, 2, 3]

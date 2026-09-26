@@ -32,6 +32,10 @@ class DebugReport:
     exhausted: str = ""
     verification_state: str = "unverified"
     cancelled: bool = False
+    #: M2.12 P3: observed evidence for the auto-verify run. Empty when no
+    #: independent verification command ran, which is exactly why a debug
+    #: PASSED must never be claimed from ``verified`` alone.
+    verification_evidence: dict = field(default_factory=dict)
 
     def to_context(self) -> str:
         lines = [f"Issue: {self.issue}", f"Root cause: {self.root_cause}"]
@@ -115,6 +119,7 @@ class DebugLoop:
             report.verified = False
             report.verification_state = "unverified"
             report.final_message = "Verification cancelled."
+            report.verification_evidence = {"command": command, "cancelled": True}
             self._observe("terminal.execute", args, outcome)
             return report
         has_failure, sig = self._verify.check_failure(outcome.output or outcome.error or "")
@@ -125,6 +130,16 @@ class DebugLoop:
             signature=sig,
             detail=(outcome.output or outcome.error or "")[:300],
         ))
+        # The auto-verify run is a real observation: record the command, the exit
+        # code and the failure signature so a PASSED verdict is evidence-backed
+        # rather than a bare assertion that verification "passed".
+        report.verification_evidence = {
+            "command": command,
+            "working_dir": workdir,
+            "exit_code": getattr(outcome, "exit_code", None),
+            "failure_signature": sig,
+            "output_excerpt": str(outcome.output or outcome.error or "")[:280],
+        }
         self._observe("terminal.execute", args, outcome)
         if ok:
             report.verified = True
