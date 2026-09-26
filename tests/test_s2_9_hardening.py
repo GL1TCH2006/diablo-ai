@@ -698,7 +698,11 @@ class TestBoundedOutput:
         )
         out_file = tmp_path / "result.json"
         runner = BlenderRunner(exe=sys.executable, max_stream_chars=1000)
-        cmd = [sys.executable, "-c", noisy, "pid", "req", str(out_file), "0"]
+        # The child's extra write target must be an absolute path inside tmp_path.
+        # A bare "0" is a non-empty (truthy) string, so the child would resolve it
+        # against the CWD and drop a stray file named "0" in the repository root.
+        child_side_effect = tmp_path / "child_side_effect.txt"
+        cmd = [sys.executable, "-c", noisy, "pid", "req", str(out_file), str(child_side_effect)]
         out_file.write_text(json.dumps(
             {"success": True, "operation": "inspect_scene", "data": {},
              "error": None, "request_id": "r"}), encoding="utf-8")
