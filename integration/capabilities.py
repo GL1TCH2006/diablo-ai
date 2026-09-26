@@ -115,10 +115,22 @@ class BlenderVisionIntegration:
         )
 
     def _context(self, context: dict | None, operation: str, request_id: str) -> dict:
+        """Build the context this operation hands to Vision.
+
+        ``request_id`` is the integration's own per-call correlation id, produced
+        by :meth:`_start` for the ``IntegrationResult`` envelope. It is published
+        only as ``s2_internal_request_id``.
+
+        The trusted request identity is owned by S1, which pins it onto
+        ``CapabilityRequest.context`` before dispatch. S2 must never author or
+        replace that value, so an incoming ``request_id`` is carried through
+        untouched and the internal id is kept in its own field. ``run_id`` and
+        ``task_id`` are likewise left exactly as the caller supplied them.
+        """
         value = dict(context or {})
         value.setdefault("source", "blender_vision_integration")
         value["integration_operation"] = operation
-        value["request_id"] = request_id
+        value["s2_internal_request_id"] = request_id
         return value
 
     def _start(self, operation: str) -> tuple[str, float]:

@@ -394,7 +394,10 @@ def test_context_is_correlated_to_vision_request(tmp_path):
     assert context["scene"] == "demo"
     assert context["source"] == "blender_vision_integration"
     assert context["integration_operation"] == "inspect_render"
-    assert context["request_id"] == result.request_id
+    # S2 never authors the trusted request identity; its own per-call id is
+    # published separately so diagnostics keep a handle without shadowing it.
+    assert context["s2_internal_request_id"] == result.request_id
+    assert "request_id" not in context
 
 
 def test_injected_layers_are_not_closed_by_integration(tmp_path):
@@ -539,11 +542,15 @@ S1_CONTEXT = {"source": "s1_core", "run_id": "run-42", "task_id": "task-7"}
 
 
 def _bv_request(operation="inspect_render", params=None, context=None, request_id="req-s23"):
+    ctx = dict(S1_CONTEXT if context is None else context)
+    # Mirror the S1 capability bridge, which pins the trusted request id onto
+    # the request context before dispatch.
+    ctx.setdefault("request_id", request_id)
     return CapabilityRequest(
         capability="blender_vision",
         operation=operation,
         params=dict(params or {}),
-        context=dict(S1_CONTEXT if context is None else context),
+        context=ctx,
         task_id="task-7",
         request_id=request_id,
     )
@@ -634,10 +641,12 @@ def test_s23_request_id_preserved_and_internal_correlation_kept(tmp_path):
     # S1 identity is what the caller correlates on
     assert result.request_id == "req-s23"
     assert result.task_id == "task-7"
-    # S2.3 still stamps its own internal request id alongside the S1 context
+    # The trusted S1 request id reaches the backend unchanged, and S2.3 keeps
+    # its own per-call id in a separate field rather than replacing it.
     context = seen["inspect_render"]
-    assert context["request_id"]
-    assert context["request_id"] != "req-s23"
+    assert context["request_id"] == "req-s23"
+    assert context["s2_internal_request_id"]
+    assert context["s2_internal_request_id"] != "req-s23"
     assert context["integration_operation"] == "inspect_render"
     assert context["run_id"] == "run-42"
     assert context["task_id"] == "task-7"
@@ -658,12 +667,13 @@ def test_s23_integration_operation_still_stamped(tmp_path):
 
     context = seen["inspect_render"]
     assert context["integration_operation"] == "verify_render"
-    assert context["request_id"]
+    assert context["request_id"] == "req-s23"
+    assert context["s2_internal_request_id"]
     assert context["source"] == "s1_core"
 
 
 def test_s23_internal_request_id_is_unique_per_call(tmp_path):
-    """Each S2.3 call keeps its own correlation id."""
+    """Each S2.3 call keeps its own correlation id, separate from the S1 id."""
     seen = {}
     integration = BlenderVisionIntegration(
         blender=FakeBlender(tmp_path / "blender"),
@@ -673,11 +683,16 @@ def test_s23_internal_request_id_is_unique_per_call(tmp_path):
     target = _write_png(tmp_path / "render.png")
 
     adapter.execute(_bv_request("inspect_render", {"path": str(target)}, request_id="req-1"))
-    first = seen["inspect_render"]["request_id"]
+    first = seen["inspect_render"]["s2_internal_request_id"]
+    first_trusted = seen["inspect_render"]["request_id"]
     adapter.execute(_bv_request("inspect_render", {"path": str(target)}, request_id="req-2"))
-    second = seen["inspect_render"]["request_id"]
+    second = seen["inspect_render"]["s2_internal_request_id"]
+    second_trusted = seen["inspect_render"]["request_id"]
 
     assert first != second
+    # the trusted id tracks the request, not the call
+    assert first_trusted == "req-1"
+    assert second_trusted == "req-2"
 
 
 def test_s23_context_reaches_vision(tmp_path):
@@ -748,7 +763,11 @@ def test_s23_missing_context_is_tolerated():
 
     assert result.status is CapabilityStatus.SUCCESS
     assert result.request_id == "req-empty"
-    assert integration.calls[0]["context"] == {}
+    # The adapter forwards the merged context verbatim and never invents a
+    # request identity of its own. (s2_internal_request_id is added by the real
+    # integration, which this recording stub stands in for.)
+    seen = integration.calls[0]["context"]
+    assert "request_id" not in seen
 
 
 def test_s23_adapter_stores_no_per_request_state():
