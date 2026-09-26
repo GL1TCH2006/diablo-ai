@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 import time
 from pathlib import Path
 
@@ -15,7 +14,12 @@ from core.events import EventBus
 from core.executor import ExecutionOutcome, Executor
 from core.logging_setup import get_logger
 from core.planner import ExecutionPlan, PlanValidationError, Planner
-from core.task_manager import StepStatus, TaskManager, TaskState
+from core.request_context import (
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    BoundedRequestGate,
+    RequestContext,
+)
+from core.task_manager import StepStatus, TaskState
 from core.verification import VerificationResult, VerificationState, Verifier
 from coding.change_tracker import ChangeTracker
 from coding.snapshot_manager import SnapshotManager
@@ -67,14 +71,13 @@ class Agent:
             event_context=self._event_payload,
         )
         self._verifier = Verifier()
-        self._tasks = TaskManager()
         self._messages: list[dict] = []
-        self._request_lock = threading.RLock()
-        self._active_cancellation_token: CancellationToken | object | None = None
+        self._max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
+        self._request_gate = BoundedRequestGate(self._max_concurrent_requests)
+        self._request_context = RequestContext()
         self._task_store = TaskStore(settings.sessions_dir)
         self._change_tracker = ChangeTracker(settings.sessions_dir)
         self._snapshot_manager = SnapshotManager(settings.sessions_dir)
-        self._pending_goal = ""
         self._rules_store = RuleStore(settings.memory_dir / "rules.json")
         self._rules_engine = RuleEngine(self._rules_store, project=self._project.name if self._project else "")
         permissions.rule_engine = self._rules_engine
@@ -85,15 +88,116 @@ class Agent:
             if callable(attach_task_history):
                 attach_task_history(ProjectTaskHistory(self._task_store, settings.workspace_root))
         self._router = self._build_router()
-        self._router_verify_ok = True
-        self._escalations_used = 0
-        self._offline_fallback_used = False
-        self._last_model = None
         from tools import runtime_context
         runtime_context.router = self._router
         runtime_context.prefs = self._preferences
-        self._recovered_task_ids = []
         self._reconcile_interrupted_tasks()
+
+    # ------------------------------------------------------------------
+    # M2.12 P1 — request-scoped state
+    #
+    # Request state lives on RequestContext. The names below are thin,
+    # backwards-compatible accessors onto the *active* context, kept because
+    # the UI and existing tests read and write them directly. They are
+    # accessors only: no request state is stored on the Agent instance.
+    # ------------------------------------------------------------------
+
+    @property
+    def request_context(self) -> RequestContext:
+        """The active (most recent) request context.
+
+        Retained after ``respond()`` returns so post-request inspection keeps
+        working exactly as before. Not an execution input for a future
+        scheduler, which will pass each context explicitly.
+        """
+        context = getattr(self, "_request_context", None)
+        if context is None:
+            context = RequestContext()
+            self._request_context = context
+        return context
+
+    @property
+    def max_concurrent_requests(self) -> int:
+        """Configured request admission limit. P1 default is 1 (single-flight)."""
+        return int(getattr(self, "_max_concurrent_requests", DEFAULT_MAX_CONCURRENT_REQUESTS))
+
+    @property
+    def request_gate(self) -> BoundedRequestGate:
+        return self._request_gate
+
+    # -- legacy aliases onto the active RequestContext -----------------
+
+    @property
+    def _tasks(self):
+        return self.request_context.tasks
+
+    @_tasks.setter
+    def _tasks(self, value) -> None:
+        self.request_context.tasks = value
+
+    @property
+    def _active_cancellation_token(self):
+        return self.request_context.cancellation_token
+
+    @_active_cancellation_token.setter
+    def _active_cancellation_token(self, value) -> None:
+        self.request_context.cancellation_token = value
+
+    @property
+    def _router_verify_ok(self) -> bool:
+        return self.request_context.router_verify_ok
+
+    @_router_verify_ok.setter
+    def _router_verify_ok(self, value: bool) -> None:
+        self.request_context.router_verify_ok = bool(value)
+
+    @property
+    def _escalations_used(self) -> int:
+        return self.request_context.escalations_used
+
+    @_escalations_used.setter
+    def _escalations_used(self, value: int) -> None:
+        self.request_context.escalations_used = int(value)
+
+    @property
+    def _offline_fallback_used(self) -> bool:
+        return self.request_context.offline_fallback_used
+
+    @_offline_fallback_used.setter
+    def _offline_fallback_used(self, value: bool) -> None:
+        self.request_context.offline_fallback_used = bool(value)
+
+    @property
+    def _pending_goal(self) -> str:
+        return self.request_context.pending_goal
+
+    @_pending_goal.setter
+    def _pending_goal(self, value: str) -> None:
+        self.request_context.pending_goal = "" if value is None else str(value)
+
+    @property
+    def _recovered_task_ids(self) -> list[str]:
+        return self.request_context.recovered_task_ids
+
+    @_recovered_task_ids.setter
+    def _recovered_task_ids(self, value) -> None:
+        self.request_context.recovered_task_ids = list(value or [])
+
+    @property
+    def _terminal_event_emitted(self) -> bool:
+        return self.request_context.terminal_event_emitted
+
+    @_terminal_event_emitted.setter
+    def _terminal_event_emitted(self, value: bool) -> None:
+        self.request_context.terminal_event_emitted = bool(value)
+
+    @property
+    def _last_model(self):
+        return self.request_context.last_model
+
+    @_last_model.setter
+    def _last_model(self, value) -> None:
+        self.request_context.last_model = value
 
     def _build_router(self):
         from ai.model_router import ModelRouter
@@ -1039,15 +1143,41 @@ class Agent:
         return GREETING
 
     def respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
-        lock = getattr(self, "_request_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._request_lock = lock
-        with lock:
+        """Handle one user request inside its own RequestContext.
+
+        Admission is governed by :class:`BoundedRequestGate`. P1 ships with
+        ``max_concurrent_requests = 1``, so requests are still handled one at a
+        time; the gate exists so a later task can raise the limit without
+        redesigning the request state.
+
+        The gate guards genuinely *shared* Agent state — the change tracker's
+        single active session, the conversation transcript,
+        ``PermissionManager.last_decision`` and the ``tools.runtime_context``
+        singleton. Request state itself is per-context.
+        """
+        gate = getattr(self, "_request_gate", None)
+        if gate is None:
+            gate = BoundedRequestGate(self.max_concurrent_requests)
+            self._request_gate = gate
+        with gate:
             return self._respond(user_input, cancellation_token)
+
+    def _begin_request_context(self) -> RequestContext:
+        """Install a fresh RequestContext for the request about to run.
+
+        Any recovery ids discovered while reconciling interrupted tasks are
+        carried over from the previous context and drained there, so they are
+        still reported exactly once by the next request.
+        """
+        previous = self.request_context
+        context = RequestContext()
+        context.inherit_pending_recoveries(previous)
+        self._request_context = context
+        return context
 
     def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
         user_input = (user_input or "").strip()
+        self._begin_request_context()
         self._active_cancellation_token = cancellation_token
         self._terminal_event_emitted = False
         self._router_verify_ok = True
