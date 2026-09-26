@@ -41,14 +41,14 @@ If S2 needs an internal correlation id it MUST be named
 identifiers MUST NOT share a field name, because `request_id` is
 S1-authoritative end to end.
 
-### Known S2 gap that S2.9 MUST close
+### Known S2 gap that S2.9 MUST close — **CLOSED (envelope correlation)**
 
-`blender/protocol.py` and `vision/protocol.py` currently mint their **own**
-`request_id` when the caller supplies none, and the S2 layer adapters
+`blender/protocol.py` and `vision/protocol.py` used to mint their **own**
+`request_id` when the caller supplied none, and the S2 layer adapters
 (`integration/contracts.py::_LayerAdapter._dispatch`) call the layer operation
-with `params` only — they do not forward the trusted S1 `request_id`.
+with `params` only — they did not forward the trusted S1 `request_id`.
 
-Consequence, verified empirically at ratification:
+Consequence, verified empirically at ratification (state **before** the fix):
 
 | Identifier | Value | Owner |
 | --- | --- | --- |
@@ -57,19 +57,41 @@ Consequence, verified empirically at ratification:
 | `request_id` on the Blender wire envelope | `6ce5924d0667484ba15a2ab5e22c8f50` | S2, **divergent** |
 
 The ratified invariant (`CapabilityResult.request_id == trusted S1 request_id`)
-therefore **already holds**. The remaining defect is narrower: the trusted
-request id is not *visible to the S2 backend* for direct `blender.*` /
-`vision.*` operations, so backend-side correlation currently uses a
-divergent id.
+therefore **already holds**. The defect was narrower: the trusted request id was
+not *visible to the S2 backend* for direct `blender.*` / `vision.*` operations,
+so backend-side correlation used a divergent id.
 
-S2.9 obligations:
+#### Status: closed
 
-* forward the trusted S1 `request_id` into the S2 layer and onto the backend
-  envelope, so the backend observes the same id S1 owns; and
-* if a separate S2-internal correlation id is still wanted, name it
-  `s2_internal_request_id` and never `request_id`.
+The forwarding obligation is implemented. `request_id` on the Blender and Vision
+wire envelopes is now the S1-authoritative id on every path — success, failure,
+cancellation and unavailable. The mechanism:
 
-This gap is S2-owned. S1 does not change S2 code to close it.
+* `BlenderCapabilityLayer` and `VisionCapabilityLayer` expose a re-entrant,
+  thread-local `request_correlation(request_id, context)` scope, and pass the
+  trusted id into `build_request(request_id=...)`. `VisionCapabilityLayer`
+  additionally falls back to `context["request_id"]`, since its public
+  operations already take a `context` payload.
+* `_LayerAdapter.execute` and `BlenderVisionCapabilityAdapter.execute` enter that
+  scope around the layer call, so the adapter contract itself carries the id
+  without changing any operation params.
+* A layer with no `request_correlation` hook is unaffected.
+* `blender/protocol.py::build_request` and `vision/protocol.py::build_request`
+  keep minting an id when no trusted id is in scope. That fallback is retained as
+  an internal diagnostic for direct (non-S1) callers; it is never authoritative,
+  because `CapabilityResult.from_value` assigns identity from the request.
+
+The same field name is used on the wire, which is intentional: `request_id` is
+S1-authoritative end to end. The `s2_internal_request_id` rule above continues
+to govern any *separate* S2-internal correlation id.
+
+Verified by `tests/test_s2_wire_correlation.py` (behavioural, at the real
+protocol/backend boundary via a spy runner and a spy vision backend) and against
+a real `blender.exe` background process, which echoes the trusted id back.
+
+This closes the envelope-correlation obligation only. The remaining S2.9
+obligations — subprocess hardening, cancellation supervision, output limits, temp
+cleanup and error redesign — are **NOT STARTED**.
 
 ---
 

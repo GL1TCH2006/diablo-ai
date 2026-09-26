@@ -19,6 +19,7 @@ Transform convention: location/scale are ``[x, y, z]`` floats in Blender units;
 
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from core.logging_setup import get_logger
@@ -81,6 +82,10 @@ class BlenderCapabilityLayer:
         # Serializes the read-modify-write of session_file. Held for the whole
         # subprocess invocation so concurrent callers queue instead of racing.
         self._session_lock = threading.RLock()
+        # Trusted S1 request identity for the calls currently in flight on this
+        # thread. Thread-local so concurrent requests never observe each other's
+        # correlation.
+        self._correlation = threading.local()
 
     # -------------------------------------------------------------- helpers
 
@@ -102,14 +107,36 @@ class BlenderCapabilityLayer:
         """Most recent error as JSON-safe dict, or None after a success."""
         return self._last_error
 
+    @contextmanager
+    def request_correlation(self, request_id: str = "", context: dict | None = None):
+        """Bind the trusted S1 request identity for the calls made inside.
+
+        S1 owns ``request_id``. The capability adapter enters this scope around
+        the layer call so the Blender wire envelope carries that same id instead
+        of an unrelated one minted here. The scope is thread-local, re-entrant
+        and always restored, so it cannot leak across concurrent requests.
+        """
+        previous = getattr(self._correlation, "value", None)
+        self._correlation.value = {
+            "request_id": str(request_id or ""),
+            "context": dict(context or {}),
+        }
+        try:
+            yield self
+        finally:
+            self._correlation.value = previous
+
     def _run(self, operation: str, params: dict | None = None, timeout: float | None = None) -> dict:
         # The whole operation is serialized: build_request stats session_file to
         # decide whether Blender opens it, and the runner then reads and rewrites
         # it. Both must happen with exclusive access to avoid a torn session.
         with self._session_lock:
+            correlation = getattr(self._correlation, "value", None) or {}
+            trusted_request_id = str(correlation.get("request_id") or "")
             request = build_request(
                 operation,
                 params,
+                request_id=trusted_request_id or None,
                 session={
                     "open_file": str(self.session_file) if self.session_file.is_file() else "",
                     "save_file": str(self.session_file),

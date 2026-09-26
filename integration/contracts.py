@@ -11,6 +11,7 @@ import inspect
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Protocol
@@ -581,6 +582,23 @@ class _LayerAdapter:
         method = getattr(self.layer, operation)
         return method(**dict(params))
 
+    @contextmanager
+    def _correlation_scope(self, request: CapabilityRequest):
+        """Bind the trusted S1 request identity on the layer for this call.
+
+        S1 owns ``request_id`` (see the ratified cross-layer contract). Layers
+        that expose ``request_correlation`` use it to put that same id on their
+        wire envelope, so the Blender/Vision backend observes the id S1 owns
+        rather than one the protocol layer minted for itself. Layers without
+        the hook are unaffected.
+        """
+        scope = getattr(self.layer, "request_correlation", None)
+        if not callable(scope):
+            yield self.layer
+            return
+        with scope(request.request_id, request.context):
+            yield self.layer
+
     @staticmethod
     def _status_for_exception(exc: BaseException) -> CapabilityStatus:
         code = str(getattr(exc, "code", "")).lower()
@@ -601,7 +619,9 @@ class _LayerAdapter:
         if not self.can_execute(request.operation):
             return CapabilityResult.failure(request, CapabilityStatus.INVALID_REQUEST, f"unsupported operation: {request.operation}")
         try:
-            return CapabilityResult.from_value(self._dispatch(request.operation, request.params), request, time.perf_counter())
+            with self._correlation_scope(request):
+                value = self._dispatch(request.operation, request.params)
+            return CapabilityResult.from_value(value, request, time.perf_counter())
         except PermissionError as exc:
             return CapabilityResult.failure(request, CapabilityStatus.PERMISSION_REQUIRED, str(exc) or type(exc).__name__)
         except CapabilityCancellationError:
@@ -692,7 +712,8 @@ class BlenderVisionCapabilityAdapter(_LayerAdapter):
         if not self.can_execute(request.operation):
             return CapabilityResult.failure(request, CapabilityStatus.INVALID_REQUEST, f"unsupported operation: {request.operation}")
         try:
-            value = self._dispatch_request(request)
+            with self._correlation_scope(request):
+                value = self._dispatch_request(request)
         except BlenderVisionError as exc:
             status = CapabilityStatus.UNAVAILABLE if "unavailable" in exc.code else CapabilityStatus.FAILURE
             return CapabilityResult.failure(request, status, exc.message, code=exc.code)

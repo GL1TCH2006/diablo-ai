@@ -6,6 +6,8 @@ Provides a clean interface for the rest of Diablo to consume vision
 functionality without knowing about backends directly.
 """
 
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,41 @@ class VisionCapabilityLayer:
     def __init__(self, preferred_backend: str | None = None) -> None:
         self.preferred_backend = preferred_backend
         self._last_error: dict | None = None
+        # Trusted S1 request identity for the calls currently in flight on this
+        # thread. Thread-local so concurrent requests never observe each other's
+        # correlation.
+        self._correlation = threading.local()
+
+    @contextmanager
+    def request_correlation(self, request_id: str = "", context: dict | None = None):
+        """Bind the trusted S1 request identity for the calls made inside.
+
+        S1 owns ``request_id``. The capability adapter enters this scope around
+        the layer call so the Vision wire envelope carries that same id instead
+        of an unrelated one minted here. The scope is thread-local, re-entrant
+        and always restored.
+        """
+        previous = getattr(self._correlation, "value", None)
+        self._correlation.value = {
+            "request_id": str(request_id or ""),
+            "context": dict(context or {}),
+        }
+        try:
+            yield self
+        finally:
+            self._correlation.value = previous
+
+    def _trusted_request_id(self, context: dict | None) -> str:
+        """The S1-owned request id for this call, or '' when there is none.
+
+        Prefers the adapter-bound correlation and falls back to the request
+        context, which is how a direct (non-adapter) caller supplies it.
+        """
+        correlation = getattr(self._correlation, "value", None) or {}
+        trusted = str(correlation.get("request_id") or "")
+        if trusted:
+            return trusted
+        return str((context or {}).get("request_id") or "")
 
     @property
     def available_backends(self) -> list[dict[str, Any]]:
@@ -77,7 +114,8 @@ class VisionCapabilityLayer:
 
     def _run(self, operation: str, image_path: str, params: dict | None = None, context: dict | None = None) -> dict:
         """Execute a vision operation with error handling."""
-        request = build_request(operation, image_path, params, context)
+        request = build_request(operation, image_path, params, context,
+                                request_id=self._trusted_request_id(context) or None)
         validated_request = VisionRequest.from_dict(request)
 
         backend = self._select_backend(operation)
