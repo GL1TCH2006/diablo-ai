@@ -590,13 +590,32 @@ class Agent:
         scratch = getattr(self._settings, "scratch_dir", "")
         return self._canonical_root(str(scratch)) if scratch else ""
 
+    @staticmethod
+    def _within_project(project_root: str, active_root: str) -> bool:
+        """Whether an operation target belongs to the active task project.
+
+        Containment, not string equality. The previous exact comparison meant a
+        write to ``<project>/tests/test_x.py`` derived the root
+        ``<project>/tests``, which compared unequal to ``<project>`` and was
+        refused - so no project could ever contain a subdirectory, even though
+        the boundary's actual intent is only to stop a session straying into a
+        *different* project. Descendants stay inside the boundary, so this is a
+        correction rather than a relaxation; anything genuinely outside is still
+        refused.
+        """
+        if project_root.casefold() == active_root.casefold():
+            return True
+        from config.permissions import path_is_within
+
+        return path_is_within(Path(project_root), [Path(active_root)])
+
     def _before_execute(self, tool: str, args: dict) -> None:
         if not self._is_coding_tool(tool) or self._change_tracker is None:
             return
         project_root = self._project_root_from_args(args, tool)
         if self._change_tracker.active is not None:
             active_root = self._canonical_root(self._change_tracker.active.project)
-            if project_root and active_root and project_root.casefold() != active_root.casefold():
+            if project_root and active_root and not self._within_project(project_root, active_root):
                 raise ValueError("operation target is outside the active task project")
             self._attach_checkpoint(self._maybe_create_checkpoint(tool, args))
             return
@@ -1883,7 +1902,11 @@ class Agent:
     def _llm_loop(self, user_input: str) -> str:
         specs = self._registry.all_specs()
         messages = [
-            {"role": "system", "content": build_system_prompt(self._provider.model_label, self._project)},
+            {"role": "system", "content": build_system_prompt(
+                self._provider.model_label,
+                self._project,
+                str(getattr(self._settings, "workspace_root", "") or ""),
+            )},
         ]
         extra = self._reference_sections()
         if extra:
@@ -1982,6 +2005,18 @@ class Agent:
                     return "Task stopped after bounded recovery attempts."
             self._finalize_plan()
             log.debug("agent loop: %d tool call(s) executed this turn", tool_call_count)
+
+        if self._tasks.verification is VerificationState.PASSED:
+            # The reasoning budget ran out, but the work was already verified
+            # with observed evidence. A resource limit must not overwrite an
+            # adjudicated verdict: reporting this as a failure would discard
+            # real evidence and tell the user a working project had failed.
+            self._transition(TaskState.COMPLETED)
+            log.info("turn limit reached after successful verification; reporting completion")
+            return (
+                "Stopped at the reasoning turn limit, but the work was already "
+                "verified."
+            )
 
         step = self._tasks.add_step("max_turns_reached")
         self._tasks.set_status(step, StepStatus.FAILED, "Reasoning turn limit reached.")

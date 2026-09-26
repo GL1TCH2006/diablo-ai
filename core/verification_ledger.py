@@ -174,6 +174,10 @@ class VerificationMethod(str, Enum):
     WORKFLOW_CONTRACT = "workflow_contract"
     ANALYSIS = "analysis"
     DEBUG_RUN = "debug_run"
+    #: M2.13: a project's own test suite was executed and the result observed.
+    #: Added as a distinct method because running the suite is a real
+    #: independent observation, unlike a command merely returning zero.
+    PROJECT_TESTS = "project_tests"
 
 
 class EvidenceTrust(str, Enum):
@@ -231,6 +235,7 @@ LEGACY_KIND_AXES: dict[str, tuple[VerificationSubject, VerificationMethod]] = {
     "execution": (VerificationSubject.TASK, VerificationMethod.EXECUTION_OUTCOME),
     "file_and_output": (VerificationSubject.FILE, VerificationMethod.FILE_AND_OUTPUT),
     "image_inspection": (VerificationSubject.FILE, VerificationMethod.IMAGE_INSPECTION),
+    "project_tests": (VerificationSubject.RUN, VerificationMethod.PROJECT_TESTS),
     "render_file": (VerificationSubject.FILE, VerificationMethod.RENDER_FILE_PROBE),
     "tool_observation": (VerificationSubject.ENVIRONMENT, VerificationMethod.TOOL_OBSERVATION),
     "workflow_verification": (VerificationSubject.RUN, VerificationMethod.WORKFLOW_CONTRACT),

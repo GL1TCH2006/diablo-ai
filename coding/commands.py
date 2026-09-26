@@ -42,6 +42,27 @@ def _package_manager(root: Path) -> str:
     return "npm"
 
 
+def _has_python_tests(root: Path, files: set[str]) -> bool:
+    """Whether a marker-less project still looks like a pytest project.
+
+    Never raises: an unreadable directory means "not detected", not an error.
+    """
+    if any(name.startswith("test_") and name.endswith(".py") for name in files):
+        return True
+    if any(name.endswith("_test.py") for name in files):
+        return True
+    tests_dir = root / "tests"
+    try:
+        if not tests_dir.is_dir():
+            return False
+        return any(
+            child.is_file() and child.name.endswith(".py") and child.name.startswith("test_")
+            for child in tests_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def detect_commands(root: Path) -> ProjectCommands:
     """Best-effort detection of test/build/run/install commands. Never raises."""
     commands = ProjectCommands()
@@ -62,6 +83,13 @@ def detect_commands(root: Path) -> ProjectCommands:
         if marker in files:
             language = lang
             break
+
+    # M2.13: a marker-less Python project is still a Python project when it
+    # carries tests. Without this, a freshly scaffolded module + test file has
+    # no detectable test command and cannot be verified at all. Only consulted
+    # when no marker matched, so every marker-based path above is unchanged.
+    if not language and _has_python_tests(root, files):
+        language = "python"
 
     if "node" in language:
         mgr = _package_manager(root)

@@ -198,6 +198,32 @@ def build_registry(
     )
     registry.register(
         ToolSpec(
+            name="project.verify",
+            description=(
+                "Run this project's own test suite and report whether it passes. Use this to "
+                "verify coding work: it detects the project's test command, runs it, and returns "
+                "an evidence-backed verdict (tests run, tests failed, exit code). Call it after "
+                "creating or changing code instead of claiming the work works."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project root directory"}},
+                "required": ["path"],
+            },
+            required=["path"],
+            # Running a project's suite executes its code, so this is gated like
+            # python.run_script: NORMAL inside an allowed root, SENSITIVE outside.
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: coding_tool.project_verify(kw["path"], settings),
+            describe=lambda args: f"Run project tests: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="project.info",
             description="Analyse a project and return its profile: language, framework, entry points, dependencies, test/build/run commands, git branch.",
             parameters={"type": "object", "properties": {"path": {"type": "string", "description": "Project root directory"}}, "required": ["path"]},
