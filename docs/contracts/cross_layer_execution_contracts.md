@@ -584,12 +584,110 @@ unification are later work and are not started here.
 
 ---
 
+## M2.12 post-P3 composition audit
+
+A read-only audit traced the real production call paths rather than judging the
+architecture by naming, then hardened two confirmed defects. Traced entry point
+for every path is `Agent.respond()`.
+
+### Composition facts established by tracing
+
+* **Identity.** `task_id` and `run_id` are minted once per request in
+  `TaskManager.begin_task`; `step_id` is deterministic (`step-N`, or the tool
+  call id) and stable across a retry because the retry re-plans into a *new*
+  plan record that retires the failed one into `superseded`. Ledger entries
+  carry the authoritative `task_id`/`run_id` copied from the `TaskManager` and
+  never mint their own.
+* **The `FAILED -> PENDING` edge is never actually taken.** The state machine
+  permits it, but the LLM loop retries by re-planning, so a retry never mutates
+  a FAILED step in place. This is consistent with the ratified P2 design
+  ("the LLM loop re-plans on every reasoning turn") and with `superseded`
+  existing to preserve the failed record, so it is intentional rather than a gap.
+  It does mean the edge is currently unused.
+* **Permissions are re-evaluated on every retry.** A retry re-enters
+  `Executor.run`, which calls `PermissionManager.evaluate` for each dispatch, so
+  confirmation, workspace roots, branch policy and destructive-command blocking
+  all re-apply. Recovery cannot bypass them.
+* **Escalation has no second router.** `ESCALATE_MODEL` only flips
+  `_router_verify_ok`; `_select_model` / `ModelRouter` remain the sole place a
+  model is chosen and the only place `_escalations_used` increments.
+* **`RERUN_VERIFY` is unreachable from `_llm_loop`.** A failed verification
+  short-circuits to "Task stopped because verification failed" before the
+  recovery branch, so the policy is never consulted for that category.
+  `DebugLoop`, which owns no durable plan, is the only caller that can produce
+  the action. The asymmetry is real but not currently harmful, and is now
+  pinned by a test.
+
+### Defect 1 — status inferred from error-message wording (fixed, `ffff890`)
+
+`Agent._step_status` classified a step as `CANCELLED` when the reason text
+contained `"Denied by user"`, contradicting the rule above that status must not
+be inferred from error-message wording. A real denial already sets
+`cancelled=True` and `status="cancelled"` in `Executor`, so the text match was
+redundant in production; its only real effect was to let an unrelated blocked
+operation whose message happened to read "Denied by user" be reported as
+`CANCELLED`, inverting the terminal task state. Pre-existing since `36fdee3`, not
+a P3 regression.
+
+### Defect 2 — terminal verdicts bypassing the ledger (fixed, `59eaa53`)
+
+Four sites in `Agent._finish_tracking` called `set_verification` directly,
+despite Phase 2 documenting `record_verification` as the single funnel. A task
+could therefore end with an authoritative verification of `FAILED` and an empty
+ledger, leaving the persisted projection unable to explain its own state:
+
+```
+before:  task=failed verification=failed ledger=0 (not_run)
+after:   task=failed verification=failed ledger=1 (failed)
+```
+
+This was an auditability and contract defect, not a safety hole: all four sites
+could only move verification to `FAILED`, so nothing was ever promoted to
+`PASSED` outside the ledger invariant.
+
+### Accepted, not changed
+
+* **`RECOVERING -> COMPLETED` is an illegal edge that is attempted and
+  swallowed.** After a recovery, a turn returning no tool calls makes
+  `_llm_loop` attempt this transition; `Agent._transition` deliberately does not
+  raise from cleanup paths, and `_respond` immediately re-evaluates from step
+  statuses and reaches the correct terminal state. The durable record status is
+  always recomputed from steps, so the swallowed edge cannot produce a wrong
+  outcome. Pinned by a test.
+* **`invalidate_verification` sets state without a ledger entry.** Correct: a
+  retraction is not an adjudication, and it is preserved in the separate,
+  bounded `verification_history` layer.
+* **`_reconcile_interrupted_tasks` writes lifecycle metadata directly.** Correct
+  for a historical record: there is no live ledger in memory for an old task.
+
+### Known deferred limitations
+
+* `ExecutionPlanRecord.summary()` drops `recovery_hint` (and `expected_result`,
+  `detail`, `interrupted`, `verification_state`) when a plan is superseded, so
+  the hint derived from an observed failure does not carry into the replacement
+  step. It survives only in the superseded summary's `status`/`attempts`. This
+  matters only once `Agent.resume()` exists.
+* The fast-intent path (`_run_intent`: hello-python, open-app, system-info) has
+  no recovery at all. It handles three fixed intents and never had retry
+  semantics, so this is a scope boundary rather than a defect.
+* Ledger entries written by the intent-path writers carry no `step_id`, and
+  durable plan steps often have an empty `verification_state`, so a verification
+  cannot always be correlated to a specific plan step.
+* The ledger is a write-only projection in production;
+  `VerificationLedger.from_dict` is not called on any production path.
+* The S2.8 limitation where a running Blender child cannot be interrupted is
+  unchanged and is not claimed as fixed.
+
+---
+
 ## Verification
 
 * S1 invariants: `tests/test_cross_layer_contracts.py`
 * P3 Phase 1 ledger schema: `tests/test_verification_ledger.py`
 * P3 Phase 2 writer migration: `tests/test_p3_verification_migration.py`
 * P3 Phase 3 recovery: `tests/test_p3_recovery.py`
+* Post-P3 composition audit: `tests/test_p3_composition_audit.py`
+* Step-status structured-signal contract: `tests/test_step_status_contract.py`
 * Pre-existing boundary coverage, unchanged:
   `tests/test_capability_provenance.py` (identity/provenance),
   `tests/test_capability_context_contract.py` (context propagation),
