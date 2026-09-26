@@ -150,15 +150,23 @@ def build_registry(
     registry.register(
         ToolSpec(
             name="task.info",
-            description="Read one persisted task with outcome, status, Git summary, snapshots, and change steps. Read-only.",
+            description="Read one persisted task with outcome, status, Git summary, snapshots, change steps, and its durable execution plan. Read-only.",
             parameters={
                 "type": "object",
-                "properties": {"task_id": {"type": "string", "description": "Canonical task ID"}},
+                "properties": {
+                    "task_id": {"type": "string", "description": "Canonical task ID"},
+                    "include_plan_args": {
+                        "type": "boolean",
+                        "description": "Include raw plan step arguments. Withheld by default because plans are model-authored and can embed sensitive payloads.",
+                    },
+                },
                 "required": ["task_id"],
             },
             required=["task_id"],
             level=PermissionLevel.SAFE,
-            fn=lambda **kw: tasks_tool.task_info(kw["task_id"], settings),
+            fn=lambda **kw: tasks_tool.task_info(
+                kw["task_id"], settings, bool(kw.get("include_plan_args", False))
+            ),
             describe=lambda args: f"Inspect task: {args.get('task_id')}",
         )
     )

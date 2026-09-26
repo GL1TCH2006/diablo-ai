@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.logging_setup import get_logger
+from core.planner import ExecutionPlanRecord, PlanStepError, migrate_plan_record
 from memory.storage import load_json, save_json
 
 log = get_logger("task_store")
@@ -144,6 +145,27 @@ class TaskChangeStep:
         )
 
 
+def _coerce_plan(value) -> Optional["ExecutionPlanRecord"]:
+    """Normalise anything plan-shaped into an ExecutionPlanRecord.
+
+    Returns None when there is no plan or the payload cannot be understood, so a
+    legacy or corrupt record reads as "no plan" instead of raising. A plan we
+    cannot read must never be treated as a plan with zero steps, because that
+    would let a resume conclude that no work ever ran.
+    """
+    if value is None:
+        return None
+    if isinstance(value, ExecutionPlanRecord):
+        return value
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ExecutionPlanRecord.from_dict(migrate_plan_record(value))
+    except (PlanStepError, TypeError, ValueError) as exc:
+        log.warning("discarding unreadable plan payload: %s", exc)
+        return None
+
+
 @dataclass
 class TaskRecord:
     task_id: str
@@ -160,6 +182,11 @@ class TaskRecord:
     snapshots: list[str] = field(default_factory=list)
     change_steps: list[TaskChangeStep] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    # M2.12 P2: durable execution plan. Owned by this record; carries no task
+    # identity of its own (task_id/run_id stay authoritative here and on
+    # TaskManager). None means "no plan", which includes every record written
+    # before P2.
+    plan: Optional[ExecutionPlanRecord] = None
 
     VALID_STATUSES = ("pending", "active", "completed", "failed", "cancelled")
 
@@ -168,11 +195,15 @@ class TaskRecord:
             raise ValueError("task_id must be a safe non-empty identifier")
         if self.status not in self.VALID_STATUSES:
             raise ValueError(f"invalid status: {self.status}, must be one of {self.VALID_STATUSES}")
+        self.plan = _coerce_plan(self.plan)
 
     def to_dict(self) -> dict:
         data = asdict(self)
         data["git"] = self.git.to_dict()
         data["change_steps"] = [s.to_dict() for s in self.change_steps]
+        # Serialised explicitly rather than via asdict recursion so the plan
+        # owns its own schema, including plan_version and StepStatus values.
+        data["plan"] = self.plan.to_dict() if isinstance(self.plan, ExecutionPlanRecord) else None
         return data
 
     @classmethod
@@ -194,6 +225,7 @@ class TaskRecord:
             snapshots=[str(value) for value in _list_field(data, "snapshots")],
             change_steps=[TaskChangeStep.from_dict(value) for value in _list_field(data, "change_steps")],
             metadata=_dict_field(data, "metadata"),
+            plan=_coerce_plan(data.get("plan")),
         )
 
 
@@ -250,6 +282,7 @@ def serialize_task(record: TaskRecord) -> dict:
         "snapshots": _string_list(record.snapshots),
         "change_steps": [_change_step_dict(step) for step in (record.change_steps or [])],
         "metadata": dict(record.metadata) if isinstance(record.metadata, dict) else {},
+        "plan": record.plan.to_dict() if isinstance(record.plan, ExecutionPlanRecord) else None,
     }
 
 
@@ -338,6 +371,8 @@ class TaskStore:
                 for git_key, git_value in value.items():
                     if hasattr(record.git, git_key):
                         setattr(record.git, git_key, git_value)
+            elif key == "plan":
+                record.plan = _coerce_plan(value)
             elif hasattr(record, key):
                 setattr(record, key, value)
             else:

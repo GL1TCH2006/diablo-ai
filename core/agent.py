@@ -13,7 +13,15 @@ from core.context import build_system_prompt, ProjectContext
 from core.events import EventBus
 from core.executor import ExecutionOutcome, Executor
 from core.logging_setup import get_logger
-from core.planner import ExecutionPlan, PlanValidationError, Planner
+from core.planner import (
+    ExecutionPlan,
+    ExecutionPlanRecord,
+    PlanStepError,
+    PlanStepRecord,
+    PlanValidationError,
+    Planner,
+    side_effect_key,
+)
 from core.request_context import (
     DEFAULT_MAX_CONCURRENT_REQUESTS,
     BoundedRequestGate,
@@ -75,6 +83,15 @@ class Agent:
         self._max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
         self._request_gate = BoundedRequestGate(self._max_concurrent_requests)
         self._request_context = RequestContext()
+        # M2.12 P2: the durable plan for the request in flight. Lives on the
+        # Agent rather than on RequestContext because the P1 field set is
+        # ratified and must not grow; it is reset per request in
+        # _begin_request_context and mirrored to TaskRecord.plan immediately.
+        self._active_plan: ExecutionPlanRecord | None = None
+        # The plan step currently between write-ahead and terminal state. Set by
+        # _step_write_ahead so pre-execution hooks (checkpoints) can attach
+        # provenance to the step they belong to.
+        self._running_plan_step: PlanStepRecord | None = None
         self._task_store = TaskStore(settings.sessions_dir)
         self._change_tracker = ChangeTracker(settings.sessions_dir)
         self._snapshot_manager = SnapshotManager(settings.sessions_dir)
@@ -370,6 +387,25 @@ class Agent:
             if "already exists" not in str(exc):
                 log.warning("could not create task record: %s", exc)
 
+    def _classify_interrupted_steps(self, record) -> list[str]:
+        """Flag steps left RUNNING by a process death.
+
+        A step persisted as RUNNING may or may not have applied its side effect.
+        The status is deliberately left alone and the step is marked
+        ``interrupted`` instead, so nothing replays it implicitly and a future
+        Agent.resume can require an explicit decision. Read-only steps are
+        reported separately because replaying them is free.
+        """
+        plan = getattr(record, "plan", None)
+        if plan is None:
+            return []
+        flagged: list[str] = []
+        for step in plan.steps:
+            if step.status is StepStatus.RUNNING and not step.interrupted:
+                step.mark_interrupted()
+                flagged.append(step.step_id)
+        return flagged
+
     def _reconcile_interrupted_tasks(self) -> None:
         store = getattr(self, "_task_store", None)
         tracker = getattr(self, "_change_tracker", None)
@@ -386,6 +422,7 @@ class Agent:
                 session.finished_at = time.strftime("%Y%m%d-%H%M%S")
                 tracker.save(session)
             metadata = dict(record.metadata or {})
+            interrupted = self._classify_interrupted_steps(record)
             metadata["lifecycle"] = {
                 **(metadata.get("lifecycle") or {}),
                 "state": "failed",
@@ -393,15 +430,25 @@ class Agent:
                 "verification_detail": "Recovered after interrupted process.",
                 "recovered": True,
                 "recovery_action": "marked_failed",
+                "interrupted_steps": interrupted,
             }
             reconciled = False
             try:
+                if interrupted:
+                    store.update(record.task_id, plan=record.plan)
                 store.update(record.task_id, metadata=metadata)
                 reconciled = store.finish(record.task_id, "Recovered after interrupted process; not resumed automatically.", "failed") is not None
             except (OSError, TypeError, ValueError) as exc:
                 log.warning("could not reconcile interrupted task %s: %s", record.task_id, exc)
             if reconciled:
                 self._recovered_task_ids.append(record.task_id)
+                for step_id in interrupted:
+                    self._emit_lifecycle(
+                        "plan_step_interrupted",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        replayable=False,
+                    )
         for session in tracker.load_all(store.sessions_dir):
             if session.status != "active":
                 continue
@@ -510,7 +557,7 @@ class Agent:
             active_root = self._canonical_root(self._change_tracker.active.project)
             if project_root and active_root and project_root.casefold() != active_root.casefold():
                 raise ValueError("operation target is outside the active task project")
-            self._maybe_create_checkpoint(tool, args)
+            self._attach_checkpoint(self._maybe_create_checkpoint(tool, args))
             return
         goal = (self._pending_goal.strip() or "Development task across multiple tool calls").strip()
         self._change_tracker.start(goal, project_root, session_id=getattr(self._tasks, "task_id", ""))
@@ -522,7 +569,17 @@ class Agent:
                 title=self._tasks.task_title or goal,
                 goal=goal,
             )
-        self._maybe_create_checkpoint(tool, args)
+        self._attach_checkpoint(self._maybe_create_checkpoint(tool, args))
+
+    def _attach_checkpoint(self, snapshot_id: str) -> None:
+        """Bind a pre-execution snapshot to the step about to run."""
+        if not snapshot_id:
+            return
+        step = getattr(self, "_running_plan_step", None)
+        if step is None or step.checkpoint_id:
+            return
+        step.checkpoint_id = snapshot_id
+        self._persist_plan()
 
     def _note_step(self, tool: str, args: dict, outcome) -> None:
         if not self._is_coding_tool(tool) or self._change_tracker is None:
@@ -541,6 +598,7 @@ class Agent:
                     title=self._tasks.task_title or goal,
                     goal=goal,
                 )
+        running = getattr(self, "_running_plan_step", None)
         self._change_tracker.step(
             tool,
             args,
@@ -551,6 +609,7 @@ class Agent:
             str(getattr(outcome, "status", "") or ""),
             int(getattr(outcome, "duration_ms", 0) or 0),
             getattr(outcome, "exit_code", None),
+            str(getattr(running, "checkpoint_id", "") or ""),
         )
         self._sync_task_metadata(self._change_tracker.active.id)
         if tool == "git.commit" and getattr(outcome, "success", False) and self._change_tracker.active:
@@ -610,29 +669,35 @@ class Agent:
         }
         return tool in checkpoint_tools
 
-    def _maybe_create_checkpoint(self, tool: str, args: dict) -> None:
+    def _maybe_create_checkpoint(self, tool: str, args: dict) -> str:
+        """Create a pre-execution checkpoint. Returns its snapshot id, or "".
+
+        M2.12 P2: the id is returned so the caller can attach it to the
+        executing plan step, which is what makes a step's checkpoint an exact
+        "workspace state immediately before this step ran" undo boundary.
+        """
         if not self._should_checkpoint(tool):
-            return
+            return ""
         if self._snapshot_manager is None:
-            return
+            return ""
         if self._change_tracker is None or self._change_tracker.active is None:
-            return
+            return ""
 
         task_id = self._change_tracker.active.id
         if not task_id:
-            return
+            return ""
 
         project_root = self._project_root_from_args(args, tool)
 
         if not project_root:
-            return
+            return ""
 
         from pathlib import Path
         if not Path(project_root).is_dir():
-            return
+            return ""
 
         if not (Path(project_root) / ".git").exists():
-            return
+            return ""
 
         label = f"pre-{tool.replace('.', '-')}"
         try:
@@ -643,6 +708,7 @@ class Agent:
                 creation_reason=f"auto-checkpoint-before-{tool}",
             )
             self._task_store.link_snapshot(task_id, snapshot.snapshot_id)
+            return str(getattr(snapshot, "snapshot_id", "") or "")
         except Exception as exc:
             record = self._task_store.get(task_id)
             if record is not None:
@@ -650,6 +716,7 @@ class Agent:
                 metadata["checkpoint_error"] = f"{tool}: {exc}"
                 self._task_store.update(task_id, metadata=metadata)
             log.warning("auto-checkpoint failed for %s: %s", tool, exc)
+            return ""
 
     def _capture_task_git_start(self, task_id: str, project_root: str, title: str, goal: str) -> None:
         """Capture starting Git state for a task and create TaskRecord."""
@@ -964,6 +1031,205 @@ class Agent:
             log.warning("task history context failed: %s", exc)
         return "\n\n".join(extra)
 
+    # ------------------------------------------------------------------
+    # M2.12 P2 - durable execution plan
+    #
+    # ExecutionPlan (frozen) is validated intent. ExecutionPlanRecord is the
+    # durable, mutable record persisted on TaskRecord.plan. The plan holds no
+    # task identity: TaskManager.run_id / task_id stay authoritative.
+    # ------------------------------------------------------------------
+
+    @property
+    def active_plan(self) -> ExecutionPlanRecord | None:
+        return getattr(self, "_active_plan", None)
+
+    def _persist_plan(self) -> None:
+        """Mirror the in-flight plan onto its TaskRecord.
+
+        Called on every step transition, so a process death always leaves a
+        record on disk describing the last known step state.
+        """
+        store = getattr(self, "_task_store", None)
+        plan = getattr(self, "_active_plan", None)
+        task_id = getattr(self._tasks, "task_id", "")
+        if store is None or plan is None or not task_id:
+            return
+        try:
+            store.update(task_id, plan=plan)
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not persist execution plan for %s: %s", task_id, exc)
+
+    def _begin_plan(self, plan: ExecutionPlan) -> ExecutionPlanRecord | None:
+        """Create and persist the durable record for a validated plan.
+
+        Any plan already in flight is retired into ``superseded`` first, so
+        re-planning on a later reasoning turn does not erase the record of
+        steps that already ran.
+        """
+        previous = getattr(self, "_active_plan", None)
+        record = ExecutionPlanRecord.from_plan(plan)
+        record.absorb(previous)
+        cycles = record.check_cycles()
+        if cycles:
+            log.warning("plan dependency cycle detected among %s", ", ".join(cycles))
+            self._emit_lifecycle(
+                "plan_invalid",
+                reason="dependency_cycle",
+                step_ids=cycles,
+            )
+            return None
+        self._active_plan = record
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_created",
+            goal=record.goal,
+            plan_version=record.plan_version,
+            steps=len(record.steps),
+        )
+        return record
+
+    def _finalize_plan(self) -> None:
+        """Settle dependency skips, flag abandoned steps, and persist."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return
+        skipped = plan.propagate_skipped()
+        if skipped:
+            self._emit_lifecycle("plan_steps_skipped", step_ids=skipped)
+        # A step still RUNNING here never reached a terminal state: the request
+        # ended underneath it. Flag it rather than leaving it looking active, so
+        # the task cannot be recorded as cleanly finished over an unresolved
+        # side effect.
+        abandoned = [item.step_id for item in plan.steps if item.status is StepStatus.RUNNING]
+        for step in plan.steps:
+            if step.status is StepStatus.RUNNING:
+                step.mark_interrupted()
+        if abandoned:
+            log.warning("plan steps ended while still running: %s", ", ".join(abandoned))
+            self._emit_lifecycle("plan_steps_abandoned", step_ids=abandoned)
+        self._sync_task_metadata()
+        self._persist_plan()
+
+    def _plan_has_unresolved_steps(self) -> list[str]:
+        """Ids of steps that neither succeeded nor reached a terminal state."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return []
+        return [
+            item.step_id
+            for item in plan.steps
+            if item.interrupted or item.status is StepStatus.RUNNING
+        ]
+
+    def _next_plan_step(self) -> PlanStepRecord | None:
+        """Dependency-gated next executable step, or None."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return None
+        return plan.next_step()
+
+    def _plan_step_for(self, step_id: str) -> PlanStepRecord | None:
+        plan = getattr(self, "_active_plan", None)
+        return plan.step(step_id) if plan is not None else None
+
+    def _annotate_step(self, step: PlanStepRecord, outcome: ExecutionOutcome | None = None) -> None:
+        """Fill in the fields the existing architecture can actually supply."""
+        if outcome is not None:
+            data = getattr(outcome, "data", None)
+            if isinstance(data, dict):
+                capability_result = data.get("capability_result")
+                if isinstance(capability_result, dict):
+                    step.capability = str(capability_result.get("capability") or "")
+        verification = getattr(outcome, "verification", None)
+        if verification is not None and hasattr(verification, "state"):
+            state = getattr(verification.state, "value", verification.state)
+            step.verification_state = str(state or "")
+
+    def _step_write_ahead(self, step: PlanStepRecord) -> None:
+        """Persist RUNNING *before* the side effect is dispatched.
+
+        Without this a hard kill leaves a persisted PENDING step whose side
+        effect may already have applied, and any later resume would treat it as
+        untouched work.
+        """
+        step.begin_attempt()
+        self._running_plan_step = step
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_step_started",
+            step_id=step.step_id,
+            tool=step.tool,
+            attempt=step.attempts,
+            side_effect_key=step.side_effect_key,
+        )
+
+    def _step_finalize(
+        self,
+        step: PlanStepRecord,
+        outcome: ExecutionOutcome,
+        status: StepStatus,
+    ) -> None:
+        """Persist the terminal state of a step and record what happened."""
+        detail = str(getattr(outcome, "reason", "") or getattr(outcome, "error", "") or "")
+        summary = _plan_result_summary(outcome)
+        step.finish(status, detail=detail, result_summary=summary)
+        if getattr(self, "_running_plan_step", None) is step:
+            self._running_plan_step = None
+        # FAILED and BLOCKED both leave a step that a later resume could act on.
+        # CANCELLED deliberately gets no hint: cancellation is a user decision,
+        # not a condition to recover from automatically.
+        if status in (StepStatus.FAILED, StepStatus.BLOCKED) and not step.recovery_hint:
+            # Derived from the observed failure, never from user wording.
+            step.recovery_hint = _recovery_hint_for(outcome)
+        self._annotate_step(step, outcome)
+        expected = self._evaluate_expected_result(step, outcome)
+        if expected is not None:
+            step.detail = f"{step.detail} {expected}".strip() if step.detail else expected
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_step_finished",
+            step_id=step.step_id,
+            tool=step.tool,
+            status=step.status.value,
+            attempts=step.attempts,
+            detail=step.detail,
+        )
+
+    def _evaluate_expected_result(self, step: PlanStepRecord, outcome: ExecutionOutcome) -> str | None:
+        """Honour PlanStep.expected_result.
+
+        Supports the closed vocabulary the current verifier can actually
+        evaluate. Returns a short note, or None when the step declares no
+        expectation.
+        """
+        expected = step.expected_result
+        if not isinstance(expected, dict) or not expected:
+            return None
+        kind = str(expected.get("type") or "")
+        text = f"{getattr(outcome, 'output', '') or ''}\n{getattr(outcome, 'error', '') or ''}"
+        if kind == "output_contains":
+            needle = str(expected.get("value") or "")
+            return f"expected output {needle!r} {'found' if needle and needle.lower() in text.lower() else 'NOT found'}"
+        if kind == "output_matches":
+            pattern = str(expected.get("value") or "")
+            try:
+                hit = bool(pattern) and re.search(pattern, text, re.I) is not None
+            except re.error:
+                return f"expected_result pattern {pattern!r} is not a valid regex"
+            return f"expected pattern {'matched' if hit else 'did not match'}"
+        if kind == "exit_code":
+            want = expected.get("value")
+            got = getattr(outcome, "exit_code", None)
+            return f"expected exit code {want!r}, got {got!r}"
+        if kind == "file_exists":
+            raw = str(expected.get("path") or "")
+            try:
+                exists = bool(raw) and Path(raw).exists()
+            except OSError:
+                exists = False
+            return f"expected file {raw!r} {'exists' if exists else 'is missing'}"
+        return f"unsupported expected_result type {kind!r}"
+
     def _step_status(self, outcome: ExecutionOutcome) -> StepStatus:
         if getattr(outcome, "cancelled", False):
             return StepStatus.CANCELLED
@@ -992,8 +1258,12 @@ class Agent:
         outcome: ExecutionOutcome,
         step: TaskStep | None = None,
     ) -> TaskStep:
+        # The executing plan step is read from _running_plan_step rather than
+        # passed in, so the durable-plan wiring does not change this method's
+        # signature and existing observers/doubles keep working.
+        plan_step = getattr(self, "_running_plan_step", None)
         if step is None:
-            step = self._tasks.add_step(tool)
+            step = self._tasks.add_step(tool, step_id=plan_step.step_id if plan_step else "")
         self._tasks.set_status(step, StepStatus.RUNNING)
         self._step_event(step, outcome)
         self._persist_tool_observation(tool, outcome)
@@ -1022,10 +1292,46 @@ class Agent:
         self._sync_task_metadata()
         return step
 
-    def _execute_step(self, tool: str, args: dict) -> ExecutionOutcome:
+    def _plan_step_runnable(self, step: PlanStepRecord) -> bool:
+        """Dependency gate: a step runs only when its dependencies are DONE."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return False
+        index = plan.by_id()
+        if step.dependencies_unsatisfiable(index):
+            return False
+        return step.dependencies_satisfied(index)
+
+    def _annotate_intent_expectations(self, record: ExecutionPlanRecord, intent) -> None:
+        """Populate expected_result where the fast-intent contract knows it.
+
+        These are real, pre-declared assertions the executor can evaluate
+        against the observed outcome, not post-hoc narration.
+        """
+        name = getattr(intent, "name", "")
+        if name == "create_hello_python":
+            for step in record.steps:
+                if step.tool == "python.run_script":
+                    step.expected_result = {"type": "output_contains", "value": "Hello World"}
+        elif name == "open_app":
+            for step in record.steps:
+                if step.tool == "applications.open":
+                    step.expected_result = {"type": "output_contains", "value": "opened"}
+
+    def _execute_step(
+        self,
+        tool: str,
+        args: dict,
+        plan_step: PlanStepRecord | None = None,
+    ) -> ExecutionOutcome:
         self._transition(TaskState.EXECUTING)
+        if plan_step is not None:
+            # Write-ahead: the RUNNING state reaches disk before dispatch.
+            self._step_write_ahead(plan_step)
         outcome = self._executor.run(tool, args, self._active_cancellation_token)
         self._record_execution(tool, args, outcome)
+        if plan_step is not None:
+            self._step_finalize(plan_step, outcome, self._step_status(outcome))
         return outcome
 
     def _begin_recovery(self, reason: str) -> None:
@@ -1048,6 +1354,15 @@ class Agent:
     def _finish_tracking(self, reply: str, status: str | None = None) -> str:
         tasks = self._tasks
         status = status or tasks.final_status()
+        # A step abandoned mid-flight means the request ended over a possibly
+        # applied side effect. That is not a clean completion, whatever the
+        # in-memory step statuses imply.
+        unresolved = self._plan_has_unresolved_steps()
+        if unresolved and status == "completed":
+            status = "failed"
+            tasks.failure_reason = (
+                f"Task ended with unresolved plan step(s): {', '.join(unresolved)}."
+            )
         if status == "cancelled":
             tasks.invalidate_verification("Task was cancelled before verification completed.")
         elif status == "failed":
@@ -1173,6 +1488,7 @@ class Agent:
         context = RequestContext()
         context.inherit_pending_recoveries(previous)
         self._request_context = context
+        self._active_plan = None
         return context
 
     def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
@@ -1227,6 +1543,7 @@ class Agent:
             self._mark_failure(f"{type(exc).__name__}: {exc}")
             reply = f"Task failed: {exc}"
         finally:
+            self._finalize_plan()
             self._append_to_conversation(user_input, reply)
             status = self._finish_tracking(reply)
             self._events.emit_status("state", "idle")
@@ -1238,9 +1555,22 @@ class Agent:
                 "verification": self._tasks.verification.value,
                 "task_succeeded": self._tasks.task_succeeded(),
                 "partial": self._tasks.partial,
+                "plan": self._plan_public_summary(),
             })
             self._active_cancellation_token = None
         return reply
+
+    def _plan_public_summary(self) -> dict | None:
+        """Small plan digest for the task_done event. No args, ever."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return None
+        return {
+            "plan_version": plan.plan_version,
+            "counts": plan.counts(),
+            "is_complete": plan.is_complete,
+            "interrupted_step_ids": [item.step_id for item in plan.interrupted_steps()],
+        }
 
     def _run_intent(self, intent) -> str:
         try:
@@ -1250,17 +1580,29 @@ class Agent:
             self._mark_failure(f"Invalid execution plan: {exc}")
             return f"Task failed: invalid execution plan ({exc})."
 
+        record = self._begin_plan(plan)
+        if record is None:
+            self._mark_failure("Invalid execution plan: dependency cycle.")
+            return "Task failed: invalid execution plan (dependency cycle)."
+        self._annotate_intent_expectations(record, intent)
+
         outcomes = []
-        for step in plan.steps:
+        for step in record.steps:
+            if step.status is StepStatus.SKIPPED:
+                continue
+            if not self._plan_step_runnable(step):
+                continue
             if cancellation_requested(self._active_cancellation_token):
                 self._transition(TaskState.CANCELLED)
+                step.finish(StepStatus.CANCELLED, detail="Cancelled before dispatch.")
                 break
-            outcome = self._execute_step(step.tool, step.args)
+            outcome = self._execute_step(step.tool, step.args, plan_step=step)
             outcomes.append(outcome)
             if self._tasks.verification == VerificationState.FAILED or self._tasks.state == TaskState.FAILED:
                 break
             if not outcome.success or outcome.cancelled:
                 break
+        self._finalize_plan()
 
         intent_name = getattr(intent, "name", "")
         if intent_name == "open_app":
@@ -1391,31 +1733,47 @@ class Agent:
                 self._mark_failure(f"Invalid execution plan: {exc}")
                 return f"Task failed: invalid execution plan ({exc})."
 
-            for step in plan.steps:
+            record = self._begin_plan(plan)
+            if record is None:
+                self._mark_failure("Invalid execution plan: dependency cycle.")
+                return "Task failed: invalid execution plan (dependency cycle)."
+
+            for step in record.steps:
+                if step.status is StepStatus.SKIPPED:
+                    continue
+                if not self._plan_step_runnable(step):
+                    continue
                 if cancellation_requested(self._active_cancellation_token):
                     self._transition(TaskState.CANCELLED)
+                    step.finish(StepStatus.CANCELLED, detail="Cancelled before dispatch.")
+                    self._persist_plan()
                     return "Task cancelled."
                 if tool_call_count >= max_tool_calls:
                     self._mark_failure(f"Tool call limit reached ({max_tool_calls}).")
                     return "Task stopped at the tool call limit."
                 tool_call_count += 1
-                outcome = self._execute_step(step.tool, step.args)
+                outcome = self._execute_step(step.tool, step.args, plan_step=step)
                 messages.append({"role": "tool", "content": f"[{step.tool}] {outcome.display}"})
                 if self._tasks.verification == VerificationState.FAILED or self._tasks.state == TaskState.FAILED:
                     self._router_verify_ok = False
+                    self._finalize_plan()
                     return "Task stopped because verification failed."
                 if outcome.cancelled:
                     self._transition(TaskState.CANCELLED)
+                    self._finalize_plan()
                     return "Task cancelled."
                 if not outcome.success:
                     if not outcome.executed:
                         self._mark_failure(outcome.error or outcome.reason or "Tool was blocked.")
+                        self._finalize_plan()
                         return "Task stopped because a tool was blocked."
                     if self._tasks.recovery_attempts >= max_recovery_attempts:
                         self._mark_failure(outcome.error or outcome.reason or "Tool failed repeatedly.")
+                        self._finalize_plan()
                         return "Task stopped after bounded recovery attempts."
                     self._begin_recovery(outcome.error or outcome.reason or f"{step.tool} failed")
                     break
+            self._finalize_plan()
             log.debug("agent loop: %d tool call(s) executed this turn", tool_call_count)
 
         step = self._tasks.add_step("max_turns_reached")
@@ -1511,6 +1869,31 @@ class Agent:
                 self._conversation.append_assistant(reply)
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("Could not persist conversation: %s", exc)
+
+
+def _plan_result_summary(outcome: ExecutionOutcome) -> str:
+    """Compact, persistence-safe record of what a step produced."""
+    status = str(getattr(outcome, "status", "") or "")
+    exit_code = getattr(outcome, "exit_code", None)
+    output = str(getattr(outcome, "output", "") or "").strip().splitlines()
+    tail = output[-1][:160] if output else ""
+    parts = [p for p in (status, f"exit={exit_code}" if exit_code is not None else "", tail) if p]
+    return " | ".join(parts)[:280]
+
+
+def _recovery_hint_for(outcome: ExecutionOutcome) -> str:
+    """Derive a resume hint from the observed failure, not from user wording."""
+    error = str(getattr(outcome, "error", "") or "").strip()
+    reason = str(getattr(outcome, "reason", "") or "").strip()
+    if not getattr(outcome, "executed", False):
+        return f"Step did not execute ({reason or error or 'blocked'}). Re-check preconditions before retrying."
+    if getattr(outcome, "cancelled", False):
+        return "Step was cancelled. Confirm intent before retrying."
+    if exit_code := getattr(outcome, "exit_code", None):
+        return f"Step failed with exit code {exit_code}. Inspect the failing command before retrying."
+    if error:
+        return f"Previous attempt failed: {error[:180]}"
+    return f"Previous attempt failed: {reason[:180]}" if reason else "Previous attempt failed."
 
 
 def _to_api_calls(calls: list[ToolCall]) -> list[dict] | None:
