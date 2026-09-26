@@ -1277,7 +1277,13 @@ class Agent:
         if getattr(outcome, "executed", False) and getattr(outcome, "success", False):
             return StepStatus.DONE
         if not getattr(outcome, "executed", False) and not getattr(outcome, "allowed", False):
-            if getattr(outcome, "status", "") == "cancelled" or "Denied by user" in str(getattr(outcome, "reason", "")):
+            # Structured signals only. A user denial already sets `cancelled`
+            # and `status="cancelled"` in Executor, and the check above catches
+            # it. Matching the reason *text* here would let any unrelated
+            # failure whose message happens to read "Denied by user" be reported
+            # as CANCELLED, inverting the terminal task state. The cross-layer
+            # contract forbids inferring status from error-message wording.
+            if getattr(outcome, "status", "") == "cancelled":
                 return StepStatus.CANCELLED
             return StepStatus.BLOCKED
         return StepStatus.FAILED
