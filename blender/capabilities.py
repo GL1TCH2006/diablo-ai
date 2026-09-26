@@ -17,6 +17,8 @@ Transform convention: location/scale are ``[x, y, z]`` floats in Blender units;
 ``rotation`` is ``[x, y, z]`` in **degrees** (Euler XYZ).
 """
 
+import inspect
+import shutil
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -25,15 +27,46 @@ from pathlib import Path
 from core.logging_setup import get_logger
 
 from .errors import (
+    BlenderCancelledError,
+    BlenderClosedError,
     BlenderError,
     BlenderScriptError,
     C_SCRIPT_ERROR,
 )
+from .operations import is_interruptible, requires_session_revalidation
 from .protocol import build_request
 from .render_inspect import inspect_render as _inspect_render_file
 from .runner import BlenderRunner
 
 log = get_logger("blender.capabilities")
+
+#: Leading bytes of a session file we are willing to reuse. Blender writes either
+#: a plain ``BLENDER`` header or a gzip container when compression is enabled.
+_SESSION_MAGIC = (b"BLENDER", b"\x1f\x8b")
+
+#: A session smaller than this cannot be a real ``.blend``.
+_MIN_SESSION_BYTES = 12
+
+
+def session_file_is_valid(path: Path) -> bool:
+    """Whether a session file is plausibly intact and safe to reuse.
+
+    Conservative by design. After a forced termination the session may have been
+    caught mid-write, and reusing a torn ``.blend`` produces the confusing
+    "Cannot change old file" failure. When this returns ``False`` the caller
+    discards the session rather than reusing it; a fresh session is cheap, a
+    corrupt one is not.
+    """
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size < _MIN_SESSION_BYTES:
+            return False
+        with path.open("rb") as handle:
+            head = handle.read(len(_SESSION_MAGIC[0]))
+    except OSError:
+        return False
+    return any(head.startswith(magic) for magic in _SESSION_MAGIC)
 
 
 class BlenderCapabilityLayer:
@@ -59,9 +92,19 @@ class BlenderCapabilityLayer:
     Separate layers are independent: each owns a private ``work_dir`` and
     session file, so two layers must not be pointed at the same ``work_dir``.
 
-    Cancellation is observed at the capability boundary, before a subprocess is
-    started. An operation that is already running is never interrupted, because
-    killing Blender mid-save is precisely what would corrupt the session.
+    Cancellation
+    ------------
+    Cancellation is honoured before a subprocess starts and, when a token is
+    bound via :meth:`cancellation_scope`, while one is running. A running child
+    is terminated (with a bounded kill fallback) and reaped, and the result is
+    reported as cancellation rather than as a generic failure. Operations are
+    split by the authoritative inventory in :mod:`blender.operations`:
+
+    * read-only operations cannot corrupt the session, so terminating them is
+      always safe;
+    * session-mutating operations can be caught mid-save, so after a forced
+      termination the session is revalidated and discarded when it is not
+      provably intact, rather than reused blindly.
     """
 
     def __init__(
@@ -74,6 +117,10 @@ class BlenderCapabilityLayer:
         self._runner = runner or BlenderRunner(exe=exe)
         self.timeout = timeout
         self._last_error: dict | None = None
+        # Only a layer-created workspace is removed wholesale on close. A
+        # caller-supplied directory is left in place with the session artifacts
+        # cleared out of it.
+        self._owns_work_dir = work_dir is None
         self._work_dir = Path(
             work_dir or tempfile.mkdtemp(prefix="diablo_blender_work_")
         )
@@ -86,6 +133,11 @@ class BlenderCapabilityLayer:
         # thread. Thread-local so concurrent requests never observe each other's
         # correlation.
         self._correlation = threading.local()
+        # Cancellation token for the call currently in flight on this thread.
+        self._cancellation = threading.local()
+        self._closed = False
+        # Whether a forced termination has left the session unproven.
+        self._session_suspect = False
 
     # -------------------------------------------------------------- helpers
 
@@ -97,14 +149,29 @@ class BlenderCapabilityLayer:
     def blender_exe(self) -> str:
         return self._runner.resolve_exe()
 
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run. A closed layer accepts no operations."""
+        return self._closed
+
     def detect(self):
-        """Return the existing detection result (BlenderInfo), unchanged API."""
+        """Return the detection result (BlenderInfo), unchanged API.
+
+        Detection is cached, so repeated calls do not re-probe the filesystem or
+        spawn ``blender --version`` again. See
+        :func:`blender.controller.detect_blender`.
+        """
         from .controller import detect_blender
 
         return detect_blender()
 
     def last_error(self) -> dict | None:
-        """Most recent error as JSON-safe dict, or None after a success."""
+        """Most recent error as JSON-safe dict, or None after a success.
+
+        The payload carries the trusted ``request_id`` of the call that failed as
+        diagnostic attribution, so a stored failure is never mistaken for
+        belonging to a later request.
+        """
         return self._last_error
 
     @contextmanager
@@ -126,11 +193,71 @@ class BlenderCapabilityLayer:
         finally:
             self._correlation.value = previous
 
+    @contextmanager
+    def cancellation_scope(self, token=None):
+        """Bind a cancellation token for the calls made inside.
+
+        Thread-local and re-entrant, mirroring :meth:`request_correlation`. With
+        a token bound, a running Blender child is terminated instead of being
+        waited out.
+        """
+        previous = getattr(self._cancellation, "token", None)
+        self._cancellation.token = token
+        try:
+            yield self
+        finally:
+            self._cancellation.token = previous
+
+    def _trusted_request_id(self) -> str:
+        """The S1-owned request id for this call, or '' when there is none."""
+        correlation = getattr(self._correlation, "value", None) or {}
+        return str(correlation.get("request_id") or "")
+
+    def _cancel_token(self):
+        return getattr(self._cancellation, "token", None)
+
+    def _runner_accepts_cancellation(self) -> bool:
+        """Whether this runner's ``run`` accepts a ``cancel_token`` keyword.
+
+        Test doubles and third-party runners may not. Probing the signature keeps
+        them working unchanged, which is the same approach the capability
+        contracts use for optional hooks.
+        """
+        run = getattr(self._runner, "run", None)
+        if not callable(run):
+            return False
+        try:
+            parameters = inspect.signature(run).parameters
+        except (TypeError, ValueError):
+            return False
+        if "cancel_token" in parameters:
+            return True
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _record_error(self, exc: BlenderError) -> None:
+        """Store a failure with its diagnostic attribution.
+
+        The current call's trusted id always wins, even if the exception
+        instance is reused across calls: a recorded failure must never claim to
+        belong to an earlier request.
+        """
+        exc.request_id = self._trusted_request_id()
+        self._last_error = exc.to_dict()
+
     def _run(self, operation: str, params: dict | None = None, timeout: float | None = None) -> dict:
         # The whole operation is serialized: build_request stats session_file to
         # decide whether Blender opens it, and the runner then reads and rewrites
         # it. Both must happen with exclusive access to avoid a torn session.
         with self._session_lock:
+            if self._closed:
+                raise BlenderClosedError(
+                    operation=operation,
+                    message="blender capability layer is closed",
+                    request_id=self._trusted_request_id(),
+                )
             correlation = getattr(self._correlation, "value", None) or {}
             trusted_request_id = str(correlation.get("request_id") or "")
             request = build_request(
@@ -142,12 +269,21 @@ class BlenderCapabilityLayer:
                     "save_file": str(self.session_file),
                 },
             )
+            token = self._cancel_token()
+            run_kwargs: dict = {"timeout": timeout or self.timeout,
+                                "scene_file": self.session_file}
+            if token is not None and self._runner_accepts_cancellation():
+                run_kwargs["cancel_token"] = token
             try:
-                result = self._runner.run(
-                    request, timeout=timeout or self.timeout, scene_file=self.session_file
-                )
+                result = self._runner.run(request, **run_kwargs)
+            except BlenderCancelledError as exc:
+                # A forced termination can leave the session mid-write. Never
+                # reuse it unproven.
+                self._after_forced_termination(operation, exc)
+                self._record_error(exc)
+                raise
             except BlenderError as exc:
-                self._last_error = exc.to_dict()
+                self._record_error(exc)
                 raise
             if not result.success:
                 exc = BlenderScriptError(
@@ -158,11 +294,53 @@ class BlenderCapabilityLayer:
                     stdout=result.stdout,
                     stderr=result.stderr,
                     code=result.error_code or C_SCRIPT_ERROR,
+                    request_id=trusted_request_id,
+                    diagnostics={"stdout_truncated": result.stdout_truncated,
+                                "stderr_truncated": result.stderr_truncated},
                 )
-                self._last_error = exc.to_dict()
+                self._record_error(exc)
                 raise exc
             self._last_error = None
             return result.data if result.data is not None else {}
+
+    def _after_forced_termination(self, operation: str, exc: BlenderCancelledError) -> None:
+        """Revalidate the session after a child was killed mid-operation.
+
+        Also records the ratified cancellation attribution: whether the child was
+        actually terminated, and whether the operation was interruptible at all.
+        Operations that do not write the session need no revalidation. Ones that
+        do are checked, and an unprovable session is discarded so the next
+        operation starts clean instead of inheriting a torn file.
+        """
+        exc.diagnostics.setdefault("terminated", exc.terminated)
+        exc.diagnostics.setdefault("cancellation_terminated", exc.terminated)
+        exc.diagnostics["interruptible"] = is_interruptible(operation)
+        if not requires_session_revalidation(operation):
+            exc.diagnostics["session_revalidated"] = False
+            return
+        if session_file_is_valid(self.session_file):
+            self._session_suspect = False
+            exc.diagnostics["session_revalidated"] = True
+            exc.diagnostics["session_discarded"] = False
+            return
+        discarded = self._discard_session()
+        self._session_suspect = False
+        exc.diagnostics["session_revalidated"] = True
+        exc.diagnostics["session_discarded"] = discarded
+        log.warning(
+            "session discarded after interrupted %s: %s", operation, self.session_file
+        )
+
+    def _discard_session(self) -> bool:
+        """Remove the session and its backups. Returns whether anything went."""
+        removed = False
+        for path in self._session_artifacts():
+            try:
+                path.unlink()
+                removed = True
+            except OSError as exc:
+                log.warning("could not remove session artifact %s: %s", path, exc)
+        return removed
 
     def _session_artifacts(self) -> list[Path]:
         """The session file plus the Blender-generated backups beside it.
@@ -180,12 +358,61 @@ class BlenderCapabilityLayer:
         return artifacts
 
     def close(self) -> None:
-        """Release the session scratch files. Saved renders/exports are preserved."""
+        """Release the session scratch files. Saved renders/exports are preserved.
+
+        Safe to call repeatedly and safe to call while an operation is running:
+        the session lock is taken first, so a session is never unlinked while a
+        child is still using it. A layer-created workspace is removed entirely; a
+        caller-supplied one is left in place with its session artifacts cleared.
+
+        Cleanup never raises. A failure to delete must not turn an otherwise
+        successful program into an unrelated error.
+        """
+        with self._session_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._discard_session()
+            if self._owns_work_dir:
+                self._remove_work_dir()
+
+    def _remove_work_dir(self) -> None:
+        """Remove a layer-created workspace, tolerating any failure."""
         try:
-            for path in self._session_artifacts():
-                path.unlink()
-        except OSError:
+            shutil.rmtree(self._work_dir, ignore_errors=False)
+        except OSError as exc:
+            # Locked files are routine on Windows while a child is closing.
+            log.warning("could not remove blender work dir %s: %s", self._work_dir, exc)
+            try:
+                shutil.rmtree(self._work_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+    def _close_best_effort(self, timeout: float = 0.0) -> None:
+        """Cleanup for the destructor: never block, never raise.
+
+        A destructor must not stall the interpreter, so it only takes the session
+        lock if the lock is immediately free (or available within ``timeout``).
+        If an operation is still running, that operation's own path is
+        responsible for finishing cleanup.
+        """
+        if timeout:
+            acquired = self._session_lock.acquire(timeout=timeout)
+        else:
+            acquired = self._session_lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            if self._closed:
+                return
+            self._closed = True
+            self._discard_session()
+            if self._owns_work_dir:
+                self._remove_work_dir()
+        except Exception:  # noqa: BLE001 - destructor must not raise
             pass
+        finally:
+            self._session_lock.release()
 
     # ----------------------------------------------------------- inspection
 
@@ -372,6 +599,6 @@ class BlenderCapabilityLayer:
 
     def __del__(self) -> None:
         try:
-            self.close()
+            self._close_best_effort()
         except Exception:  # noqa: BLE001 - destructor must not raise
             pass

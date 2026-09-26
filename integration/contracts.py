@@ -18,6 +18,21 @@ from typing import Any, Callable, Protocol
 
 from .errors import BlenderVisionError
 
+#: Blender operation inventory, owned by :mod:`blender.operations`. Imported
+#: lazily-safe: `blender` is a leaf package with no dependency on `integration`.
+from blender.operations import OPERATION_NAMES as BLENDER_OPERATION_NAMES
+
+#: Stable error code -> capability status.
+#:
+#: Exact code matching only. Infrastructure outcomes (missing executable, denied
+#: permission, spawn failure) keep their own identity, and nothing in this table
+#: can yield INVALID_REQUEST, which is reserved for caller-attributable invalid
+#: input. Mirrors `blender.errors.ERROR_CODES`.
+_STATUS_BY_ERROR_CODE: dict[str, "CapabilityStatus"] = {}
+
+#: Exact exception types that imply a specific status when no code is present.
+_STATUS_BY_EXCEPTION_TYPE: list[tuple[type, "CapabilityStatus"]] = []
+
 
 class CapabilityStatus(str, Enum):
     SUCCESS = "success"
@@ -40,6 +55,56 @@ class CapabilityStatus(str, Enum):
             return cls(normalized)
         except ValueError as exc:
             raise ValueError(f"unknown capability status: {value!r}") from exc
+
+
+def _build_status_tables() -> None:
+    """Populate the exact-match status tables.
+
+    Imported lazily so this module keeps no import-time dependency on the
+    Blender error hierarchy, and so the mapping is stated in one readable place.
+    """
+    from blender.errors import (
+        C_CANCELLATION_PENDING,
+        BlenderCancelledError,
+        BlenderClosedError,
+        BlenderError,
+        BlenderNotFoundError,
+        BlenderPermissionError,
+        BlenderProcessError,
+        BlenderProtocolError,
+        BlenderScriptError,
+        BlenderSpawnError,
+        BlenderTimeoutError,
+    )
+
+    _STATUS_BY_ERROR_CODE.update({
+        # A cancelled child is a cancellation, never a generic failure. This
+        # includes the "could not terminate it" variant, which the ratified
+        # contract still classifies as cancelled (with distinct metadata).
+        BlenderCancelledError.code: CapabilityStatus.CANCELLED,
+        C_CANCELLATION_PENDING: CapabilityStatus.CANCELLED,
+        # The executable is missing or unusable: the capability is unavailable.
+        BlenderNotFoundError.code: CapabilityStatus.UNAVAILABLE,
+        BlenderSpawnError.code: CapabilityStatus.UNAVAILABLE,
+        # Access denied is a permission outcome, not a malformed request.
+        BlenderPermissionError.code: CapabilityStatus.PERMISSION_REQUIRED,
+        # Everything else is a plain failure. A lifecycle fault (closed layer) is
+        # deliberately a failure too: it is not caller-attributable invalid input.
+        BlenderClosedError.code: CapabilityStatus.FAILURE,
+        BlenderTimeoutError.code: CapabilityStatus.FAILURE,
+        BlenderProcessError.code: CapabilityStatus.FAILURE,
+        BlenderScriptError.code: CapabilityStatus.FAILURE,
+        BlenderProtocolError.code: CapabilityStatus.FAILURE,
+        BlenderError.code: CapabilityStatus.FAILURE,
+    })
+    _STATUS_BY_EXCEPTION_TYPE.extend((
+        (BlenderCancelledError, CapabilityStatus.CANCELLED),
+        (BlenderNotFoundError, CapabilityStatus.UNAVAILABLE),
+        (BlenderPermissionError, CapabilityStatus.PERMISSION_REQUIRED),
+    ))
+
+
+_build_status_tables()
 
 
 class CapabilityCancellationError(Exception):
@@ -599,15 +664,70 @@ class _LayerAdapter:
         with scope(request.request_id, request.context):
             yield self.layer
 
+    @contextmanager
+    def _cancellation_scope(self, request: CapabilityRequest):
+        """Bind the request's cancellation token on the layer for this call.
+
+        Layers exposing ``cancellation_scope`` can then honour a cancellation
+        that arrives while the operation is already running, rather than only
+        observing one that was set beforehand. Layers without the hook are
+        unaffected.
+        """
+        scope = getattr(self.layer, "cancellation_scope", None)
+        if not callable(scope) or request.cancellation_token is None:
+            yield self.layer
+            return
+        with scope(request.cancellation_token):
+            yield self.layer
+
+    @contextmanager
+    def _scopes(self, request: CapabilityRequest):
+        """Bind every per-call layer scope this capability understands."""
+        with self._correlation_scope(request):
+            with self._cancellation_scope(request):
+                yield self.layer
+
     @staticmethod
     def _status_for_exception(exc: BaseException) -> CapabilityStatus:
-        code = str(getattr(exc, "code", "")).lower()
-        name = type(exc).__name__.lower()
-        if isinstance(exc, PermissionError) or "permission" in code:
+        """Map an exception onto a capability status by stable code.
+
+        Status is decided by exact match against a known error code (or an exact
+        exception type), never by searching the message for words like
+        "invalid". That is what keeps an infrastructure failure from being
+        misreported as caller-attributable invalid input. An unrecognised code
+        is a plain failure; nothing here can produce ``INVALID_REQUEST``.
+        """
+        if isinstance(exc, CapabilityCancellationError):
+            return CapabilityStatus.CANCELLED
+        if isinstance(exc, PermissionError):
             return CapabilityStatus.PERMISSION_REQUIRED
-        if "not_found" in code or "unavailable" in code or "notfound" in name:
-            return CapabilityStatus.UNAVAILABLE
+        code = str(getattr(exc, "code", "") or "")
+        if code:
+            mapped = _STATUS_BY_ERROR_CODE.get(code)
+            if mapped is not None:
+                return mapped
+        for exc_type, status in _STATUS_BY_EXCEPTION_TYPE:
+            if isinstance(exc, exc_type):
+                return status
         return CapabilityStatus.FAILURE
+
+    @staticmethod
+    def _cancellation_metadata(exc: BaseException) -> dict:
+        """Ratified cancellation attribution to surface on the result.
+
+        The contract requires that a cancellation which could not terminate its
+        child be distinguishable from one that did, via stable result metadata
+        rather than message wording. Only the two ratified keys are promoted; the
+        rest of the diagnostics stay on the error object.
+        """
+        diagnostics = getattr(exc, "diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return {}
+        metadata: dict = {}
+        for key in ("cancellation_terminated", "interruptible"):
+            if key in diagnostics:
+                metadata[key] = diagnostics[key]
+        return metadata
 
     def execute(self, request: CapabilityRequest) -> CapabilityResult:
         try:
@@ -619,7 +739,7 @@ class _LayerAdapter:
         if not self.can_execute(request.operation):
             return CapabilityResult.failure(request, CapabilityStatus.INVALID_REQUEST, f"unsupported operation: {request.operation}")
         try:
-            with self._correlation_scope(request):
+            with self._scopes(request):
                 value = self._dispatch(request.operation, request.params)
             return CapabilityResult.from_value(value, request, time.perf_counter())
         except PermissionError as exc:
@@ -628,7 +748,12 @@ class _LayerAdapter:
             return CapabilityResult.failure(request, CapabilityStatus.CANCELLED, "capability observed cancellation")
         except Exception as exc:  # noqa: BLE001 - normalize implementation errors
             status = self._status_for_exception(exc)
-            return CapabilityResult.failure(request, status, str(exc) or type(exc).__name__, code=getattr(exc, "code", type(exc).__name__))
+            metadata = self._cancellation_metadata(exc)
+            return CapabilityResult.failure(
+                request, status, str(exc) or type(exc).__name__,
+                code=getattr(exc, "code", type(exc).__name__),
+                metadata=metadata or None,
+            )
 
     def cancel(self, task_id: str = "", *, request_id: str = "") -> bool:
         cancel = getattr(self.layer, "cancel_task", None)
@@ -649,11 +774,7 @@ class _LayerAdapter:
 
 class BlenderCapabilityAdapter(_LayerAdapter):
     name = "blender"
-    _operations = (
-        "inspect_scene", "list_objects", "inspect_object", "create_object", "delete_object",
-        "modify_object", "transform_object", "create_material", "assign_material",
-        "configure_camera", "configure_light", "execute_script", "save", "export", "render", "inspect_render",
-    )
+    _operations = BLENDER_OPERATION_NAMES
 
 
 class VisionCapabilityAdapter(_LayerAdapter):
@@ -712,7 +833,7 @@ class BlenderVisionCapabilityAdapter(_LayerAdapter):
         if not self.can_execute(request.operation):
             return CapabilityResult.failure(request, CapabilityStatus.INVALID_REQUEST, f"unsupported operation: {request.operation}")
         try:
-            with self._correlation_scope(request):
+            with self._scopes(request):
                 value = self._dispatch_request(request)
         except BlenderVisionError as exc:
             status = CapabilityStatus.UNAVAILABLE if "unavailable" in exc.code else CapabilityStatus.FAILURE

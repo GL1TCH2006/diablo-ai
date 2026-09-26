@@ -166,6 +166,42 @@ defines no grace/termination timeout today (verified: no grace/timeout knob in
 `config/settings.py`), so nothing on the S1 side needs to change. If S1 later
 defines one, this contract is the integration point.
 
+#### Status: implemented (S2.9)
+
+Points 1-6 are implemented in `blender/runner.py` and `blender/capabilities.py`:
+
+* the child is started with `subprocess.Popen`, so the runner keeps a handle and
+  a supervision loop polls the cancellation token and the deadline;
+* on cancellation (or timeout) the runner stops waiting, calls `terminate()`,
+  then escalates to `kill()` after a bounded grace, and reaps the child;
+* the outcome is reported as `cancelled` with error code `blender_cancelled`;
+* termination is **confirmed, never assumed**: when the child cannot be
+  confirmed dead, the code is `cancellation_pending` and
+  `metadata.cancellation_terminated` is `false`, as required above. S2 does not
+  claim a termination it did not achieve;
+* `metadata.interruptible` reflects the operation's class from the authoritative
+  inventory (`blender/operations.py`): read-only operations are interruptible;
+  session-mutating operations are not, and force session revalidation;
+* after any forced termination of a session-mutating operation the session is
+  revalidated and discarded when it is not provably intact, so a torn `.blend`
+  is never reused blindly.
+
+`terminate()`/`kill()` are used rather than `send_signal` because Windows has no
+`SIGKILL`; a missing signal constant must never turn a kill escalation into an
+`AttributeError`.
+
+Verified behaviourally in `tests/test_s2_9_hardening.py` (real child processes
+for termination, kill ordering, orphan checks and output bounding) and against a
+real `blender.exe`, which is terminated mid-render with no surviving process.
+
+**Limitation.** Supervision is bound through the capability boundary
+(`BlenderCapabilityLayer.cancellation_scope`, entered by the adapters). An S2.8
+workflow that calls the layer directly does not bind a per-task token, so a
+workflow step still checks for cancellation only before and after the call and
+cannot interrupt a child already running. Closing that would mean threading the
+workflow's per-task token into its layer-call funnel, i.e. an S2.8 redesign,
+which is out of scope here.
+
 ---
 
 ## Contract 3 — Error Vocabulary / Status Assignment
@@ -216,6 +252,45 @@ Verified S1 behaviour at ratification (no S1 change required):
 | unknown dispatch `Exception` | `failure` |
 
 No infrastructure condition produced `invalid_request`. S1 already satisfies
+this; S2.9 removes the last S2-side text inference so the guarantee is structural
+rather than incidental.
+
+#### Status: implemented (S2.9)
+
+S2 no longer infers a status from a message, or from a substring of an error
+code. `_LayerAdapter._status_for_exception` matches an **exact** stable code
+against a declared table, then falls back to exact exception types, and defaults
+to `failure`:
+
+| Blender error code | Status |
+| --- | --- |
+| `blender_cancelled`, `cancellation_pending` | `cancelled` |
+| `blender_not_found`, `blender_spawn_error` | `unavailable` |
+| `blender_permission_denied` | `permission_required` |
+| `blender_timeout` | `failure` |
+| `blender_process_error`, `blender_script_error`, `blender_protocol_error` | `failure` |
+| `blender_closed` | `failure` |
+| `blender_error` (unclassified) | `failure` |
+
+A subprocess that cannot be created is now a typed error rather than a raw
+`OSError`: `FileNotFoundError` -> `blender_not_found`, `PermissionError` ->
+`blender_permission_denied`, any other `OSError` -> `blender_spawn_error`.
+`blender_closed` (an operation attempted on a closed layer) is a lifecycle fault
+and is deliberately a `failure`, not caller-attributable invalid input.
+
+`INVALID_REQUEST` remains reachable only for a structurally invalid request or an
+unsupported operation requested by the caller. No entry in the table can produce
+it. The closed code set lives in `blender.errors.ERROR_CODES` and is pinned by
+`tests/test_s2_9_hardening.py`.
+
+### Operation inventory
+
+`blender/operations.py` is the single authoritative inventory. It classifies each
+operation as subprocess or local, and as session-mutating or read-only, which is
+what drives the cancellation-safety distinction above. The wire protocol
+(`SUPPORTED_OPERATIONS`) and the capability adapter (`_operations`) derive from
+it; the Blender-side dispatch script keeps its own read-only literal because it
+runs standalone inside Blender's interpreter, and a test asserts the two agree.
 this contract.
 
 `INVALID_REQUEST` is currently assigned only for: missing

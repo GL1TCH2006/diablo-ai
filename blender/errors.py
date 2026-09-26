@@ -28,6 +28,8 @@ class BlenderError(Exception):
         stderr: str = "",
         code: str = "",
         timeout: float | None = None,
+        request_id: str = "",
+        diagnostics: dict | None = None,
     ) -> None:
         self.operation = operation or ""
         self.message = message or str(self)
@@ -37,11 +39,17 @@ class BlenderError(Exception):
         self.stderr = stderr or ""
         self.timeout = timeout
         self.code = code or self.default_code
+        # Diagnostic attribution only. This is never an authoritative identity:
+        # S1 owns request_id, and CapabilityResult assigns it from the request.
+        # It is populated exclusively from the trusted correlation scope so a
+        # failure can be traced back to the call that produced it.
+        self.request_id = request_id or ""
+        self.diagnostics = dict(diagnostics or {})
         super().__init__(self.message)
 
     def to_dict(self, max_stream_chars: int = 4000) -> dict:
         """JSON-safe structured failure description."""
-        return {
+        payload = {
             "error": self.code,
             "operation": self.operation,
             "message": self.message,
@@ -51,6 +59,12 @@ class BlenderError(Exception):
             "stdout": self.stdout[:max_stream_chars],
             "stderr": self.stderr[:max_stream_chars],
         }
+        if self.request_id:
+            # Attribution, not authority. See the note on self.request_id.
+            payload["request_id"] = self.request_id
+        if self.diagnostics:
+            payload["diagnostics"] = dict(self.diagnostics)
+        return payload
 
     def __str__(self) -> str:
         parts = [self.code]
@@ -70,11 +84,61 @@ class BlenderNotFoundError(BlenderError):
     default_code = "blender_not_found"
 
 
+class BlenderSpawnError(BlenderError):
+    """The Blender child process could not be created at all.
+
+    Raised instead of letting a raw ``OSError`` from ``Popen`` escape. Covers
+    the generic spawn failure that is neither a missing executable nor a
+    permission problem (too many handles, bad working directory, ...).
+    """
+
+    code = "blender_spawn_error"
+    default_code = "blender_spawn_error"
+
+
+class BlenderPermissionError(BlenderError):
+    """The Blender executable or its working directory is not accessible."""
+
+    code = "blender_permission_denied"
+    default_code = "blender_permission_denied"
+
+
 class BlenderTimeoutError(BlenderError):
     """A Blender subprocess exceeded its configured timeout."""
 
     code = "blender_timeout"
     default_code = "blender_timeout"
+
+
+class BlenderCancelledError(BlenderError):
+    """A Blender subprocess was terminated because its request was cancelled.
+
+    Distinct from a timeout on purpose: cancellation must never be reported as a
+    generic failure, and the capability boundary maps this code to ``CANCELLED``.
+
+    When the child could **not** be confirmed dead, the code becomes
+    :data:`C_CANCELLATION_PENDING` instead, because S2 must never claim a
+    termination it did not achieve.
+    """
+
+    code = "blender_cancelled"
+    default_code = "blender_cancelled"
+
+    @property
+    def terminated(self) -> bool:
+        """Whether the child was confirmed dead. Never assumed."""
+        return bool(self.diagnostics.get("cancellation_terminated", False))
+
+
+class BlenderClosedError(BlenderError):
+    """An operation was attempted on a layer that has been closed.
+
+    A lifecycle fault rather than caller-attributable invalid input, so it maps
+    to ``FAILURE`` and never to ``INVALID_REQUEST``.
+    """
+
+    code = "blender_closed"
+    default_code = "blender_closed"
 
 
 class BlenderProcessError(BlenderError):
@@ -102,6 +166,33 @@ class BlenderProtocolError(BlenderError):
 C_UNKNOWN_OPERATION = "unknown_operation"
 C_SCRIPT_ERROR = "blender_script_error"  # same as BlenderScriptError.code
 C_RUNNER_FAILURE = "runner_failure"
+
+#: Reported when a cancellation arrived but the child could not be confirmed
+#: terminated. The ratified contract requires this exact code plus
+#: ``metadata.cancellation_terminated = false``; S2 must not claim a termination
+#: it did not achieve, and must not report SUCCESS.
+C_CANCELLATION_PENDING = "cancellation_pending"
+
+#: Every stable error code this subsystem can produce. The capability boundary
+#: maps these to statuses by exact code, never by inspecting message text, so an
+#: infrastructure failure can never be misreported as invalid caller input.
+ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "blender_error",
+        "blender_not_found",
+        "blender_spawn_error",
+        "blender_permission_denied",
+        "blender_timeout",
+        "blender_cancelled",
+        "blender_closed",
+        "blender_process_error",
+        "blender_script_error",
+        "blender_protocol_error",
+        C_UNKNOWN_OPERATION,
+        C_RUNNER_FAILURE,
+        C_CANCELLATION_PENDING,
+    }
+)
 
 
 def condense(exc: BlenderError) -> str:

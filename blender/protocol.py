@@ -46,28 +46,16 @@ from typing import Any
 
 from core.logging_setup import get_logger
 
+from .operations import SUBPROCESS_OPERATIONS
+
 log = get_logger("blender.protocol")
 
 #: Operations recognised by the Blender-side dispatcher.
-SUPPORTED_OPERATIONS = frozenset(
-    {
-        "inspect_scene",
-        "list_objects",
-        "inspect_object",
-        "create_object",
-        "delete_object",
-        "modify_object",
-        "transform_object",
-        "create_material",
-        "assign_material",
-        "configure_camera",
-        "configure_light",
-        "execute_script",
-        "save",
-        "export",
-        "render",
-    }
-)
+#:
+#: Derived from the authoritative inventory in :mod:`blender.operations` rather
+#: than restated here. The Blender-side dispatch script must expose a matching
+#: ``op_<name>`` handler for each; ``tests/test_s2_9_hardening.py`` enforces it.
+SUPPORTED_OPERATIONS = frozenset(SUBPROCESS_OPERATIONS)
 
 
 def new_request_id() -> str:
