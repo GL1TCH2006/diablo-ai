@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
+from core.logging_setup import get_logger
 from core.verification import VerificationState
+
+log = get_logger("task_manager")
 
 
 class StepStatus(str, Enum):
@@ -193,7 +197,21 @@ class TaskManager:
         self.verification = value
         self.verification_detail = detail
         if evidence is not None:
-            self.verification_evidence = dict(evidence)
+            # `verification_evidence` is a mapping by contract, and this value is
+            # persisted into the task record. A capability that reports a
+            # non-mapping evidence payload (a bare list, tuple or string) must
+            # not be able to raise here: dict() on those raises TypeError or
+            # ValueError, which would abort task persistence mid-flight.
+            # Reject the payload instead of crashing; the ledger is what
+            # adjudicates whether such evidence may support a verdict.
+            if isinstance(evidence, Mapping):
+                self.verification_evidence = dict(evidence)
+            else:
+                log.warning(
+                    "ignored non-mapping verification evidence of type %s",
+                    type(evidence).__name__,
+                )
+                self.verification_evidence = {}
 
     def invalidate_verification(self, detail: str) -> None:
         if self.verification != VerificationState.NOT_RUN:
