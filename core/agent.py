@@ -1496,6 +1496,20 @@ class Agent:
         self._transition(TaskState.RECOVERING)
         self._emit_lifecycle("recovery_started", reason=reason, attempt=self._tasks.recovery_attempts)
 
+    def _force_failed_verification(self, reason: str) -> None:
+        """Record a terminal FAILED verdict through the ledger funnel.
+
+        Persistence and session-reconciliation failures are fail-closed: they may
+        only ever move verification to FAILED, never to PASSED. They still go
+        through ``record_verification`` so the ledger stays the single
+        adjudication authority and the persisted projection cannot end up
+        disagreeing with the authoritative scalar (which is exactly what
+        happened when these four sites called ``set_verification`` directly).
+        """
+        self._tasks.record_verification(
+            VerificationResult(VerificationState.FAILED, reason, "execution")
+        )
+
     def _mark_failure(self, detail: str) -> None:
         if not any(step.status in (StepStatus.FAILED, StepStatus.BLOCKED) for step in self._tasks.steps):
             step = self._tasks.add_step("execution")
@@ -1528,7 +1542,10 @@ class Agent:
             if tasks.verification != VerificationState.FAILED:
                 result = VerificationResult(VerificationState.FAILED, "Execution or verification failed.", "execution")
                 if tasks.state == TaskState.FAILED:
-                    tasks.set_verification(result.state, result.detail)
+                    # Already terminal: transitioning to VERIFYING would be an
+                    # illegal edge, so record through the ledger directly rather
+                    # than via _begin_verification. Still goes through the funnel.
+                    tasks.record_verification(result)
                     self._emit_lifecycle("verification_failed", verification=result.state.value, detail=result.detail)
                 else:
                     self._begin_verification()
@@ -1558,13 +1575,13 @@ class Agent:
                 status = "failed"
                 tasks.failure_reason = "Task persistence failed."
                 tasks.state = TaskState.FAILED
-                tasks.set_verification(VerificationState.FAILED, tasks.failure_reason)
+                self._force_failed_verification(tasks.failure_reason)
             if tracker.finish(reply, status) is None:
                 persistence_ok = False
                 status = "failed"
                 tasks.failure_reason = "Coding session persistence failed."
                 tasks.state = TaskState.FAILED
-                tasks.set_verification(VerificationState.FAILED, tasks.failure_reason)
+                self._force_failed_verification(tasks.failure_reason)
                 try:
                     record = self._task_store.get(active_id)
                     if record is not None:
@@ -1592,7 +1609,7 @@ class Agent:
             status = "failed"
             tasks.failure_reason = tasks.failure_reason or "Task persistence failed."
             self._transition(TaskState.FAILED)
-            tasks.set_verification(VerificationState.FAILED, tasks.failure_reason)
+            self._force_failed_verification(tasks.failure_reason)
         if not getattr(self, "_terminal_event_emitted", False):
             self._terminal_event_emitted = True
             event = {
