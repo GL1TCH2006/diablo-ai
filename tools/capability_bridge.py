@@ -500,6 +500,10 @@ def build_capability_tool(
     return ToolSpec(
         name="capability.execute",
         description=description(),
+        # M2.13.0: this one tool reaches Blender, Vision and the S2.8 workflows
+        # without being named after any of them, so its capability is declared
+        # explicitly rather than derived from the "capability" namespace.
+        capabilities=("capability", "blender", "vision"),
         parameters={
             "type": "object",
             "properties": {

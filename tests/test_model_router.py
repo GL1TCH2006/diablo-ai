@@ -113,7 +113,11 @@ def test_router_resource_fallback(tmp_settings, catalog, monkeypatch):
     router = ModelRouter(settings, catalog=catalog)
     identity = router.identities["qwen3:14b"]
     identity.size_bytes = 8 * 1024 ** 3
-    monkeypatch.setattr(mr, "_available_ram", lambda: 4 * 1024 ** 3)
+    # M2.13.0: the guard compares against *total* physical memory, because fit is
+    # a question about capacity. Patching _available_ram here would let the
+    # 8GiB model pass on a machine with 4GiB free of 16GiB total, which is
+    # exactly the false positive this fix removes.
+    monkeypatch.setattr(mr, "_total_ram", lambda: 6 * 1024 ** 3)
     choice = router._guard_resource(type("MC", (), {"name": "qwen3:14b", "mode": "force14b", "source": "forced", "reason": "", "escalated": False})())
     assert choice.name == "qwen3:8b"
     assert "resource" in choice.source

@@ -31,6 +31,26 @@ class ToolSpec:
     validate_args: Callable[[dict], None] | None = None
     persist_data: bool = False
     explicit_confirmation: bool = False
+    #: M2.13.0: explicit capability tags. Left empty on almost every tool, in
+    #: which case :attr:`capability` is derived from the tool's name namespace.
+    #: An explicit tag exists so a tool can declare that it serves a capability
+    #: other than the one its name suggests (``capability.execute`` reaches
+    #: Blender and Vision without being named after them).
+    capabilities: tuple[str, ...] = ()
+
+    @property
+    def capability(self) -> str:
+        """The single capability this tool belongs to.
+
+        Derived from the name namespace (``git.status`` -> ``git``) unless the
+        spec declares one explicitly. The namespace is real, stable structure
+        already present in every registered tool name, so classification needs
+        no keyword matching against user text.
+        """
+        if self.capabilities:
+            return str(self.capabilities[0])
+        namespace = str(self.name or "").split(".", 1)[0]
+        return namespace or "unknown"
 
     def describe_args(self, args: dict) -> str:
         if self.describe is not None:
@@ -63,3 +83,11 @@ class ToolRegistry:
 
     def names(self) -> list[str]:
         return list(self._tools.keys())
+
+    def by_capability(self, capability: str) -> list[ToolSpec]:
+        """Every spec whose capability matches, in registration order.
+
+        Ordering is registration order, so a capability subset is deterministic.
+        """
+        wanted = str(capability or "")
+        return [spec for spec in self._tools.values() if spec.capability == wanted]

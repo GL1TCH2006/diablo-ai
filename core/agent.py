@@ -97,6 +97,16 @@ class Agent:
         # ratified and must not grow; it is reset per request in
         # _begin_request_context and mirrored to TaskRecord.plan immediately.
         self._active_plan: ExecutionPlanRecord | None = None
+        # M2.13.0: every model degradation seen during the request in flight,
+        # oldest first. Lives on the Agent for the same reason _active_plan
+        # does - the P1 RequestContext field set is ratified and must not grow -
+        # and is reset per request in _begin_request_context. Each entry is the
+        # dict form of an AIProviderError plus the model it happened on and
+        # what was tried next, so a silent fallback chain can be reconstructed.
+        self._provider_failures: list[dict] = []
+        # M2.13.0: the most recent adaptive tool-context decision, kept for
+        # diagnostics. None until the first model turn selects one.
+        self._tool_context_decision: Any = None
         # The plan step currently between write-ahead and terminal state. Set by
         # _step_write_ahead so pre-execution hooks (checkpoints) can attach
         # provenance to the step they belong to.
@@ -1692,6 +1702,7 @@ class Agent:
         self._router_verify_ok = True
         self._escalations_used = 0
         self._offline_fallback_used = False
+        self._provider_failures = []
         self._tasks.begin_task(user_input)
         self._capture_plan_goal(user_input)
         self._events.emit_status("state", "thinking")
@@ -1868,39 +1879,173 @@ class Agent:
 
         return "; ".join(o.display for o in outcomes) if outcomes else "Done."
 
+    def _offline_response(self, messages: list[dict], specs: list) -> object:
+        from ai.offline_provider import OfflineProvider
+
+        offline = OfflineProvider(scratch_dir=self._settings.scratch_dir)
+        response = offline.chat(messages, tools=specs, model=offline.model_label)
+        self._offline_fallback_used = True
+        self._last_model = type("MC", (), {
+            "to_state_line": lambda self_: f"MODEL: {offline.model_label} MODE: fallback SOURCE: offline",
+            "escalated": False,
+        })()
+        return response
+
+    def _record_provider_failure(self, exc: Exception, model: str, next_model: str = "") -> dict:
+        """M2.13.0: make a swallowed provider failure observable.
+
+        The fallback chain used to discard the exception entirely, so an offline
+        answer was indistinguishable from a real one after the fact. The
+        structured fields let recovery and routing tell a timeout (this model is
+        too slow for this request) from a malformed response (this model cannot
+        do this task) from a missing model (the configuration is wrong).
+        """
+        from ai.provider import AIProviderError, FailureCategory
+
+        if isinstance(exc, AIProviderError):
+            detail = exc.to_dict()
+        else:
+            detail = {
+                "category": FailureCategory.UNKNOWN,
+                "model": model,
+                "latency": 0.0,
+                "retryable": False,
+                "status": 0,
+                "message": str(exc)[:300],
+            }
+        detail["model"] = detail.get("model") or model
+        detail["next_model"] = next_model
+        detail["exception"] = type(exc).__name__
+        self._provider_failures.append(detail)
+        return detail
+
+    @property
+    def provider_failures(self) -> list[dict]:
+        """Model degradations observed during the current request, oldest first."""
+        return list(self._provider_failures)
+
     def _chat_with_fallback(self, messages: list[dict], specs: list, choice) -> object:
         try:
             return self._provider.chat(messages, tools=specs, model=choice.name)
-        except Exception:
+        except Exception as primary:
             fallback = self._router.fallback_name(exclude=choice.name)
             if not fallback or fallback == choice.name:
-                from ai.offline_provider import OfflineProvider
-                offline = OfflineProvider(scratch_dir=self._settings.scratch_dir)
-                response = offline.chat(messages, tools=specs, model=offline.model_label)
-                self._offline_fallback_used = True
-                self._last_model = type("MC", (), {
-                    "to_state_line": lambda self_: f"MODEL: {offline.model_label} MODE: fallback SOURCE: offline",
-                    "escalated": False,
-                })()
-                return response
+                self._record_provider_failure(primary, getattr(choice, "name", ""), "offline")
+                self._emit_lifecycle(
+                    "model_offline_fallback",
+                    model=getattr(choice, "name", ""),
+                    reason="no alternative model available",
+                )
+                return self._offline_response(messages, specs)
             self._begin_recovery(f"provider unavailable for {choice.name}")
             try:
                 response = self._provider.chat(messages, tools=specs, model=fallback)
-                self._last_model = type("MC", (), {"to_state_line": lambda self_: f"MODEL: {fallback} MODE: {choice.mode} SOURCE: provider-fallback", "escalated": False})()
-                return response
-            except Exception:
-                from ai.offline_provider import OfflineProvider
-                offline = OfflineProvider(scratch_dir=self._settings.scratch_dir)
-                response = offline.chat(messages, tools=specs, model=offline.model_label)
-                self._offline_fallback_used = True
-                self._last_model = type("MC", (), {
-                    "to_state_line": lambda self_: f"MODEL: {offline.model_label} MODE: fallback SOURCE: offline",
-                    "escalated": False,
-                })()
-                return response
+            except Exception as secondary:
+                detail = self._record_provider_failure(
+                    primary, getattr(choice, "name", ""), fallback
+                )
+                self._record_provider_failure(secondary, fallback, "offline")
+                self._emit_lifecycle(
+                    "model_offline_fallback",
+                    model=fallback,
+                    reason="fallback model also failed",
+                    category=detail.get("category", ""),
+                )
+                return self._offline_response(messages, specs)
+            detail = self._record_provider_failure(
+                primary, getattr(choice, "name", ""), fallback
+            )
+            self._last_model = type("MC", (), {"to_state_line": lambda self_: f"MODEL: {fallback} MODE: {choice.mode} SOURCE: provider-fallback", "escalated": False})()
+            self._emit_lifecycle(
+                "model_fallback",
+                **{"from": getattr(choice, "name", ""), "to": fallback, **detail},
+            )
+            return response
+
+    def _tool_context(self, user_input: str) -> tuple[list, Any]:
+        """Select which tool specs to present to the model for this turn.
+
+        Presentation only. The full registry stays authoritative: tool calls are
+        still validated and dispatched against every registered tool, and
+        permissions are unchanged. The decision is recorded for diagnostics and
+        any failure degrades to the full registry.
+        """
+        selector = getattr(self, "_tool_selector", None)
+        if selector is None:
+            from core.tool_context import ToolContextSelector
+
+            selector = ToolContextSelector(self._registry)
+            self._tool_selector = selector
+        settings = getattr(self, "_settings", None)
+        if getattr(settings, "tools_full_context", False):
+            decision = selector.select(full=True)
+        else:
+            try:
+                planner_class = self._planner.coding_intent(user_input) or ""
+            except Exception:  # pragma: no cover - defensive
+                planner_class = ""
+            # Observed tools for this request: the strongest structured signal
+            # available, because it is what the agent actually did, not text.
+            used = [step.name for step in getattr(self._tasks, "steps", [])]
+            decision = selector.select(
+                user_text=user_input,
+                planner_class=planner_class,
+                used_tool_names=used,
+                capabilities=self._requested_capabilities(user_input),
+            )
+        specs = selector.specs_for(decision)
+        self._tool_context_decision = decision
+        self._emit_lifecycle(
+            "tool_context_selected",
+            tool_count=decision.tool_count,
+            total_tools=decision.total_tools,
+            reduction=decision.reduction_ratio,
+            capabilities=list(decision.capabilities),
+            reason=decision.reason,
+            degraded=decision.degraded,
+        )
+        log.info(
+            "tool context: %d/%d tools (%.0f%% withheld) via %s",
+            decision.tool_count, decision.total_tools,
+            decision.reduction_ratio * 100, decision.reason,
+        )
+        return specs, decision
+
+    def _requested_capabilities(self, user_text: str) -> tuple[str, ...]:
+        """Capabilities the request explicitly names, from structured signals.
+
+        Derived from the planner's own classification and the active project's
+        detected profile rather than by scanning the sentence for keywords, so
+        an unrelated word in a path or a file name cannot widen or narrow the
+        tool set.
+        """
+        found: list[str] = []
+        try:
+            klass = self._planner.coding_intent(user_text) or ""
+        except Exception:  # pragma: no cover - defensive
+            klass = ""
+        if klass == "debug":
+            found.append("debugging")
+        elif klass == "develop":
+            found.append("coding")
+
+        project = getattr(self, "_project", None)
+        path = str(getattr(project, "path", "") or "")
+        if path:
+            try:
+                from coding.commands import detect_commands
+
+                commands = detect_commands(Path(path))
+                # A project that has its own version control or CI surface is
+                # far more likely to need it than an arbitrary request.
+                if commands.build.exists or commands.install.exists:
+                    found.append("version_control")
+            except Exception:  # pragma: no cover - detect_commands never raises
+                pass
+        return tuple(dict.fromkeys(found))
 
     def _llm_loop(self, user_input: str) -> str:
-        specs = self._registry.all_specs()
+        specs = self._tool_context(user_input)[0]
         messages = [
             {"role": "system", "content": build_system_prompt(
                 self._provider.model_label,

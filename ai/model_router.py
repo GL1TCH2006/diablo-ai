@@ -47,9 +47,25 @@ class ModelChoice:
     source: str = "default"
     reason: str = ""
     escalated: bool = False
+    #: M2.13.0: how confident the router is in this choice, 0.0-1.0. Additive
+    #: with defaults, so every existing construction site is unaffected.
+    confidence: float = 1.0
+    #: The evidence the decision was based on, for diagnostics.
+    signals: tuple = ()
 
     def to_state_line(self) -> str:
         return f"MODEL: {self.name}  MODE: {self.mode.upper()}  SOURCE: {self.source}" + (f"  ({self.reason})" if self.reason else "")
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "mode": self.mode,
+            "source": self.source,
+            "reason": self.reason,
+            "escalated": self.escalated,
+            "confidence": round(float(self.confidence), 3),
+            "signals": list(self.signals),
+        }
 
 
 class ModelRouter:
@@ -182,18 +198,47 @@ class ModelRouter:
         return self._available_choice(fast, "auto", "default", "routine request")
 
     def _guard_resource(self, choice: ModelChoice) -> ModelChoice:
+        """Refuse a model the machine cannot hold.
+
+        M2.13.0 fix. This compared the model's size against *currently
+        available* physical memory. That is the wrong quantity: available memory
+        measures what happens to be free this instant, and on a busy machine it
+        collapses even when a model would fit comfortably once the OS reclaimed
+        page cache. The M2.13.0 benchmark hit exactly that - 0.2GiB free of
+        15.7GiB - which would have made this guard reject every installed model
+        for no reason. Fit is a question about total capacity, so total capacity
+        is what is compared. Available memory is still reported, as context.
+        """
         if not self._settings.resource_check_enabled:
             return choice
         ident = self.identities.get(choice.name)
         if ident is None:
             return choice
-        ram_bytes = _available_ram()
-        if ram_bytes and ident.size_bytes and ident.size_bytes * 1.6 > ram_bytes:
-            fallback = self._fallback_name(exclude=choice.name)
-            if fallback and fallback != choice.name:
-                return ModelChoice(fallback, choice.mode, choice.source + "-resource-fallback",
-                                   f"strong model {choice.name} needs ~{ident.size_bytes // (1024 ** 3)}GiB; resources low")
-        return choice
+        total_bytes = _total_ram()
+        if not total_bytes or not ident.size_bytes:
+            return choice
+        needed = ident.size_bytes * 1.6
+        if needed <= total_bytes:
+            return choice
+        fallback = self._fallback_name(exclude=choice.name)
+        available = _available_ram()
+        detail = (
+            f"strong model {choice.name} needs ~{int(needed) // (1024 ** 3)}GiB "
+            f"of {total_bytes // (1024 ** 3)}GiB total"
+        )
+        if available:
+            detail += f" ({available // (1024 ** 3)}GiB free right now)"
+        if fallback and fallback != choice.name:
+            return ModelChoice(
+                fallback, choice.mode, choice.source + "-resource-fallback",
+                f"{detail}; using {fallback} instead", confidence=0.4,
+                signals=(f"total_ram={total_bytes}", f"needed={int(needed)}"),
+            )
+        return ModelChoice(
+            choice.name, choice.mode, choice.source + "-resource-warn",
+            f"{detail}; no smaller model installed", confidence=0.2,
+            signals=(f"total_ram={total_bytes}", f"needed={int(needed)}"),
+        )
 
     def fallback_name(self, exclude: str = "") -> str:
         return self._fallback_name(exclude=exclude)
@@ -254,6 +299,20 @@ def all_gb(size_bytes: int) -> float:
     return (size_bytes or 0) / (1024 ** 3)
 
 
+def _total_ram() -> int:
+    """Total physical memory in bytes, or 0 if it cannot be determined."""
+    return _memory_status()[0]
+
+
+def _available_ram() -> int:
+    """Physical memory free *right now*, or 0 if it cannot be determined.
+
+    Reported for context only. This is a snapshot, not a capacity, so it must
+    not be used to decide whether a model can be loaded.
+    """
+    return _memory_status()[1]
+
+
 def _parse_billion(text: str) -> float:
     if not text:
         return 0.0
@@ -274,18 +333,41 @@ def _family_of(name: str) -> str:
     return base
 
 
-def _available_ram() -> int:
+def _memory_status() -> tuple[int, int]:
+    """(total_physical, available_physical) in bytes; (0, 0) if unknown.
+
+    M2.13.0 fix. The previous implementation declared ``MEMORYSTATUSEX``
+    without its two leading ``DWORD`` fields (``dwLength``, ``dwMemoryLoad``).
+    ctypes then wrote and read every subsequent field at the wrong offset, the
+    call reported failure, and the function returned 0 - so the resource guard
+    silently did nothing on every machine. Setting ``dwLength`` is not
+    optional: the API uses it to validate the structure size.
+    """
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
-        class MS(ctypes.Structure):
-            _fields_ = [("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        ms = MS()
-        if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-            return int(ms.ullAvailPhys)
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        status = kernel32.GlobalMemoryStatusEx
+        status.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+        status.restype = wintypes.BOOL
+        info = MEMORYSTATUSEX()
+        info.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if status(ctypes.byref(info)):
+            return int(info.ullTotalPhys), int(info.ullAvailPhys)
     except Exception:
         pass
-    return 0
+    return 0, 0

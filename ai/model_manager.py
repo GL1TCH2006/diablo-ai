@@ -39,7 +39,16 @@ def build_backend(settings: Settings, force_offline: bool = False) -> BackendRes
         return _offline_fallback(settings, "Remote Ollama hosts are disabled. Set allow_remote_ollama=true to opt in.")
 
     try:
-        provider = OllamaProvider(host=settings.ollama_host)
+        # Only pass an explicit timeout when one was actually configured, so a
+        # substituted provider that accepts just `host` keeps working and the
+        # historical call shape is preserved.
+        from .ollama_provider import DEFAULT_TOOL_TIMEOUT
+
+        timeout = float(getattr(settings, "ai_request_timeout", DEFAULT_TOOL_TIMEOUT) or 0)
+        if timeout <= 0 or timeout == DEFAULT_TOOL_TIMEOUT:
+            provider = OllamaProvider(host=settings.ollama_host)
+        else:
+            provider = OllamaProvider(host=settings.ollama_host, timeout=timeout)
         if not provider.is_available():
             note = f"Ollama is not reachable at {settings.ollama_host}: {provider.reason}"
             return _offline_fallback(settings, note)

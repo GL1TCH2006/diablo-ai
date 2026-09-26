@@ -29,6 +29,16 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_float(value: str | None, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+    # A non-positive timeout would mean "give up immediately", which is never
+    # what someone setting a timeout intends.
+    return parsed if parsed > 0 else default
+
+
 @dataclass
 class Settings:
     base_dir: Path = BASE_DIR
@@ -70,6 +80,16 @@ class Settings:
     models_max_attempts_before_escalate: int = 1
     models_max_escalations: int = 1
     resource_check_enabled: bool = False
+    #: M2.13.0: per-request model timeout in seconds. The default is the
+    #: historical 600s, chosen because a cold large model on a loaded machine can
+    #: legitimately think for minutes; making it explicit lets a user on known
+    #: slow hardware shorten it deliberately instead of it being unreachable.
+    ai_request_timeout: float = 600.0
+    #: M2.13.0: when true, every model turn sees the complete registry instead
+    #: of the adaptively selected subset. The subset only changes what the model
+    #: is *shown* - permissions, dispatch and verification are unaffected - so
+    #: this exists as an escape hatch and a way to A/B the two behaviours.
+    tools_full_context: bool = False
     git_push_policy: str = "blocked"
     git_restore_policy: str = "blocked"
     git_branch_policy: str = "blocked"
@@ -101,6 +121,9 @@ def load_settings() -> Settings:
         ollama_host=env.get("OLLAMA_HOST", _str(toml, ["ollama", "host"], "http://localhost:11434")),
         allow_remote_ollama=_as_bool(env.get("ALLOW_REMOTE_OLLAMA"), _bool(toml, ["ollama", "allow_remote"], False)),
         ai_model=env.get("AI_MODEL", ""),
+        ai_request_timeout=_as_float(
+            env.get("AI_REQUEST_TIMEOUT"), _as_float(_str(toml, ["ai", "request_timeout"], ""), 600.0)
+        ),
         workspace_root=workspace_root,
         data_dir=data_dir,
         memory_dir=data_dir / "memory",
@@ -135,6 +158,7 @@ def load_settings() -> Settings:
         models_max_attempts_before_escalate=int(_int(toml, ["models", "max_attempts_before_escalate"], 1)),
         models_max_escalations=int(_int(toml, ["models", "max_escalations"], 1)),
         resource_check_enabled=_as_bool(env.get("RESOURCE_CHECK"), _str(toml, ["resources", "check_enabled"], "false")),
+        tools_full_context=_as_bool(env.get("TOOLS_FULL_CONTEXT"), _str(toml, ["tools", "full_context"], "false")),
         git_push_policy=_str(toml, ["git", "push"], "blocked"),
         git_restore_policy=_str(toml, ["git", "restore"], "blocked"),
         git_branch_policy=_str(toml, ["git", "branch"], "blocked"),

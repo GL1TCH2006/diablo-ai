@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 
-from .provider import AIProvider, AIProviderError, AIResponse, ModelInfo, ToolCall
+from .provider import AIProvider, AIProviderError, AIResponse, FailureCategory, ModelInfo, ToolCall
 
-_TOOL_TIMEOUT = 600.0
+#: Generous by design. A cold 30B model on a loaded machine can legitimately
+#: think for minutes, and cutting a slow model off early destroys work it was
+#: about to finish. It is configurable per provider instance; the default is
+#: unchanged.
+DEFAULT_TOOL_TIMEOUT = 600.0
+_TOOL_TIMEOUT = DEFAULT_TOOL_TIMEOUT
 _LIST_TIMEOUT = 5.0
 
 
@@ -26,9 +32,12 @@ class OllamaProvider(AIProvider):
     available = False
     reason = ""
 
-    def __init__(self, host: str = "http://localhost:11434"):
+    def __init__(self, host: str = "http://localhost:11434", timeout: float | None = None):
         self.host = host.rstrip("/")
         self.model_label = f"ollama@{self.host}"
+        #: ``None`` means "use the module default", so an unset setting cannot
+        #: accidentally mean "no timeout".
+        self.timeout = DEFAULT_TOOL_TIMEOUT if timeout is None else max(1.0, float(timeout))
 
     def is_available(self) -> bool:
         try:
@@ -64,7 +73,9 @@ class OllamaProvider(AIProvider):
 
     def chat(self, messages: list[dict], tools: list | None = None, model: str | None = None) -> AIResponse:
         if not model:
-            raise AIProviderError("No Ollama model selected.")
+            raise AIProviderError(
+                "No Ollama model selected.", category=FailureCategory.NO_MODEL, retryable=False
+            )
         prepared = _drop_tool_calls_holes(messages)
         for message in prepared:
             if message.get("role") in ("system", "user"):
@@ -78,18 +89,39 @@ class OllamaProvider(AIProvider):
         if tools:
             payload["tools"] = [to_ollama_schema(t) for t in tools]
 
+        started = time.perf_counter()
         try:
-            response = self._post(payload)
-        except AIProviderError:
+            response = self._post(payload, model=model, started=started)
+        except AIProviderError as exc:
+            # Fill in the model and latency if the inner layer did not.
+            if not exc.model:
+                exc.model = str(model or "")
+            if not exc.latency:
+                exc.latency = time.perf_counter() - started
             raise
         except httpx.TimeoutException as exc:
-            raise AIProviderError(f"Ollama timed out after {_TOOL_TIMEOUT}s.") from exc
+            raise AIProviderError(
+                f"Ollama timed out after {self.timeout}s.",
+                category=FailureCategory.TIMEOUT,
+                model=model,
+                latency=time.perf_counter() - started,
+            ) from exc
         except Exception as exc:
-            raise AIProviderError(f"Ollama request failed: {exc}") from exc
+            raise AIProviderError(
+                f"Ollama request failed: {exc}",
+                category=FailureCategory.CONNECTION,
+                model=model,
+                latency=time.perf_counter() - started,
+            ) from exc
 
         data = response
         if isinstance(data, dict) and data.get("error"):
-            raise AIProviderError(str(data["error"]))
+            raise AIProviderError(
+                str(data["error"]),
+                category=FailureCategory.HTTP,
+                model=model,
+                latency=time.perf_counter() - started,
+            )
 
         message = (data or {}).get("message", {}) or {}
         content = message.get("content") or ""
@@ -100,30 +132,58 @@ class OllamaProvider(AIProvider):
                 ToolCall(
                     id=f"call_{slot}",
                     name=function.get("name", ""),
-                    arguments=_parse_args(function.get("arguments", "{}")),
+                    arguments=_parse_args(function.get("arguments", "{}"), model=model),
                 )
             )
         return AIResponse(text=content, tool_calls=calls, model=model)
 
-    def _post(self, payload: dict) -> dict:
+    def _post(self, payload: dict, model: str = "", started: float = 0.0) -> dict:
         try:
-            resp = httpx.post(f"{self.host}/api/chat", json=payload, timeout=_TOOL_TIMEOUT)
+            resp = httpx.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500] if exc.response is not None else ""
-            raise AIProviderError(f"Ollama HTTP {exc.response.status_code}: {detail}") from exc
+            status = exc.response.status_code if exc.response is not None else 0
+            raise AIProviderError(
+                f"Ollama HTTP {status}: {detail}",
+                category=FailureCategory.HTTP,
+                model=model,
+                latency=(time.perf_counter() - started) if started else 0.0,
+                # 5xx is transient; 4xx means this request will never be accepted.
+                retryable=500 <= status < 600,
+                status=status,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise AIProviderError(
+                f"Ollama timed out after {self.timeout}s.",
+                category=FailureCategory.TIMEOUT,
+                model=model,
+                latency=(time.perf_counter() - started) if started else 0.0,
+            ) from exc
 
 
-def _parse_args(raw) -> dict:
+def _parse_args(raw, model: str = "") -> dict:
     if isinstance(raw, dict):
         return raw
     try:
         parsed = json.loads(raw or "{}")
     except (TypeError, ValueError) as exc:
-        raise AIProviderError("Ollama returned malformed tool arguments.") from exc
+        raise AIProviderError(
+            "Ollama returned malformed tool arguments.",
+            category=FailureCategory.MALFORMED,
+            model=model,
+            # Deliberately not retryable: the same model will malform the same
+            # way, so this is a capability signal, not a transient fault.
+            retryable=False,
+        ) from exc
     if not isinstance(parsed, dict):
-        raise AIProviderError("Ollama returned non-object tool arguments.")
+        raise AIProviderError(
+            "Ollama returned non-object tool arguments.",
+            category=FailureCategory.MALFORMED,
+            model=model,
+            retryable=False,
+        )
     return parsed
 
 
