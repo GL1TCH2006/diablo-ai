@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from ai.provider import AIProvider, ToolCall
@@ -21,6 +22,13 @@ from core.planner import (
     PlanValidationError,
     Planner,
     side_effect_key,
+)
+from core.recovery import (
+    FailureCategory,
+    FailureObservation,
+    RecoveryAction,
+    RecoveryDecision,
+    RecoveryPolicy,
 )
 from core.request_context import (
     DEFAULT_MAX_CONCURRENT_REQUESTS,
@@ -1308,9 +1316,12 @@ class Agent:
         if status in (StepStatus.FAILED, StepStatus.BLOCKED, StepStatus.CANCELLED):
             if getattr(outcome, "executed", False) or any(s.status == StepStatus.DONE for s in self._tasks.steps):
                 self._tasks.mark_partial()
-            threshold = max(1, int(getattr(self._settings, "models_max_attempts_before_escalate", 1)))
-            if self._tasks.recovery_attempts + 1 >= threshold:
-                self._router_verify_ok = False
+            # M2.12 P3: model escalation is no longer decided by a bare counter
+            # comparison here. The single RecoveryPolicy decides, and it can
+            # refuse - cancellation, an interrupted step, a non-retryable
+            # category, a terminal step or a spent escalation budget all suppress
+            # escalation.
+            self._apply_recovery_policy(tool, outcome, status, plan_step, phase="escalation")
         if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED, TaskState.COMPLETED):
             self._transition(TaskState.EXECUTING)
         verification = getattr(outcome, "verification", None)
@@ -1324,6 +1335,113 @@ class Agent:
         self._step_event(step, outcome)
         self._sync_task_metadata()
         return step
+
+    def _recovery_policy(self) -> RecoveryPolicy:
+        """The single recovery policy, built from existing settings.
+
+        ``max_recovery_attempts`` already bounded the LLM loop and
+        ``models_max_escalations`` already bounded the router, so both limits
+        are reused rather than replaced with new knobs. The escalation ceiling
+        here is the stricter of the two, so recovery can never drive more
+        escalation than the router would allow on its own.
+        """
+        settings = getattr(self, "_settings", None)
+        retries = max(0, int(getattr(settings, "max_recovery_attempts", 3)))
+        router_ceiling = max(0, int(getattr(settings, "models_max_escalations", retries)))
+        return RecoveryPolicy(
+            max_retries=retries,
+            max_escalations=min(router_ceiling, retries) if router_ceiling else retries,
+        )
+
+    def _failure_observation(
+        self,
+        tool: str,
+        outcome,
+        status: StepStatus,
+        plan_step=None,
+    ) -> FailureObservation:
+        """Build the redacted recovery input for one failed execution."""
+        verification = getattr(outcome, "verification", None)
+        entry = self._tasks.ledger.latest
+        state = VerificationState.NOT_RUN
+        evidence: dict = {}
+        if isinstance(verification, VerificationResult):
+            state = verification.state
+        if entry is not None:
+            state = entry.state
+            evidence = dict(entry.evidence)
+        capability = ""
+        if plan_step is not None:
+            capability = str(getattr(plan_step, "capability", "") or "")
+        data = getattr(outcome, "data", None)
+        if not capability and isinstance(data, Mapping):
+            payload = data.get("capability_result")
+            if isinstance(payload, Mapping):
+                capability = str(payload.get("capability") or "")
+        return FailureObservation(
+            category=_failure_category(outcome, status),
+            task_id=str(getattr(self._tasks, "task_id", "") or ""),
+            run_id=str(getattr(self._tasks, "run_id", "") or ""),
+            step_id=str(getattr(plan_step, "step_id", "") or ""),
+            tool=str(tool or ""),
+            capability=capability,
+            error_code=str(getattr(outcome, "status", "") or ""),
+            error_type=str(getattr(outcome, "reason", "") or ""),
+            error_message=str(getattr(outcome, "error", "") or ""),
+            attempt=int(getattr(plan_step, "attempts", 0) or 0),
+            recovery_attempts=int(getattr(self._tasks, "recovery_attempts", 0) or 0),
+            escalations_used=int(self._escalations_used),
+            verification_state=state,
+            verification_evidence=evidence,
+            cancelled=bool(getattr(outcome, "cancelled", False)),
+            recovery_hint=str(getattr(plan_step, "recovery_hint", "") or ""),
+            expected_result=getattr(plan_step, "expected_result", None),
+            step_status=status,
+            step_replayable=bool(plan_step.is_replayable) if plan_step is not None else True,
+            interrupted=bool(getattr(plan_step, "interrupted", False)) if plan_step is not None else False,
+        )
+
+    def _apply_recovery_policy(
+        self,
+        tool: str,
+        outcome,
+        status: StepStatus,
+        plan_step=None,
+        phase: str = "",
+    ) -> RecoveryDecision:
+        """Route one failure through the single RecoveryPolicy and apply it.
+
+        The policy decides; this method only carries out the decision by
+        adjusting the signals the existing loop and router already read
+        (``_router_verify_ok`` for escalation). It never dispatches work itself
+        and never bypasses permission, workspace or state-machine enforcement.
+        """
+        observation = self._failure_observation(tool, outcome, status, plan_step)
+        decision = self._recovery_policy().decide(observation)
+        if decision.action is RecoveryAction.ESCALATE_MODEL:
+            # Model *selection* stays with _select_model / ModelRouter. This only
+            # marks verification as not-ok, which is the router's existing input
+            # for escalating.
+            self._router_verify_ok = False
+        self._emit_lifecycle(
+            "recovery_decided",
+            phase=phase or "unspecified",
+            action=decision.action.value,
+            reason=decision.reason,
+            category=observation.category.value,
+            step_id=observation.step_id,
+            tool=observation.tool,
+            retries_used=decision.retries_used,
+            escalations_used=decision.escalations_used,
+        )
+        log.info(
+            "recovery policy [%s] %s for %s: %s",
+            phase or "unspecified",
+            decision.action.value,
+            tool,
+            decision.reason,
+        )
+        return decision
 
     def _plan_step_runnable(self, step: PlanStepRecord) -> bool:
         """Dependency gate: a step runs only when its dependencies are DONE."""
@@ -1753,7 +1871,6 @@ class Agent:
         messages.append({"role": "user", "content": user_input})
         max_turns = max(1, int(getattr(self._settings, "max_turns", 4)))
         max_tool_calls = max(1, int(getattr(self._settings, "max_tool_calls", 32)))
-        max_recovery_attempts = max(0, int(getattr(self._settings, "max_recovery_attempts", 3)))
         tool_call_count = 0
 
         for _ in range(max_turns):
@@ -1822,16 +1939,24 @@ class Agent:
                     self._finalize_plan()
                     return "Task cancelled."
                 if not outcome.success:
+                    # M2.12 P3: the bounded-retry decision is made by the single
+                    # RecoveryPolicy, not by an inline counter comparison. The
+                    # branch structure and user-visible wording are preserved.
+                    decision = self._apply_recovery_policy(
+                        step.tool, outcome, self._step_status(outcome), plan_step=step, phase="llm_loop"
+                    )
+                    if decision.action is RecoveryAction.RETRY_STEP:
+                        self._begin_recovery(outcome.error or outcome.reason or f"{step.tool} failed")
+                        break
                     if not outcome.executed:
                         self._mark_failure(outcome.error or outcome.reason or "Tool was blocked.")
                         self._finalize_plan()
                         return "Task stopped because a tool was blocked."
-                    if self._tasks.recovery_attempts >= max_recovery_attempts:
-                        self._mark_failure(outcome.error or outcome.reason or "Tool failed repeatedly.")
-                        self._finalize_plan()
-                        return "Task stopped after bounded recovery attempts."
-                    self._begin_recovery(outcome.error or outcome.reason or f"{step.tool} failed")
-                    break
+                    self._mark_failure(outcome.error or outcome.reason or "Tool failed repeatedly.")
+                    self._finalize_plan()
+                    if decision.action is RecoveryAction.ESCALATE_MODEL:
+                        return "Task stopped after bounded recovery attempts; a stronger model may be required."
+                    return "Task stopped after bounded recovery attempts."
             self._finalize_plan()
             log.debug("agent loop: %d tool call(s) executed this turn", tool_call_count)
 
@@ -1936,6 +2061,33 @@ class Agent:
                 self._conversation.append_assistant(reply)
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("Could not persist conversation: %s", exc)
+
+
+def _failure_category(outcome, status: StepStatus) -> FailureCategory:
+    """Classify one failed execution into the shared recovery vocabulary.
+
+    Reuses the ratified ``CapabilityStatus`` and ``StepStatus`` meanings rather
+    than inferring a category from error-message wording. In particular it never
+    pattern-matches the error *text* to decide a status, which the cross-layer
+    contract forbids.
+    """
+    if bool(getattr(outcome, "cancelled", False)) or status is StepStatus.CANCELLED:
+        return FailureCategory.CANCELLED
+    if status is StepStatus.BLOCKED or not getattr(outcome, "executed", False):
+        return FailureCategory.NOT_EXECUTED
+    if bool(getattr(outcome, "allowed", True)) is False:
+        return FailureCategory.PERMISSION_DENIED
+    code = str(getattr(outcome, "status", "") or "").strip().lower()
+    if code in {"permission_required", "blocked", "denied"}:
+        return FailureCategory.PERMISSION_DENIED
+    if code in {"invalid_request"}:
+        return FailureCategory.INVALID_REQUEST
+    if code in {"unavailable", "timeout"}:
+        return FailureCategory.UNAVAILABLE
+    verification = getattr(outcome, "verification", None)
+    if isinstance(verification, VerificationResult) and verification.state == VerificationState.FAILED:
+        return FailureCategory.VERIFICATION_FAILED
+    return FailureCategory.EXECUTION_FAILED
 
 
 def _ledger_snapshot(tasks) -> dict:

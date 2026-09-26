@@ -7,7 +7,8 @@ from core.cancellation import CancellationToken, cancellation_requested
 from core.context_builder import ContextBuilder
 from core.logging_setup import get_logger
 from core.planner import ExecutionPlan, PlanValidationError
-from core.verification import Verifier
+from core.recovery import FailureCategory, FailureObservation, RecoveryAction, RecoveryPolicy
+from core.verification import VerificationState, Verifier
 
 log = get_logger("debug_loop")
 
@@ -75,6 +76,49 @@ class DebugLoop:
         self._model_name = model_name
         self._on_outcome = on_outcome
         self._cancellation_token = cancellation_token
+        self._last_recovery_decision = None
+
+    def _recovery_policy(self) -> RecoveryPolicy:
+        """Recovery policy for the debug loop.
+
+        DebugLoop's own bound is ``max_recovery_attempts`` (default 1), which is
+        stricter than the agent-wide setting, so it keeps its existing
+        behaviour: one extra bounded repair attempt after a failed auto-verify.
+        Escalation stays off here because DebugLoop has no model router of its
+        own - the agent owns escalation.
+        """
+        max_recovery = max(0, int(getattr(self._settings, "max_recovery_attempts", 1)))
+        return RecoveryPolicy(
+            max_retries=max_recovery,
+            max_rerun_verify=max_recovery,
+            max_escalations=0,
+            allow_skip=False,
+        )
+
+    def _recovery_observation(self, report: DebugReport, recovery_used: int) -> FailureObservation:
+        """Build the recovery input for a failed auto-verify run."""
+        state = VerificationState.NOT_RUN
+        try:
+            state = VerificationState(str(report.verification_state or "unverified"))
+        except ValueError:
+            state = VerificationState.UNVERIFIED
+        return FailureObservation(
+            category=FailureCategory.VERIFICATION_FAILED,
+            tool="terminal.execute",
+            error_code=str(report.verification_state or ""),
+            error_message=str(report.final_message or "")[:280],
+            attempt=recovery_used + 1,
+            recovery_attempts=recovery_used,
+            escalations_used=0,
+            verification_state=state,
+            verification_evidence=dict(report.verification_evidence or {}),
+            # Cancellation dominates: never recover out of a cancelled debug run.
+            cancelled=bool(report.cancelled) or cancellation_requested(self._cancellation_token),
+            # DebugLoop keeps no durable plan, so there is no step state to gate
+            # on. Signature dedup and max_failures remain the internal bounds.
+            step_status=None,
+            step_replayable=True,
+        )
 
     def _run_tool(self, name: str, args: dict):
         if self._cancellation_token is None:
@@ -212,7 +256,6 @@ class DebugLoop:
         max_rounds = max(1, int(getattr(settings, "debug_max_steps", 12)))
         max_calls = max(1, int(getattr(settings, "max_tool_calls", max_rounds * 4)))
         max_failures = max(1, int(getattr(settings, "debug_max_attempts", 3)))
-        max_recovery = max(0, int(getattr(settings, "max_recovery_attempts", 1)))
         total_calls = 0
         total_failures = 0
         seen: dict[str, int] = {}
@@ -310,9 +353,24 @@ class DebugLoop:
                 report.verification_state = "unverified"
                 return report
             report = self._run_auto_verify(report)
-            if report.verified or recovery_used >= max_recovery:
-                if not report.verified and recovery_used >= max_recovery:
-                    report.exhausted = "Debug verification recovery limit reached."
+            if report.verified:
+                return report
+            # M2.12 P3: the *final* recovery decision is made by the single
+            # RecoveryPolicy. The signature-dedup and max_failures logic above is
+            # unchanged internal diagnostics; only the "should we try another
+            # bounded repair" question is now answered centrally.
+            decision = self._recovery_policy().decide(
+                self._recovery_observation(report, recovery_used)
+            )
+            self._last_recovery_decision = decision
+            # In this loop the auto-verify command *is* the verification
+            # mechanism, so another round necessarily re-runs verification too.
+            # RERUN_VERIFY and RETRY_STEP therefore both mean "one more bounded
+            # round" here; they only diverge in callers that can re-check a
+            # verdict without re-executing the step.
+            if decision.action not in (RecoveryAction.RETRY_STEP, RecoveryAction.RERUN_VERIFY):
+                if not report.exhausted:
+                    report.exhausted = f"Debug verification recovery stopped: {decision.reason}"
                 return report
             recovery_used += 1
             messages.append({

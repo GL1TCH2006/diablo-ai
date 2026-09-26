@@ -474,11 +474,122 @@ the original record retained for audit.
 
 ---
 
+## M2.12 P3 Phase 3 — FailureObservation and unified RecoveryPolicy
+
+Introduced in `core/recovery.py`.
+
+### What a `FailureObservation` is
+
+One immutable, redacted record of what went wrong and what is known about it at
+the moment recovery is being considered. It captures recovery *decision inputs*
+and deliberately does **not** duplicate `TaskRecord` / `TaskRecord.plan`: no
+goal, no step listing, no git state, no snapshots. It references the
+authoritative ids and carries the bounded facts a decision needs — category,
+tool/capability, error code/type, attempt, verification state and evidence,
+retryability, cancellation, `recovery_hint`, `expected_result`, durable-plan step
+state.
+
+Every free-text and structured field is passed through
+`core.logging_setup.redact` **on construction**, so a token, password or
+credential in an error message or in verification evidence is `<redacted>`
+before the observation can be stored or logged.
+
+`FailureCategory` reuses the ratified `CapabilityStatus` / `StepStatus` meanings
+(`cancelled`, `permission_denied`, `invalid_request`, `unavailable`,
+`not_executed`, `verification_failed`, `execution_failed`, `unknown`) rather
+than inventing a parallel taxonomy. Classification reads structured status
+fields, never error-message wording.
+
+### Recovery precedence
+
+Evaluated in order, first match wins:
+
+1. **Cancellation dominates.** Always `NONE`. No retry, no escalation, no
+   verification rerun, no skip into another side effect, no replay of an
+   interrupted step. Matches the S2.9 rule that `CANCELLED` is terminal.
+2. **Terminal plan state with no legal retry edge.** `DONE`, `CANCELLED`,
+   `SKIPPED` -> `NONE`; `BLOCKED` and `RUNNING` -> `ABORT`; `PENDING` -> `NONE`.
+3. **Interrupted step** -> `ABORT`. Checked *before* the retryable test, so no
+   budget can authorise a silent replay.
+4. **Non-retryable category** -> `ABORT`.
+5. **Verification failure with recorded evidence** -> `RERUN_VERIFY`, within the
+   bounded `max_rerun_verify`.
+6. **Retry** -> `RETRY_STEP`, within the bounded `max_retries`, through the only
+   legal `FAILED -> PENDING` edge. Preferred over skipping and escalation
+   because it is the cheapest correct action.
+7. **Legal skip** -> `SKIP_STEP`, only once retries are spent and only when
+   `allow_skip` is explicitly enabled. Off by default: the durable plan cannot
+   know whether a skipped step was required by the goal.
+8. **Escalate, then abort** -> `ESCALATE_MODEL` while the escalation budget
+   lasts, else `ABORT`.
+
+`recovery_hint` and `expected_result` are **inputs, not commands**. A hint
+saying "retry" never overrides a limit, a terminal state, a non-retryable
+category or cancellation, and an `expected_result` is never verification
+evidence — only the ledger adjudicates a verdict.
+
+### What the policy is not
+
+`RecoveryPolicy` is pure and side-effect free: it inspects an observation and
+returns a `RecoveryDecision`. It dispatches nothing, mutates nothing, cannot
+recurse, and never returns a step status — the existing durable-plan state
+machine remains the only thing that enforces transitions. It cannot grant
+permission or widen workspace roots, branch policy or destructive-command
+restrictions. Every retry re-enters the normal dispatch path, so the whole
+safety stack re-applies on each attempt.
+
+`ESCALATE_MODEL` is a *signal*, not a model choice. Model selection remains with
+`_select_model` / `ModelRouter`, which keeps its own `models_max_escalations`
+bound; the policy applies a second, independent ceiling that is the stricter of
+the two. There is no second model router.
+
+`PlanStepRecord.is_replayable` deliberately does **not** veto an in-request
+retry. It answers the resume question ("is re-dispatching free of side
+effects?"), which is right for `Agent.resume()` and wrong for a step that ran to
+completion and reported a definite failure. What must never be replayed is an
+*interrupted* step, and that is checked unconditionally.
+
+### Unified call sites
+
+All three previously independent recovery authorities now route their **final**
+decision through the one policy:
+
+| Site | Previously | Now |
+| --- | --- | --- |
+| `Agent._record_execution` | inline `recovery_attempts + 1 >= models_max_attempts_before_escalate` | `_apply_recovery_policy(..., phase="escalation")`; only `ESCALATE_MODEL` flips `_router_verify_ok` |
+| `Agent._llm_loop` | inline `recovery_attempts >= max_recovery_attempts` | `_apply_recovery_policy(..., phase="llm_loop")`; branch wording and behaviour preserved |
+| `DebugLoop` | inline `recovery_used >= max_recovery` | `self._recovery_policy().decide(...)`; signature dedup and `max_failures` remain unchanged internal diagnostics |
+
+Limits are reused, not replaced: `max_recovery_attempts` still bounds retries,
+`models_max_escalations` still bounds escalation. In `DebugLoop` the auto-verify
+command *is* the verification mechanism, so another round necessarily re-runs
+verification too; `RERUN_VERIFY` and `RETRY_STEP` therefore both mean "one more
+bounded round" there.
+
+Every decision is logged and emitted as a `recovery_decided` lifecycle event
+with the action, reason, category, step, tool and counters.
+
+### Known limitation, explicitly not fixed here
+
+Some S2.8 workflow calls cannot interrupt an already-running Blender child
+because supervision is not bound directly to the task token. Phase 3 does not
+fix that. It guarantees only that where interruption *is* possible, cancellation
+dominates every recovery action.
+
+### Still out of scope
+
+`Agent.resume()`, cross-turn cumulative plans, concurrency > 1, a full
+`DebugLoop` durable-plan redesign, and `TaskState`/`TaskRecord` status
+unification are later work and are not started here.
+
+---
+
 ## Verification
 
 * S1 invariants: `tests/test_cross_layer_contracts.py`
 * P3 Phase 1 ledger schema: `tests/test_verification_ledger.py`
 * P3 Phase 2 writer migration: `tests/test_p3_verification_migration.py`
+* P3 Phase 3 recovery: `tests/test_p3_recovery.py`
 * Pre-existing boundary coverage, unchanged:
   `tests/test_capability_provenance.py` (identity/provenance),
   `tests/test_capability_context_contract.py` (context propagation),
