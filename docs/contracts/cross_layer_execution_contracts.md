@@ -316,9 +316,116 @@ NOT introduce a second classification layer of its own.
 
 ---
 
+## M2.12 P3 Phase 1 — Verification Ledger (schema only)
+
+Status: **ADDITIVE, NOT YET WIRED**. Introduced in `core/verification_ledger.py`.
+No existing verification writer is migrated by this phase.
+
+This section records the Phase 1 contract so later phases do not have to
+re-derive it. The normative detail lives in the module docstring; this is the
+summary.
+
+### What a `VerificationEntry` represents
+
+One immutable adjudication of "was this thing verified, and by what evidence?" —
+the atomic unit a durable ledger stores. It carries the three axes below, the
+evidence verbatim, both the *requested* and *adjudicated* state, the reason for
+any downgrade, and the caller-supplied correlation identity (`task_id`,
+`run_id`, `request_id`, `step_id`).
+
+### The three axes
+
+The legacy `VerificationResult.kind` is a single opaque string that conflates
+*what* was verified with *how*. The ledger splits it explicitly:
+
+| Axis | Question | Values |
+| --- | --- | --- |
+| `subject_kind` | What is the claim about? | `task`, `step`, `operation`, `file`, `environment`, `run`, `unknown` |
+| `method_kind` | How was it established? | `none`, `execution_outcome`, `file_and_output`, `render_file_probe`, `image_inspection`, `blender_vision_render`, `tool_observation`, `capability_evidence`, `capability_execution`, `workflow_contract`, `analysis`, `debug_run` |
+| `trust` | Is the source strong enough to support `PASSED`? | `untrusted`, `claimed`, `observed` |
+
+`unknown` subject and `none` method can never support `PASSED`.
+
+### Trust semantics
+
+`EvidenceTrust` has exactly one job in Phase 1: decide whether a source may
+support `PASSED`. There is no pre-existing trust vocabulary in the codebase to
+reuse, so these three levels are new and deliberately minimal.
+
+* `untrusted` — no defined evidence semantics: empty/default verification, free
+  text, a source the ledger cannot place. Can never support `PASSED`.
+* `claimed` — self-reported success the ledger cannot independently confirm: a
+  model asserting it finished, or a capability reporting `verified=True` about
+  itself. Recorded, never believed.
+* `observed` — established by an independent observation the ledger can name
+  and check: a filesystem probe, a process exit code, an image decode, a
+  capability evidence contract. **The only level that may support `PASSED`.**
+
+### Evidence requirements and the PASSED invariant
+
+**`PASSED` requires valid, non-empty evidence from a trusted source, about a
+declared subject, by a declared method.**
+
+Evidence must be a JSON-serialisable, non-empty mapping with at least one
+substantive leaf. A `detail` string is narration, not evidence. The ledger
+rejects or downgrades missing, empty, malformed, contradictory and untrusted
+evidence.
+
+Explicitly **not** evidence:
+
+* a tool returning without raising an exception,
+* a model claiming success,
+* `verified=True` without supporting evidence,
+* empty or default verification,
+* arbitrary text with no defined evidence semantics.
+
+Contradiction is detected generically: `ASSERTION_KEYS` (`valid`, `exists`,
+`verified`, `ok`, `success`, `passed`, `readable`, `complete`) must be strictly
+boolean when present, and a `False` value blocks `PASSED`. This encodes the
+existing `capability_bridge` rule (`data.get("valid") is False` -> `FAILED`) by
+key name, without embedding any tool's semantics.
+
+A requested `PASSED` failing any check is **downgraded** to `UNVERIFIED`; the
+original request is kept in `requested_state` and the cause in `reason`.
+Downgrade is one-way — a requested `FAILED` is never upgraded.
+
+Compatibility reference: `tools/capability_bridge.CapabilityBridge._valid_evidence`.
+The ledger is deliberately *stricter* in requiring a mapping rather than a bare
+list/tuple; being stricter cannot weaken existing behaviour. Cross-checks against
+the real bridge live in `tests/test_verification_ledger.py`.
+
+### Legacy `kind` compatibility
+
+Legacy kind information is never discarded. Every entry keeps `legacy_kind`
+verbatim, and `LEGACY_KIND_AXES` gives the explicit
+`kind -> (subject_kind, method_kind)` mapping for every kind the current writers
+produce. `resolve_legacy_kind` returns `(UNKNOWN, NONE)` for an unrecognised or
+empty kind rather than guessing. An unrecognised kind still round-trips
+losslessly; it simply cannot support `PASSED`.
+
+### Migration status
+
+Phase 1 is greenfield. The 27 existing `VerificationResult` construction sites
+(`core/agent.py`, `tools/capability_bridge.py`) are **not** migrated.
+`core/verification.py`, `Agent._record_verification`,
+`TaskManager.set_verification`, the `capability_bridge` writers, `DebugLoop` and
+`_llm_loop` recovery are all untouched.
+
+Phase 2 routes writers through:
+
+```
+Agent._record_verification -> VerificationLedger -> TaskManager.set_verification
+```
+
+Recovery unification (`RecoveryPolicy`, `FailureObservation`) and
+`Agent.resume()` are later phases and are explicitly out of scope here.
+
+---
+
 ## Verification
 
 * S1 invariants: `tests/test_cross_layer_contracts.py`
+* P3 Phase 1 ledger schema: `tests/test_verification_ledger.py`
 * Pre-existing boundary coverage, unchanged:
   `tests/test_capability_provenance.py` (identity/provenance),
   `tests/test_capability_context_contract.py` (context propagation),
