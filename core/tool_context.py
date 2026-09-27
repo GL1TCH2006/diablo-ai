@@ -44,7 +44,7 @@ from core.logging_setup import get_logger
 
 log = get_logger("tool_context")
 
-log_caps = ("filesystem", "project", "code", "python", "terminal", "system", "task")
+log_caps = ("filesystem", "project", "code", "python", "terminal", "system", "task", "data", "chart")
 
 #: Always presented. Without these an agent turn cannot make progress at all,
 #: so this set is a floor that selection may only add to.
@@ -85,6 +85,8 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "capability": ("capability",),
     "blender": ("capability",),
     "vision": ("capability",),
+    "data": ("data",),
+    "chart": ("chart",),
 }
 
 

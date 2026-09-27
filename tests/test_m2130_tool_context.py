@@ -136,10 +136,11 @@ def test_derived_capability_needs_no_registration_changes():
     # Every real tool classifies itself from its name, so the milestone adds no
     # per-tool wiring: the production registry is unchanged at 57 tools.
     registry = build_registry(_real_settings())
-    assert len(registry.all_specs()) == 57
+    # M2.13.1/M2.13.2: 8 new tools added (4 data, 4 chart)
+    assert len(registry.all_specs()) == 65
     assert {spec.capability for spec in registry.all_specs()} == {
         "applications", "code", "filesystem", "gh", "git", "memory", "models",
-        "project", "python", "rules", "system", "task", "terminal",
+        "project", "python", "rules", "system", "task", "terminal", "data", "chart",
     }
 
 
@@ -281,7 +282,7 @@ def test_capability_groups_only_reference_real_capabilities():
     # A group naming a capability that does not exist would silently do nothing.
     registry = _tiny_registry()
     real = {spec.capability for spec in registry.all_specs()}
-    real |= {"capability", "blender", "vision"}
+    real |= {"capability", "blender", "vision", "data", "chart"}
     for group, caps in CAPABILITY_GROUPS.items():
         unknown = set(caps) - real
         assert not unknown, f"group {group!r} references unknown capabilities {unknown}"

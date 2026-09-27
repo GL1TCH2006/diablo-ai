@@ -4,7 +4,7 @@ from config.permissions import PermissionLevel, path_is_within
 from config.settings import Settings
 from core.logging_setup import get_logger
 
-from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal
+from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal, data_tool, chart_tool
 from .registry import ToolRegistry, ToolSpec
 
 log = get_logger("tools")
@@ -720,6 +720,163 @@ def build_registry(
             level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_release_create(kw["root"], kw["tag"], kw.get("title", "")),
             describe=lambda args: f"Create release {args.get('tag')}",
+        )
+    )
+
+    # Data analysis tools
+    registry.register(
+        ToolSpec(
+            name="data.load_csv",
+            description="Load a CSV file and return its structure: headers, row count, and inferred column types.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: data_tool.load_csv(kw["path"], settings),
+            describe=lambda args: f"Load CSV: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="data.load_json",
+            description="Load a JSON file and return its structure.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: data_tool.load_json(kw["path"], settings),
+            describe=lambda args: f"Load JSON: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="data.inspect",
+            description="Inspect a data file (CSV or JSON) and return summary statistics: column types, missing values, basic stats.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: data_tool.inspect_data(kw["path"], settings),
+            describe=lambda args: f"Inspect data: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="data.analyze",
+            description="Perform analysis operations on a CSV file: stats, groupby, filter, sort, correlation, unique, head.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["stats", "groupby", "filter", "sort", "correlation", "unique", "head"]},
+                    "column": {"type": "string", "description": "Target column for the operation"},
+                    "group_by": {"type": "string", "description": "Column to group by (for groupby operation)"},
+                    "filter_expr": {"type": "string", "description": "Filter expression like 'age > 25' or 'name == John'"},
+                    "sort_by": {"type": "string", "description": "Column to sort by"},
+                    "limit": {"type": "integer", "description": "Maximum rows to return", "default": 100},
+                },
+                "required": ["path", "operation"],
+            },
+            required=["path", "operation"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: data_tool.analyze_data(
+                kw["path"], settings, kw["operation"],
+                column=kw.get("column", ""),
+                group_by=kw.get("group_by", ""),
+                filter_expr=kw.get("filter_expr", ""),
+                sort_by=kw.get("sort_by", ""),
+                limit=int(kw.get("limit", 100)),
+            ),
+            describe=lambda args: f"Analyze data ({args.get('operation')}): {args.get('path')}",
+        )
+    )
+
+    # Chart generation tools
+    registry.register(
+        ToolSpec(
+            name="chart.generate",
+            description="Generate a chart (line, bar, scatter, histogram, pie) from CSV data or inline data. Saves as PNG artifact.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "chart_type": {"type": "string", "enum": ["line", "bar", "scatter", "histogram", "pie"]},
+                    "data_path": {"type": "string", "description": "Path to CSV file"},
+                    "x_column": {"type": "string", "description": "X-axis column name"},
+                    "y_column": {"type": "string", "description": "Y-axis column name (required for scatter, bar, line)"},
+                    "x_data": {"type": "array", "items": {"type": "string"}, "description": "Inline X data (alternative to data_path)"},
+                    "y_data": {"type": "array", "items": {"type": "string"}, "description": "Inline Y data"},
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels for pie chart"},
+                    "title": {"type": "string", "description": "Chart title"},
+                    "xlabel": {"type": "string", "description": "X-axis label"},
+                    "ylabel": {"type": "string", "description": "Y-axis label"},
+                    "output_path": {"type": "string", "description": "Optional output path (default: auto-generated in charts/)"},
+                    "width": {"type": "integer", "default": 10, "description": "Figure width in inches"},
+                    "height": {"type": "integer", "default": 6, "description": "Figure height in inches"},
+                    "dpi": {"type": "integer", "default": 100, "description": "DPI for output"},
+                },
+                "required": ["chart_type"],
+            },
+            required=["chart_type"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("output_path") or ""), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: chart_tool.generate_chart(kw.get("chart_type", ""), settings, **{k: v for k, v in kw.items() if k != "chart_type"}),
+            describe=lambda args: f"Generate {args.get('chart_type')} chart: {args.get('data_path') or 'inline data'}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="chart.verify",
+            description="Verify a generated chart artifact exists and is a valid image file.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SAFE,
+            level_for=lambda args: (
+                PermissionLevel.SAFE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: chart_tool.verify_chart(kw["path"], settings),
+            describe=lambda args: f"Verify chart: {args.get('path')}",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="chart.list",
+            description="List all generated chart artifacts.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: chart_tool.list_charts(settings),
+            describe=lambda args: "List charts",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="chart.delete",
+            description="Delete a chart artifact.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            required=["path"],
+            level=PermissionLevel.SENSITIVE,
+            level_for=lambda args: (
+                PermissionLevel.SENSITIVE
+                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: chart_tool.delete_chart(kw["path"], settings),
+            describe=lambda args: f"Delete chart: {args.get('path')}",
         )
     )
 
