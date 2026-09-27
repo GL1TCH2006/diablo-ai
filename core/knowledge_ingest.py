@@ -14,6 +14,7 @@ from typing import Optional
 from config.settings import Settings
 from core.knowledge_code import ingest_symbols_for_files, reconcile_symbols
 from core.knowledge_graph import (
+    STALE_DELETED,
     KnowledgeGraph,
     NodeType,
     RelationType,
@@ -22,6 +23,7 @@ from core.knowledge_graph import (
     ingest_project,
     ingest_directory,
     ingest_file,
+    is_stale,
 )
 from core.logging_setup import get_logger
 
@@ -142,6 +144,7 @@ def ingest_project_structure(
     # Walk directory tree
     dir_nodes: dict[str, str] = {"": proj_node.node_id}  # rel_path -> node_id
     indexed_python: list[str] = []
+    indexed_files: list[str] = []
 
     def walk(directory: Path, depth: int, parent_rel: str) -> None:
         if depth > max_depth or stats["files"] >= max_files:
@@ -202,6 +205,7 @@ def ingest_project_structure(
                     content_hash,
                 )
                 stats["files"] += 1
+                indexed_files.append(rel)
                 # Same traversal, same authorization and size decisions as the
                 # file node above: symbols are only ever derived from a file the
                 # walk already decided to index.
@@ -221,12 +225,93 @@ def ingest_project_structure(
     stale = reconcile_symbols(graph, indexed_python)
     stats["stale_symbols"] = stale["stale_symbols"]
 
+    # The file nodes themselves, and anything recorded about files that are no
+    # longer on disk. A deleted file that still looks current is exactly the
+    # failure this phase exists to prevent.
+    removed = reconcile_deleted_files(graph, indexed_files, project_root)
+    stats["stale_files"] = removed["stale_files"]
+    stats["stale_datasets"] = removed["stale_datasets"]
+    stats["stale_charts"] = removed["stale_charts"]
+    stats["stale_artifacts"] = removed["stale_artifacts"]
+
     log.info(
         "Ingested project %s: %d dirs, %d files (%d symbols), %d skipped, %d errors",
         name, stats["directories"], stats["files"], stats["symbols"],
         stats["skipped_files"], stats["errors"],
     )
     return stats
+
+
+def reconcile_deleted_files(
+    graph: KnowledgeGraph,
+    indexed_paths: list[str],
+    project_root: Path | None = None,
+) -> dict[str, int]:
+    """Demote knowledge about things that are no longer on disk.
+
+    A node is marked rather than deleted. Deleting would throw away the record
+    that the thing ever existed, which is the useful part; keeping it unmarked
+    would let a query offer a deleted file as current. The mark is explicit, and
+    the query layer withholds stale nodes unless asked.
+
+    Two different tests are used, because absence means different things:
+
+    * FILE nodes are judged against the walk, because the walk is what decides
+      what belongs to the project.
+    * DATASET, CHART and ARTIFACT nodes are judged by asking the filesystem
+      whether the file is still there. They may legitimately live outside the
+      walk, so "the walk did not see it" would be a false alarm.
+    """
+    live = {str(p).replace("\\", "/").strip("/") for p in indexed_paths}
+    counts = {"stale_files": 0, "stale_datasets": 0,
+              "stale_charts": 0, "stale_artifacts": 0}
+    types = {
+        NodeType.FILE: "stale_files",
+        NodeType.DATASET: "stale_datasets",
+        NodeType.CHART: "stale_charts",
+        NodeType.ARTIFACT: "stale_artifacts",
+    }
+    for node_type, counter in types.items():
+        for node in graph.find_nodes(node_type=node_type, limit=100000,
+                                     include_stale=True):
+            if is_stale(node):
+                continue
+            path = str(node.metadata.get("path", "") or "").replace("\\", "/").strip("/")
+            if not path:
+                continue
+            if node_type == NodeType.FILE:
+                if path in live:
+                    continue
+            elif _still_on_disk(path, project_root):
+                continue
+            graph.mark_stale(node, STALE_DELETED)
+            counts[counter] += 1
+            if node_type == NodeType.FILE:
+                # A deleted file's symbols are no longer defined by anything.
+                for symbol in graph.find_nodes_by_key_prefix(
+                    NodeType.CODE_SYMBOL, f"symbol:{graph.project_id}:{path}:"
+                ):
+                    if not is_stale(symbol):
+                        graph.mark_stale(symbol, STALE_DELETED)
+    return counts
+
+
+def _still_on_disk(path: str, project_root: Path | None) -> bool:
+    """Whether a recorded path still resolves to a real file.
+
+    Without a project root there is nothing to resolve a relative path against,
+    so the answer is "cannot tell" and the node is left alone. Guessing here
+    would mark live knowledge stale, which is the worse error.
+    """
+    if project_root is None:
+        return True
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path(project_root) / path
+    try:
+        return candidate.is_file()
+    except OSError:
+        return True
 
 
 def ingest_changed_file(

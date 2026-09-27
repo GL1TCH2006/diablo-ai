@@ -23,6 +23,7 @@ to a project the caller is authorized to see.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from config.permissions import path_is_within
@@ -32,6 +33,8 @@ from core.knowledge_graph import (
     NodeType,
     RelationType,
     canonical_project_key,
+    shared_manager,
+    stale_state,
 )
 from core.knowledge_ingest import ingest_project_structure
 from core.knowledge_query import KnowledgeQueryEngine
@@ -55,6 +58,7 @@ QUERY_TYPES = (
     "search_datasets",
     "search_charts",
     "recent_activity",
+    "find_stale",
 )
 
 
@@ -64,8 +68,13 @@ def knowledge_dir(settings: Settings) -> Path:
 
 
 def manager(settings: Settings) -> KnowledgeGraphManager:
-    """A manager bound to this installation's knowledge directory."""
-    return KnowledgeGraphManager(knowledge_dir(settings))
+    """A manager bound to this installation's knowledge directory.
+
+    Shared per directory, so a run reuses one connection cache. Opening a fresh
+    manager per call would leave a SQLite handle open every time, and on Windows
+    an open handle makes the database undeletable.
+    """
+    return shared_manager(knowledge_dir(settings))
 
 
 def _authorized(settings: Settings, path: str) -> bool:
@@ -138,6 +147,8 @@ def _node_view(node) -> dict:
 
     Metadata is already bounded at write time (``MAX_METADATA_*`` in
     :mod:`core.knowledge_graph`), so re-truncating here would be redundant.
+    ``state`` is always present so a reader is told whether the node still
+    describes anything, rather than having to infer it from metadata.
     """
     return {
         "node_id": node.node_id,
@@ -146,6 +157,7 @@ def _node_view(node) -> dict:
         "display_name": node.display_name,
         "metadata": node.metadata,
         "updated_at": node.updated_at,
+        "state": stale_state(node),
     }
 
 
@@ -183,7 +195,7 @@ def knowledge_index(
             max_depth=_depth(max_depth, 12),
             max_files=_limit(max_files, 2000),
         )
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
         return ToolResult(False, error=f"Could not index project: {exc}")
 
     log.info("knowledge.index %s: %s", root, stats)
@@ -210,11 +222,16 @@ def knowledge_query(
     hours: int = 24,
     limit: int = 25,
     max_depth: int = 2,
+    include_stale: bool = False,
 ) -> ToolResult:
     """Query the persistent project knowledge graph. Strictly read-only.
 
     Returns reference data only. Nothing returned here is verification
     evidence and nothing here can mark a task verified.
+
+    Stale knowledge is withheld unless ``include_stale`` is set, so a default
+    answer never offers something that no longer exists. ``find_stale`` reaches
+    the history explicitly.
     """
     kind = str(query_type or "").strip().lower()
     if kind not in QUERY_TYPES:
@@ -229,7 +246,7 @@ def knowledge_query(
 
     try:
         graph = manager(settings).get_existing(project_id)
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
         return ToolResult(False, error=f"Could not open knowledge graph: {exc}")
 
     if graph is None:
@@ -263,7 +280,13 @@ def knowledge_query(
                               data={"found": True, "node": _node_view(node)})
 
         if kind == "find_nodes":
-            result = engine.find_nodes(node_type=_coerce_node_type(node_type), limit=lim)
+            result = engine.find_nodes(
+                node_type=_coerce_node_type(node_type),
+                limit=lim,
+                include_stale=include_stale,
+            )
+        elif kind == "find_stale":
+            result = engine.find_stale(limit=lim)
         elif kind == "neighbors":
             if not node_id:
                 return ToolResult(False, error="node_id is required for neighbors")
@@ -303,7 +326,10 @@ def knowledge_query(
             result = engine.search_charts(lim)
         else:  # recent_activity
             result = engine.recent_activity(hours=max(1, _limit(hours, 24)), limit=lim)
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+        # A damaged database is reported, not raised and not papered over. The
+        # graph is a projection, so failing to read it must never take down the
+        # request that asked.
         return ToolResult(False, error=f"Query failed: {exc}")
 
     payload = {
@@ -313,4 +339,8 @@ def knowledge_query(
         "truncated": result.truncated,
         "nodes": [_node_view(node) for node in result.nodes],
     }
+    if result.stale_withheld:
+        # Reported so "nothing matched" is never confused with "what matched no
+        # longer exists".
+        payload["stale_withheld"] = result.stale_withheld
     return ToolResult(True, output=_json(payload), data=payload)

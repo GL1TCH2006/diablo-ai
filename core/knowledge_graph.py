@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -60,6 +62,104 @@ class RelationType(str, Enum):
     CHANGED_BY = "changed_by"
     CHECKPOINTED_AS = "checkpointed_as"
     RELATED_TO = "related_to"
+
+
+# ──────────────────────────────────────────────────────────────
+# Staleness
+# ──────────────────────────────────────────────────────────────
+# A node records what was true when it was written. The filesystem, the task
+# store and Git keep moving afterwards, so a node can stop being an accurate
+# description of anything. Rather than deleting that history or pretending it is
+# still current, the node is *marked*: the fact survives, and its status is
+# explicit. The query layer never returns a stale node as current.
+
+#: Metadata key holding the boolean staleness flag.
+STALE_KEY = "stale"
+#: Metadata key holding why the node went stale.
+STALE_REASON_KEY = "stale_reason"
+#: Metadata key holding when it went stale.
+STALE_SINCE_KEY = "stale_since"
+
+#: Reasons a node can be marked stale. Kept explicit so a reader can tell a
+#: deleted file from a changed one, and so no caller invents an ad hoc reason.
+STALE_DELETED = "deleted"
+STALE_CHANGED = "changed"
+STALE_MISSING_ARTIFACT = "missing_artifact"
+STALE_SOURCE_CHANGED = "source_changed"
+STALE_UNREADABLE = "unreadable"
+
+#: Node types whose subject can stop existing on disk without the graph knowing,
+#: so reindexing is what establishes whether they are still current.
+PHYSICAL_NODE_TYPES = (
+    NodeType.FILE,
+    NodeType.DATASET,
+    NodeType.CHART,
+    NodeType.ARTIFACT,
+)
+
+#: Edges that assert a relationship holds *now*. These are removed when their
+#: endpoint goes stale, because leaving them would have the graph claiming
+#: something it has just recorded as untrue.
+_EDGES_CLAIMING_CURRENCY = frozenset({
+    RelationType.DEFINES,
+    RelationType.GENERATED_FROM,
+    RelationType.DERIVED_FROM,
+    RelationType.PRODUCED,
+    RelationType.CONTAINS,
+})
+
+
+def is_stale(node: Any) -> bool:
+    """Whether a node's metadata marks it as no longer current."""
+    metadata = getattr(node, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return metadata.get(STALE_KEY) is True
+
+
+def stale_state(node: Any) -> str:
+    """``"stale"`` or ``"current"``, for presenting a node's status."""
+    return "stale" if is_stale(node) else "current"
+
+
+def with_stale(metadata: dict[str, Any], reason: str, when: str) -> dict[str, Any]:
+    """A copy of ``metadata`` marked stale for a stated reason."""
+    out = dict(metadata or {})
+    out[STALE_KEY] = True
+    out[STALE_REASON_KEY] = str(reason or STALE_CHANGED)
+    out[STALE_SINCE_KEY] = when
+    return out
+
+
+def with_current(metadata: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``metadata`` marked current again, dropping the stale reason.
+
+    Seeing a thing again is what makes it current; nothing else may clear the
+    flag, so knowledge cannot quietly resume looking authoritative.
+    """
+    out = dict(metadata or {})
+    if out.get(STALE_KEY) is not True:
+        return out
+    out.pop(STALE_KEY, None)
+    out.pop(STALE_REASON_KEY, None)
+    out.pop(STALE_SINCE_KEY, None)
+    return out
+
+
+#: SQL predicate selecting rows whose metadata does not mark them stale.
+#: Metadata is a JSON blob and SQLite has no JSON path here, so the flag is
+#: matched as text. Both spacings are covered because the blob is produced by
+#: ``json.dumps`` with and without separators elsewhere. Only a literal
+#: ``true`` counts, so a string value containing the word cannot be mistaken
+#: for the flag.
+STALE_CURRENT_PREDICATE = (
+    "(metadata NOT LIKE '%\"stale\": true%' AND metadata NOT LIKE '%\"stale\":true%')"
+)
+
+#: SQL predicate selecting rows whose metadata *does* mark them stale.
+STALE_PREDICATE = (
+    "(metadata LIKE '%\"stale\": true%' OR metadata LIKE '%\"stale\":true%')"
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -189,6 +289,9 @@ class Node:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "schema_version": self.schema_version,
+            # Always stated, so a consumer can never read a node without also
+            # reading whether it still describes anything.
+            "state": stale_state(self),
         }
 
 
@@ -218,10 +321,99 @@ class Edge:
 # SQLite storage
 
 
+# ──────────────────────────────────────────────────────────────
+# SQLite storage
+# ──────────────────────────────────────────────────────────────
+
+#: Prefix for knowledge database files. Lets the manager recognise a knowledge
+#: database without opening it, and keeps them apart from any other file in the
+#: knowledge directory.
+DB_FILENAME_PREFIX = "kg_"
+DB_SUFFIX = ".db"
+
+#: Characters that cannot appear in a filename on a supported platform. The
+#: colon matters most: on Windows it is the NTFS alternate-data-stream
+#: separator, so a database named ``project:abc.db`` is not a file at all but a
+#: stream attached to a 0-byte host file called ``project``. Such a database is
+#: invisible to a directory listing, so it cannot be enumerated or deleted, and
+#: every project shares one host file. Encoding the separator keeps one real
+#: file per project on every platform.
+#:
+#: Path separators are in the set for a different, sharper reason. Prefixing a
+#: name does not make it safe: only the *first* component is protected, so
+#: ``kg_a/../../../x.db`` still resolves outside the directory it was joined to.
+#: A project id is not attacker-controlled today, but this function builds a
+#: path out of a string, and a path built from a string has to be confined by
+#: construction rather than by the accident of who calls it.
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"|?*/\\\x00-\x1f]')
+
+#: A name made only of dots is never usable: it is a relative directory
+#: reference, and on Windows it is an illegal filename besides.
+_DOTS_ONLY = re.compile(r"^\.+$")
+
+
+def db_filename(project_id: str) -> str:
+    """The on-disk filename for a project's knowledge database.
+
+    Always exactly one path component inside the knowledge directory, for any
+    input at all. The real ``project_id`` is stored inside the database, so
+    nothing downstream has to reverse this encoding to recover identity.
+    """
+    raw = str(project_id)
+    encoded = _UNSAFE_FILENAME_CHARS.sub("_", raw)
+    if not encoded or _DOTS_ONLY.match(encoded):
+        # Nothing usable survived encoding. Fall back to a digest rather than
+        # emitting an empty or dot-only name, which would resolve to the
+        # directory itself or to its parent.
+        encoded = "x" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{DB_FILENAME_PREFIX}{encoded}{DB_SUFFIX}"
+
+
+def legacy_db_path(knowledge_dir: Path, project_id: str) -> Path:
+    """The pre-Phase-8 path, kept so existing databases stay readable.
+
+    On Windows that path is an alternate data stream rather than a real file, so
+    this usually resolves to nothing and costs one ``is_file()`` check. A
+    project id that is not a plain name yields no legacy path at all, so this
+    can never become a way out of the knowledge directory.
+    """
+    name = str(project_id)
+    if _UNSAFE_FILENAME_CHARS.search(name) or _DOTS_ONLY.match(name):
+        return knowledge_dir / f"{DB_FILENAME_PREFIX}__no_legacy_path__"
+    return knowledge_dir / f"{name}.db"
+
+
+def _legacy_streams(host: Path) -> list[Path]:
+    """Alternate data streams that may live on a legacy host file.
+
+    Pre-Phase-8 databases named ``project:abc.db`` were created as NTFS
+    streams on a host file called ``project``. Windows exposes them through
+    ``host:stream`` paths, so enumeration has to look for them explicitly.
+    On a platform without alternate data streams this finds nothing.
+    """
+    if os.name != "nt" or not host.is_file():
+        return []
+    try:
+        # Opening a nonexistent stream for append would create it, so read the
+        # directory link count instead: streams are not listed as entries.
+        found: list[Path] = []
+        for stream in (DB_SUFFIX,):
+            candidate = Path(f"{host}:{stream}")
+            if candidate.is_file():
+                found.append(candidate)
+        # Names carry a project id before the extension, e.g. "project:abc.db".
+        for child in sorted(host.parent.glob(f"{host.name}:*{DB_SUFFIX}")):
+            if child not in found and child.is_file():
+                found.append(child)
+        return found
+    except OSError:
+        return []
+
+
 class KnowledgeGraph:
     """Persistent knowledge graph per project.
 
-    One database file per project_id at data/knowledge/{project_id}.db.
+    One database file per project_id at data/knowledge/{filename}.db.
 
     ``readonly=True`` opens an existing graph through SQLite's own
     ``mode=ro`` and skips schema creation entirely. That matters because the
@@ -234,7 +426,15 @@ class KnowledgeGraph:
     def __init__(self, knowledge_dir: Path, project_id: str, readonly: bool = False):
         self.project_id = project_id
         self.readonly = bool(readonly)
-        self.db_path = knowledge_dir / f"{project_id}.db"
+        primary = knowledge_dir / db_filename(project_id)
+        # A database written before Phase 8 used the raw project id as its
+        # filename. Prefer the safe name, but still open an existing legacy
+        # database so upgrading does not orphan real knowledge.
+        legacy = legacy_db_path(knowledge_dir, project_id)
+        if not primary.is_file() and legacy.is_file():
+            self.db_path = legacy
+        else:
+            self.db_path = primary
         if self.readonly:
             if not self.db_path.is_file():
                 raise FileNotFoundError(f"no knowledge graph for project {project_id}")
@@ -263,8 +463,40 @@ class KnowledgeGraph:
 
     def close(self) -> None:
         if self._conn is not None:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                # Closing is best effort; a failure here must not mask the
+                # caller's own result.
+                pass
             self._conn = None
+
+    def __del__(self) -> None:
+        # A graph can be part of a reference cycle, so it may only become
+        # unreachable at collection time. Without this the SQLite handle would
+        # survive until the next collection and, on Windows, would keep the
+        # database file locked against deletion or replacement.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def readonly_view(self) -> "KnowledgeGraph":
+        """A read-only handle onto the same database file.
+
+        The query path may run in the same process as an index. Returning the
+        writable graph there would let a read-path bug write, so the view
+        refuses writes before SQLite sees them while still observing the writes
+        the writable handle has already committed.
+        """
+        if self.readonly:
+            return self
+        view = KnowledgeGraph.__new__(KnowledgeGraph)
+        view.project_id = self.project_id
+        view.readonly = True
+        view.db_path = self.db_path
+        view._conn = None
+        return view
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -318,6 +550,14 @@ class KnowledgeGraph:
             stored = int(row[0])
             if stored < SCHEMA_VERSION:
                 self._migrate(stored)
+        # Record the owning project so a database can be identified from its
+        # contents. The filename is an encoding of this id, not a reliable
+        # source of truth for it.
+        conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('project_id', ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (self.project_id,),
+        )
         conn.commit()
 
     def _migrate(self, from_version: int) -> None:
@@ -420,6 +660,56 @@ class KnowledgeGraph:
         cur = conn.execute("DELETE FROM nodes WHERE canonical_key = ?", (canonical_key,))
         conn.commit()
         return cur.rowcount > 0
+
+    # ──────────────────────────────────────────────────────────
+    # Staleness
+    # ──────────────────────────────────────────────────────────
+
+    def mark_stale(self, node: Node, reason: str = STALE_CHANGED) -> Node:
+        """Mark a node as no longer describing anything current.
+
+        Identity is preserved: the same ``node_id`` and ``canonical_key`` keep
+        pointing at the same history, so a later sighting can clear the flag
+        instead of creating a second identity for the same thing.
+
+        Edges that assert a current relationship are dropped. Keeping
+        ``FILE --defines--> symbol`` after the symbol stopped being defined would
+        leave the graph asserting something it now knows is untrue; the symbol
+        node itself stays, so the history survives without the false claim.
+        """
+        if is_stale(node):
+            return node
+        if node.node_type in PHYSICAL_NODE_TYPES or node.node_type == NodeType.CODE_SYMBOL:
+            for edge in self.get_edges(target_id=node.node_id):
+                if edge.relation_type in _EDGES_CLAIMING_CURRENCY:
+                    self.delete_edge(edge.edge_id)
+        return self.upsert_node(
+            node.node_type,
+            node.canonical_key,
+            node.display_name,
+            with_stale(node.metadata, reason, self._now()),
+        )
+
+    def mark_current(self, node: Node) -> Node:
+        """Clear the stale flag because the subject was observed again."""
+        if not is_stale(node):
+            return node
+        return self.upsert_node(
+            node.node_type,
+            node.canonical_key,
+            node.display_name,
+            with_current(node.metadata),
+        )
+
+    def mark_stale_many(self, nodes: list[Node], reason: str = STALE_DELETED) -> int:
+        """Mark many nodes stale, returning how many changed."""
+        changed = 0
+        for node in nodes:
+            if is_stale(node):
+                continue
+            self.mark_stale(node, reason)
+            changed += 1
+        return changed
 
     # ──────────────────────────────────────────────────────────
     # Edge operations
@@ -533,7 +823,16 @@ class KnowledgeGraph:
         project_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        include_stale: bool = False,
+        only_stale: bool = False,
     ) -> list[Node]:
+        """Nodes of a type, most recently updated first, bounded.
+
+        Stale nodes are excluded unless ``include_stale`` is set, so the default
+        answer to "what is in this project" is never padded with knowledge that
+        no longer describes anything. ``only_stale`` is the mirror image, used to
+        reach the history without dragging current knowledge along with it.
+        """
         conn = self._get_conn()
         where = []
         params: list[Any] = []
@@ -543,6 +842,10 @@ class KnowledgeGraph:
         if project_id:
             where.append("project_id = ?")
             params.append(project_id)
+        if only_stale:
+            where.append(STALE_PREDICATE)
+        elif not include_stale:
+            where.append(STALE_CURRENT_PREDICATE)
         sql = "SELECT * FROM nodes"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -550,6 +853,19 @@ class KnowledgeGraph:
         params.extend([limit, offset])
         cur = conn.execute(sql, params)
         return [self._row_to_node(row) for row in cur.fetchall()]
+
+    def find_stale_nodes(
+        self,
+        node_type: NodeType | None = None,
+        limit: int = 100,
+    ) -> list[Node]:
+        """Every node currently marked stale, and nothing else."""
+        return self.find_nodes(
+            node_type=node_type,
+            limit=limit,
+            only_stale=True,
+            project_id=self.project_id,
+        )
 
     def neighbors(
         self,
@@ -659,15 +975,26 @@ class KnowledgeGraph:
 
 
 class KnowledgeGraphManager:
-    """Manages per-project knowledge graphs."""
+    """Manages per-project knowledge graphs.
+
+    Writable and read-only handles for the same project are cached separately.
+    Sharing one cache would hand the query path a writable handle whenever an
+    index had already run in the same process, which would quietly defeat the
+    guarantee that reading cannot modify knowledge.
+    """
 
     def __init__(self, knowledge_dir: Path):
         self.knowledge_dir = knowledge_dir
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
         self._graphs: dict[str, KnowledgeGraph] = {}
+        self._readonly: dict[str, KnowledgeGraph] = {}
 
     def get_graph(self, project_id: str) -> KnowledgeGraph:
         if project_id not in self._graphs:
+            # A writable handle must see the other writable handle's writes.
+            existing = self._readonly.pop(project_id, None)
+            if existing is not None:
+                existing.close()
             self._graphs[project_id] = KnowledgeGraph(self.knowledge_dir, project_id)
         return self._graphs[project_id]
 
@@ -677,35 +1004,149 @@ class KnowledgeGraphManager:
         This is the entry point the query path uses. It never creates a
         database: a project that was never indexed reports "no knowledge"
         instead of leaving an empty file behind for every path ever queried.
-        The returned graph is cached only for its lifetime, and is opened
-        read-only so a bug on the query path cannot write.
+        The returned graph is opened read-only, so a bug on the query path
+        cannot write even when an index has already happened in this process.
         """
-        if project_id in self._graphs:
-            return self._graphs[project_id]
+        writable = self._graphs.get(project_id)
+        if writable is not None:
+            # Cache the view so repeated queries reuse one handle. An uncached
+            # view would be collected only at an unpredictable later point, and
+            # each live handle keeps the database file locked on Windows.
+            view = self._readonly.get(project_id)
+            if view is None:
+                view = writable.readonly_view()
+                self._readonly[project_id] = view
+            return view
+        if project_id in self._readonly:
+            return self._readonly[project_id]
         try:
             graph = KnowledgeGraph(self.knowledge_dir, project_id, readonly=True)
         except (FileNotFoundError, OSError):
             return None
-        self._graphs[project_id] = graph
+        self._readonly[project_id] = graph
         return graph
 
     def close_all(self) -> None:
         for g in self._graphs.values():
             g.close()
+        for g in self._readonly.values():
+            g.close()
         self._graphs.clear()
+        self._readonly.clear()
 
     def list_projects(self) -> list[str]:
-        return [p.stem for p in self.knowledge_dir.glob("*.db")]
+        """Every project id this directory holds knowledge for.
+
+        Read from the databases themselves rather than from filenames, because
+        the filename is only an encoding of the id.
+        """
+        found: list[str] = []
+        seen: set[str] = set()
+        candidates = sorted(self.knowledge_dir.glob(f"{DB_FILENAME_PREFIX}*{DB_SUFFIX}"))
+        # Also consider legacy pre-Phase-8 files, including the alternate data
+        # streams Windows created for them.
+        for path in sorted(self.knowledge_dir.iterdir()) if self.knowledge_dir.is_dir() else []:
+            if path in candidates:
+                continue
+            if path.is_file() and not path.name.startswith(DB_FILENAME_PREFIX):
+                for stream in _legacy_streams(path):
+                    candidates.append(stream)
+        for path in candidates:
+            if not path.is_file():
+                continue
+            project_id = self._read_project_id(path)
+            if project_id and project_id not in seen:
+                seen.add(project_id)
+                found.append(project_id)
+        return found
+
+    @staticmethod
+    def _read_project_id(path: Path) -> str:
+        """The project id recorded inside a knowledge database, or ""."""
+        try:
+            conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM schema_meta WHERE key = 'project_id'"
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            # Not a knowledge database, or unreadable: not an error here, this
+            # is only an enumeration.
+            return ""
+        return str(row[0]) if row else ""
 
     def delete_project(self, project_id: str) -> bool:
-        if project_id in self._graphs:
-            self._graphs[project_id].close()
-            del self._graphs[project_id]
-        db_file = self.knowledge_dir / f"{project_id}.db"
-        if db_file.exists():
-            db_file.unlink()
-            return True
-        return False
+        for cache in (self._graphs, self._readonly):
+            graph = cache.pop(project_id, None)
+            if graph is not None:
+                graph.close()
+        # Another manager over the same directory may still hold the file open,
+        # and on Windows that makes it undeletable. Release those handles rather
+        # than reporting a deletion that cannot happen.
+        _release_shared(self.knowledge_dir, project_id)
+        removed = False
+        for path in (self.knowledge_dir / db_filename(project_id),
+                     legacy_db_path(self.knowledge_dir, project_id)):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed = True
+                    for sidecar in (path.with_name(path.name + "-wal"),
+                                    path.with_name(path.name + "-shm")):
+                        if sidecar.is_file():
+                            sidecar.unlink()
+            except OSError:
+                # A stream still held open elsewhere cannot be removed; report
+                # honestly rather than claiming a deletion that did not happen.
+                log.warning("could not delete knowledge database %s", path)
+        return removed
+
+
+# One manager per knowledge directory, held for the life of the process. Tool
+# calls reuse it, so a session opens one connection per project it touches
+# rather than a fresh set on every call. Handles are released explicitly, by
+# ``close_shared_managers()`` at shutdown or per project on deletion, because
+# an open SQLite connection makes its file undeletable on Windows.
+_SHARED_MANAGERS: dict[Path, KnowledgeGraphManager] = {}
+
+
+def shared_manager(knowledge_dir: Path) -> KnowledgeGraphManager:
+    """The manager for a knowledge directory, one per directory."""
+    key = Path(knowledge_dir).resolve()
+    existing = _SHARED_MANAGERS.get(key)
+    if existing is not None:
+        return existing
+    created = KnowledgeGraphManager(key)
+    _SHARED_MANAGERS[key] = created
+    return created
+
+
+def close_shared_managers() -> None:
+    """Close and forget every shared manager. Used by tests and shutdown."""
+    for mgr in list(_SHARED_MANAGERS.values()):
+        mgr.close_all()
+    _SHARED_MANAGERS.clear()
+
+
+def _release_shared(knowledge_dir: Path, project_id: str) -> None:
+    """Drop a shared manager's handle on one project's database.
+
+    Called before the file is removed, because an open SQLite connection makes
+    the file undeletable on Windows.
+    """
+    try:
+        key = Path(knowledge_dir).resolve()
+    except OSError:
+        return
+    mgr = _SHARED_MANAGERS.get(key)
+    if mgr is None:
+        return
+    for cache in (mgr._graphs, mgr._readonly):
+        graph = cache.pop(project_id, None)
+        if graph is not None:
+            graph.close()
 
 
 # ──────────────────────────────────────────────────────────────

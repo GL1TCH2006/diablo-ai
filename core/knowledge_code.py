@@ -8,16 +8,22 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from core.knowledge_graph import (
+    STALE_CHANGED,
+    STALE_DELETED,
+    STALE_UNREADABLE,
     KnowledgeGraph,
     NodeType,
     RelationType,
     canonical_file_key,
     canonical_symbol_key,
+    is_stale,
+    with_stale,
 )
 from core.logging_setup import get_logger
 
@@ -209,14 +215,14 @@ def resolve_import_to_file(
     return None
 
 
-def _stale(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Mark a node's metadata as no longer authoritative."""
-    metadata["stale"] = True
-    return metadata
+def _stale(metadata: dict[str, Any], reason: str = STALE_DELETED) -> dict[str, Any]:
+    """Mark a node's metadata as no longer authoritative, with a reason."""
+    return with_stale(metadata, reason, time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
-def _is_stale(node) -> bool:
-    return bool(getattr(node, "metadata", {}).get("stale", False))
+#: Staleness now lives in one place so the query layer and the ingestion code
+#: cannot disagree about what "stale" means.
+_is_stale = is_stale
 
 
 def _symbol_key_prefix(graph: KnowledgeGraph, file_rel_path: str) -> str:
@@ -302,27 +308,18 @@ def ingest_python_file_symbols(
             if class_node is not None:
                 graph.upsert_edge(class_node.node_id, sym_node.node_id, RelationType.CONTAINS)
 
-    # Anything previously attributed to this file but not re-observed is stale.
-    for existing in _symbols_for_file(graph, file_rel_path):
-        if existing.canonical_key not in live_keys and not _is_stale(existing):
-            graph.upsert_node(
-                NodeType.CODE_SYMBOL,
-                existing.canonical_key,
-                existing.display_name,
-                _stale(dict(existing.metadata)),
-            )
-
+    # Anything previously attributed to this file but not re-observed is
+    # demoted. A file that stopped parsing is not evidence that its symbols
+    # were removed, so that case gets its own reason rather than claiming a
+    # change that may not have happened.
     if parse_failed:
-        # Record the reason the file is not authoritative, without deleting the
-        # prior knowledge.
         for existing in _symbols_for_file(graph, file_rel_path):
             if not _is_stale(existing):
-                graph.upsert_node(
-                    NodeType.CODE_SYMBOL,
-                    existing.canonical_key,
-                    existing.display_name,
-                    _stale(dict(existing.metadata)),
-                )
+                graph.mark_stale(existing, STALE_UNREADABLE)
+    else:
+        for existing in _symbols_for_file(graph, file_rel_path):
+            if existing.canonical_key not in live_keys and not _is_stale(existing):
+                graph.mark_stale(existing, STALE_CHANGED)
 
     _handle_imports(graph, abs_path, file_rel_path, project_root, file_node)
 

@@ -26,15 +26,30 @@ log = get_logger("knowledge_query")
 MAX_RESULTS = 100
 MAX_TRAVERSAL_DEPTH = 4
 MAX_PATH_RESULTS = 10
-
-
 @dataclass
 class QueryResult:
     """Result of a graph query."""
+
     nodes: list[Node]
     edges: list[Edge]
     total_count: int
     truncated: bool
+    #: How many nodes were withheld because they are stale. Reported rather
+    #: than hidden, so a caller can tell "nothing matched" from "some of it no
+    #: longer exists".
+    stale_withheld: int = 0
+
+    def to_dict(self) -> dict:
+        out = {
+            "nodes": [n.to_dict() for n in self.nodes],
+            "edges": [e.to_dict() for e in self.edges],
+            "total_count": self.total_count,
+            "truncated": self.truncated,
+        }
+        if self.stale_withheld:
+            out["stale_withheld"] = self.stale_withheld
+        return out
+
 
 
 @dataclass
@@ -65,10 +80,39 @@ class KnowledgeQueryEngine:
         self,
         node_type: Optional[NodeType] = None,
         limit: Optional[int] = None,
+        include_stale: bool = False,
     ) -> QueryResult:
-        """Find nodes by type with optional limit."""
+        """Find nodes by type with optional limit.
+
+        Stale nodes are withheld by default. ``stale_withheld`` reports how many
+        were left out, so an empty answer is never mistaken for "this project
+        has nothing" when the truth is "what it had no longer exists".
+        """
         lim = min(limit or self.max_results, self.max_results)
-        nodes = self.graph.find_nodes(node_type=node_type, limit=lim)
+        nodes = self.graph.find_nodes(
+            node_type=node_type, limit=lim, include_stale=include_stale
+        )
+        withheld = 0
+        if not include_stale and node_type is not None:
+            withheld = len(self.graph.find_nodes(
+                node_type=node_type, limit=lim, include_stale=True
+            )) - len(nodes)
+        return QueryResult(
+            nodes=nodes,
+            edges=[],
+            total_count=len(nodes),
+            truncated=len(nodes) >= lim,
+            stale_withheld=max(0, withheld),
+        )
+
+    def find_stale(self, limit: Optional[int] = None) -> QueryResult:
+        """Everything the project knows that is no longer current.
+
+        Reachable on purpose: history is kept, it is just never presented as
+        current without being asked for.
+        """
+        lim = min(limit or self.max_results, self.max_results)
+        nodes = self.graph.find_stale_nodes(limit=lim)
         return QueryResult(
             nodes=nodes,
             edges=[],
@@ -358,6 +402,7 @@ def query_graph_tool(
             - "search_datasets": datasets
             - "search_charts": charts
             - "recent_activity": recent updates
+            - "find_stale": knowledge that no longer describes anything
         **params: Additional parameters for the query type
 
     Returns:
@@ -366,6 +411,7 @@ def query_graph_tool(
     try:
         graph = graph_manager.get_graph(project_id)
         engine = KnowledgeQueryEngine(graph)
+        include_stale = bool(params.get("include_stale", False))
 
         if query_type == "find_node":
             canonical_key = params.get("canonical_key")
@@ -376,6 +422,12 @@ def query_graph_tool(
                 return {"success": True, "output": "(node not found)", "data": {}}
             return {"success": True, "output": engine.format_node_summary(node), "data": node.to_dict()}
 
+        elif query_type == "find_stale":
+            result = engine.find_stale(limit=params.get("limit"))
+            data = result.to_dict()
+            data["count"] = len(result.nodes)
+            return {"success": True, "output": engine.format_query_result(result), "data": data}
+
         elif query_type == "find_nodes":
             node_type = params.get("node_type")
             if isinstance(node_type, str):
@@ -383,8 +435,14 @@ def query_graph_tool(
                     node_type = NodeType(node_type)
                 except ValueError:
                     return {"success": False, "error": f"invalid node_type: {node_type}"}
-            result = engine.find_nodes(node_type=node_type, limit=params.get("limit"))
-            return {"success": True, "output": engine.format_query_result(result), "data": {"nodes": [n.to_dict() for n in result.nodes]}}
+            result = engine.find_nodes(
+                node_type=node_type,
+                limit=params.get("limit"),
+                include_stale=include_stale,
+            )
+            data = result.to_dict()
+            data["count"] = len(result.nodes)
+            return {"success": True, "output": engine.format_query_result(result), "data": data}
 
         elif query_type == "neighbors":
             node_id = params.get("node_id")

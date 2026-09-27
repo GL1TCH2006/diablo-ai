@@ -5,11 +5,14 @@ Integrates M2.13.2 data analysis and chart generation with the knowledge graph.
 
 from __future__ import annotations
 
+import hashlib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from core.knowledge_graph import (
+    STALE_SOURCE_CHANGED,
     KnowledgeGraph,
     NodeType,
     RelationType,
@@ -18,6 +21,8 @@ from core.knowledge_graph import (
     canonical_artifact_key,
     canonical_analysis_key,
     canonical_file_key,
+    is_stale,
+    with_current,
 )
 from core.knowledge_tasks import link_verification_to_evidence
 from core.logging_setup import get_logger
@@ -29,7 +34,6 @@ from core.verification_ledger import (
     VerificationSubject,
 )
 
-import time
 
 log = get_logger("knowledge_data")
 
@@ -113,20 +117,43 @@ def normalize_dataset_result(result_data: dict) -> dict:
     }
 
 
-def upsert_dataset_node(graph: KnowledgeGraph, info: DatasetInfo) -> str:
+def upsert_dataset_node(
+    graph: KnowledgeGraph,
+    info: DatasetInfo,
+    metadata: dict | None = None,
+) -> str:
     """Create or update a DATASET node.
 
-    Returns the dataset node_id.
+    Returns the dataset node_id. ``metadata`` supplies extra recorded facts,
+    such as the content hash a caller observed; the descriptive fields always
+    come from ``info`` so a caller cannot contradict them.
     """
     ds_key = canonical_dataset_key(info.path)
-    metadata = {
+    previous = graph.get_node(ds_key)
+    stored = {
         "path": info.path,
         "format": info.format,
         "columns": info.columns,
         "row_count": info.row_count,
         "column_types": info.column_types or {},
     }
-    node = graph.upsert_node(NodeType.DATASET, ds_key, Path(info.path).name, metadata)
+    if metadata:
+        for key, value in metadata.items():
+            if key not in stored and value is not None:
+                stored[key] = value
+    # Seeing the dataset again makes it current again, whatever it was before.
+    node = graph.upsert_node(
+        NodeType.DATASET, ds_key, Path(info.path).name, with_current(stored)
+    )
+
+    # If the bytes changed, anything concluded from the old bytes is no longer a
+    # current answer. Done here rather than in the callers so that every path
+    # which records a dataset observation gets this, including the ones that
+    # record it without a task anchor.
+    previous_hash = (previous.metadata.get("content_hash") if previous else None)
+    new_hash = stored.get("content_hash")
+    if previous_hash and new_hash and previous_hash != new_hash:
+        invalidate_analyses_for_dataset(graph, info.path)
     return node.node_id
 
 
@@ -224,6 +251,7 @@ def sync_dataset_inspection(
     task_node_id: str,
     file_path: str,
     result_data: dict,
+    project_root: str | Path | None = None,
 ) -> Optional[str]:
     """Sync a dataset observation to the graph.
 
@@ -233,6 +261,11 @@ def sync_dataset_inspection(
 
     ``file_path`` is the authoritative path the tool was invoked with, not a
     path reconstructed from model text.
+
+    The dataset records a content hash. That is what lets a later inspection
+    tell "the same file" from "the same path with different contents", and
+    therefore lets an analysis stop being presented as current once the data
+    underneath it has changed.
     """
     try:
         shape = normalize_dataset_result(result_data or {})
@@ -243,7 +276,23 @@ def sync_dataset_inspection(
             row_count=shape["row_count"],
             column_types=shape["column_types"],
         )
-        ds_node_id = upsert_dataset_node(graph, info)
+        previous = graph.get_node(canonical_dataset_key(file_path))
+        # The recorded path is project-relative, so the bytes have to be read
+        # from the project root. Hashing the relative path against the process
+        # working directory would silently find nothing, and change detection
+        # would never fire.
+        content_hash = _content_hash(file_path, project_root)
+
+        metadata = {
+            "path": file_path,
+            "format": info.format,
+            "columns": info.columns,
+            "row_count": info.row_count,
+            "column_types": info.column_types,
+        }
+        if content_hash:
+            metadata["content_hash"] = content_hash
+        ds_node_id = upsert_dataset_node(graph, info, metadata=metadata)
 
         # Link to source file, if that file is indexed.
         file_key = canonical_file_key(graph.project_id, file_path)
@@ -259,6 +308,55 @@ def sync_dataset_inspection(
     except Exception as exc:
         log.warning("Failed to sync dataset %s: %s", file_path, exc)
         return None
+
+
+def _content_hash(
+    path: str,
+    project_root: str | Path | None = None,
+    max_bytes: int = 10 * 1024 * 1024,
+) -> str:
+    """A hash of a dataset's bytes, or "" when it cannot be read.
+
+    Only used to detect change, never stored alongside the data itself.
+    """
+    try:
+        target = Path(path)
+        if not target.is_absolute():
+            if project_root is None:
+                # No base to resolve against, so no claim is made.
+                return ""
+            target = Path(project_root) / path
+        if not target.is_file() or target.stat().st_size > max_bytes:
+            return ""
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def invalidate_analyses_for_dataset(graph: KnowledgeGraph, dataset_path: str) -> int:
+    """Mark analyses of a changed dataset as no longer current.
+
+    An analysis records a question and the shape of the answer. Once the source
+    data changes, the recorded answer no longer describes anything, so the node
+    is demoted with an explicit reason instead of quietly continuing to look
+    like a live result.
+    """
+    target = str(dataset_path).replace("\\", "/")
+    changed = 0
+    for node in graph.find_nodes(node_type=NodeType.ANALYSIS, limit=10000,
+                                include_stale=True):
+        recorded = str(node.metadata.get("dataset_path", "") or "").replace("\\", "/")
+        if recorded != target or is_stale(node):
+            continue
+        graph.mark_stale(node, STALE_SOURCE_CHANGED)
+        changed += 1
+    if changed:
+        log.info("Marked %d analyses stale after %s changed", changed, dataset_path)
+    return changed
 
 
 def sync_data_analysis(

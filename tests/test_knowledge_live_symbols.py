@@ -49,8 +49,18 @@ def indexed(tmp_settings, project: Path) -> str:
 
 
 def _symbols(tmp_settings, project: Path) -> dict[str, dict]:
+    """Current (non-stale) symbols, as a normal query returns them."""
     result = knowledge_query(query_type="find_nodes", settings=tmp_settings,
                              project_path=str(project), node_type="code_symbol", limit=100)
+    assert result.success, result.error
+    return {n["display_name"]: n for n in result.data["nodes"]}
+
+
+def _all_symbols(tmp_settings, project: Path) -> dict[str, dict]:
+    """Every symbol including stale ones, for asserting on demoted knowledge."""
+    result = knowledge_query(query_type="find_nodes", settings=tmp_settings,
+                             project_path=str(project), node_type="code_symbol",
+                             limit=100, include_stale=True)
     assert result.success, result.error
     return {n["display_name"]: n for n in result.data["nodes"]}
 
@@ -157,17 +167,26 @@ class TestChangedSource:
         (project / "src" / "main.py").write_text("def goodbye():\n    return 2\n", encoding="utf-8")
         knowledge_index(project_path=str(project), settings=tmp_settings)
 
-        symbols = _symbols(tmp_settings, project)
-        assert symbols["goodbye"]["metadata"]["stale"] is False
+        # The current answer is the file as it is now, and nothing else.
+        # "util" survives because src/util.py still defines it.
+        current = _symbols(tmp_settings, project)
+        assert set(current) == {"goodbye", "util"}
+        assert current["goodbye"]["state"] == "current"
+
+        # The functions that used to be here are kept, but demoted.
+        everything = _all_symbols(tmp_settings, project)
         for gone in ("hello", "Greeter", "greet"):
-            assert symbols[gone]["metadata"]["stale"] is True
+            assert everything[gone]["metadata"]["stale"] is True
+            assert everything[gone]["state"] == "stale"
 
     def test_renamed_symbol_does_not_remain_authoritative(self, tmp_settings, project: Path, indexed: str):
         (project / "src" / "main.py").write_text("def hi():\n    return 1\n", encoding="utf-8")
         knowledge_index(project_path=str(project), settings=tmp_settings)
-        symbols = _symbols(tmp_settings, project)
-        assert symbols["hi"]["metadata"]["stale"] is False
-        assert symbols["hello"]["metadata"]["stale"] is True
+        current = _symbols(tmp_settings, project)
+        assert "hi" in current
+        assert "hello" not in current
+        everything = _all_symbols(tmp_settings, project)
+        assert everything["hello"]["metadata"]["stale"] is True
 
     def test_changed_file_updates_line_numbers(self, tmp_settings, project: Path, indexed: str):
         (project / "src" / "main.py").write_text(
@@ -198,9 +217,27 @@ class TestDeletedSource:
     def test_deleted_file_symbols_are_marked_stale(self, tmp_settings, project: Path, indexed: str):
         (project / "src" / "util.py").unlink()
         knowledge_index(project_path=str(project), settings=tmp_settings)
-        symbols = _symbols(tmp_settings, project)
-        assert symbols["util"]["metadata"]["stale"] is True
-        assert symbols["hello"]["metadata"]["stale"] is False
+        # A stale symbol is not merely flagged, it is withheld: a query for the
+        # functions in this project must not offer one that no longer exists.
+        current = _symbols(tmp_settings, project)
+        assert "util" not in current
+        assert "hello" in current
+
+        everything = _all_symbols(tmp_settings, project)
+        assert everything["util"]["metadata"]["stale"] is True
+        assert everything["util"]["state"] == "stale"
+        assert everything["hello"]["metadata"].get("stale", False) is False
+        assert everything["hello"]["state"] == "current"
+
+    def test_stale_count_is_reported_not_hidden(self, tmp_settings, project: Path, indexed: str):
+        (project / "src" / "util.py").unlink()
+        knowledge_index(project_path=str(project), settings=tmp_settings)
+        result = knowledge_query(query_type="find_nodes", settings=tmp_settings,
+                                 project_path=str(project), node_type="code_symbol",
+                                 limit=100)
+        # "Nothing matched" and "what matched no longer exists" are different
+        # answers, so the second is reported rather than left implicit.
+        assert result.data["stale_withheld"] >= 1
 
     def test_deleted_file_is_reported_in_stats(self, tmp_settings, project: Path):
         knowledge_index(project_path=str(project), settings=tmp_settings)
@@ -249,13 +286,16 @@ class TestSyntaxErrors:
         graph.close()
 
     def test_becoming_broken_marks_previous_symbols_stale(self, tmp_settings, project: Path, indexed: str):
-        assert _symbols(tmp_settings, project)["hello"]["metadata"]["stale"] is False
+        assert _symbols(tmp_settings, project)["hello"]["state"] == "current"
         (project / "src" / "main.py").write_text("def broken(:\n", encoding="utf-8")
         knowledge_index(project_path=str(project), settings=tmp_settings)
-        symbols = _symbols(tmp_settings, project)
         # "we could not read it" is not "it defines nothing": prior symbols are
-        # retained but demoted rather than deleted.
-        assert symbols["hello"]["metadata"]["stale"] is True
+        # retained but demoted rather than deleted, and withheld from the
+        # current answer.
+        assert "hello" not in _symbols(tmp_settings, project)
+        everything = _all_symbols(tmp_settings, project)
+        assert everything["hello"]["metadata"]["stale"] is True
+        assert everything["hello"]["metadata"]["stale_reason"] == "unreadable"
 
 
 # ------------------------------------------------------------- scoping/security

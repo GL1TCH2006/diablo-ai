@@ -31,6 +31,7 @@ from core.knowledge_graph import (
     canonical_file_key,
     canonical_project_key,
     canonical_task_key,
+    shared_manager,
 )
 from core.knowledge_tasks import (
     link_task_to_changed_files,
@@ -224,7 +225,7 @@ def project_task(
         return ""
 
     project_id = canonical_project_key(project_root)
-    mgr = manager or KnowledgeGraphManager(knowledge_dir(settings))
+    mgr = manager or shared_manager(knowledge_dir(settings))
     try:
         graph = mgr.get_graph(project_id)
 
@@ -385,7 +386,7 @@ def project_tool_result(
         return ""
 
     project_id = canonical_project_key(project_root)
-    mgr = manager or KnowledgeGraphManager(knowledge_dir(settings))
+    mgr = manager or shared_manager(knowledge_dir(settings))
     try:
         graph = mgr.get_graph(project_id)
         from core.knowledge_data import (
@@ -413,9 +414,11 @@ def project_tool_result(
             if not rel:
                 return ""
             if task_node is not None:
-                sync_dataset_inspection(graph, task_node.node_id, rel, result_data)
+                sync_dataset_inspection(
+                    graph, task_node.node_id, rel, result_data, project_root
+                )
             else:
-                upsert_dataset_only(graph, rel, result_data)
+                upsert_dataset_only(graph, rel, result_data, project_root)
             return project_id
 
         if name in _ANALYZE_TOOLS:
@@ -483,7 +486,12 @@ def project_tool_result(
         return ""
 
 
-def upsert_dataset_only(graph, rel_path: str, result_data: dict) -> str:
+def upsert_dataset_only(
+    graph,
+    rel_path: str,
+    result_data: dict,
+    project_root: str | Path | None = None,
+) -> str:
     """Record a dataset observation with no task anchor."""
     from core.knowledge_data import DatasetInfo, normalize_dataset_result, upsert_dataset_node
 
@@ -495,4 +503,12 @@ def upsert_dataset_only(graph, rel_path: str, result_data: dict) -> str:
         row_count=shape["row_count"],
         column_types=shape["column_types"],
     )
-    return upsert_dataset_node(graph, info)
+    return upsert_dataset_node(graph, info, metadata={
+        "content_hash": _dataset_content_hash(rel_path, project_root),
+    })
+
+
+def _dataset_content_hash(rel_path: str, project_root: str | Path | None) -> str:
+    from core.knowledge_data import _content_hash
+
+    return _content_hash(rel_path, project_root)
