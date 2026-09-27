@@ -44,7 +44,23 @@ from core.logging_setup import get_logger
 
 log = get_logger("tool_context")
 
-log_caps = ("filesystem", "project", "code", "python", "terminal", "system", "task", "data", "chart")
+#: Capabilities added when the signal is weak and the set must widen.
+#:
+#: ``knowledge`` belongs here for the same reason ``data`` and ``chart`` do.
+#: Found in Phase 9: a real local model was asked to query the project
+#: knowledge graph and reported that the tool "is not listed in the available
+#: functions". It was not. Nothing in the structured signal set ever requests
+#: the ``knowledge`` capability — ``Agent._requested_capabilities`` only ever
+#: produces coding, debugging or version_control — so the persistent graph that
+#: M2.14 exists to provide was dispatchable but not discoverable, and the
+#: default configuration made it unreachable by the model.
+#:
+#: It rides the widened set rather than the core floor because it is a
+#: two-tool capability and the floor is meant to be what a turn cannot proceed
+#: without. The registry is still authoritative and still complete: this only
+#: decides what is offered, never what exists.
+log_caps = ("filesystem", "project", "code", "python", "terminal", "system",
+            "task", "data", "chart", "knowledge")
 
 #: Always presented. Without these an agent turn cannot make progress at all,
 #: so this set is a floor that selection may only add to.

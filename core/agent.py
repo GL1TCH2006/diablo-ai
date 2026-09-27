@@ -721,6 +721,45 @@ class Agent:
         except Exception as exc:  # pragma: no cover - projection is non-critical
             log.debug("knowledge projection skipped: %s", exc)
 
+    def _knowledge_project_root(self, args: dict, tool: str = "") -> str:
+        """The project a data/chart observation belongs to.
+
+        ``_project_root_from_args`` is a *scoping hint*: given a file argument
+        it answers "which directory is this operation about", and for a file it
+        returns the file's parent. That is the right answer for change
+        tracking and for Git, and the wrong answer for identity.
+
+        Project identity is not a property of a file's parent directory. A
+        dataset at ``<project>/data/sales.csv`` describes ``<project>``, and
+        keying it on ``<project>/data`` mints a second project for one
+        directory tree: the dataset then cannot be found by querying the
+        project that actually contains it, and cross-project isolation quietly
+        stops meaning anything because the same tree is now two projects.
+
+        So when this agent is working inside a known project and the
+        observation points into it, that project is the identity. The
+        path-derived root is still used when there is no project context, or
+        when the observation genuinely points somewhere else, which keeps
+        behaviour unchanged for every caller that has no project.
+        """
+        derived = self._project_root_from_args(args, tool)
+        active = ""
+        if self._project is not None and getattr(self._project, "path", ""):
+            active = self._canonical_root(self._project.path)
+        if not active:
+            return derived
+        if not derived:
+            return active
+        # Only adopt the active project when the observation really is inside
+        # it. An observation of something outside stays attributed to where it
+        # actually happened, rather than being folded into the current project.
+        try:
+            if self._within_project(derived, active):
+                return active
+        except Exception:
+            return derived
+        return derived
+
     def _project_knowledge_tool(
         self, tool: str, args: dict, outcome: ExecutionOutcome
     ) -> None:
@@ -745,7 +784,7 @@ class Agent:
         try:
             from core.knowledge_projection import project_tool_result
 
-            project_root = self._project_root_from_args(args, tool)
+            project_root = self._knowledge_project_root(args, tool)
             if not project_root:
                 return
             # Project the task first so the TASK node exists as an anchor.
