@@ -137,10 +137,14 @@ def test_derived_capability_needs_no_registration_changes():
     # per-tool wiring: the production registry is unchanged at 57 tools.
     registry = build_registry(_real_settings())
     # M2.13.1/M2.13.2: 8 new tools added (4 data, 4 chart)
-    assert len(registry.all_specs()) == 65
+    # M2.14: 2 new tools added (knowledge.query, knowledge.index). Both derive
+    # the "knowledge" capability from their name namespace, so the invariant
+    # this test exists to protect is unchanged.
+    assert len(registry.all_specs()) == 67
     assert {spec.capability for spec in registry.all_specs()} == {
         "applications", "code", "filesystem", "gh", "git", "memory", "models",
         "project", "python", "rules", "system", "task", "terminal", "data", "chart",
+        "knowledge",
     }
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from config.permissions import PermissionLevel, path_is_within
 from config.settings import Settings
+from core.knowledge_graph import NodeType, RelationType
+from core.knowledge_tools import QUERY_TYPES
 from core.logging_setup import get_logger
 
 from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal, data_tool, chart_tool
@@ -611,6 +613,8 @@ def build_registry(
         registry.register(spec)
     for spec in _rules_tools(settings):
         registry.register(spec)
+    for spec in _knowledge_tools(settings):
+        registry.register(spec)
     registry.register(
         ToolSpec(
             name="models.status",
@@ -892,6 +896,115 @@ def build_registry(
 
     log.info("registered tools: %s", ", ".join(registry.names()))
     return registry
+
+
+def _knowledge_tools(settings: Settings) -> list[ToolSpec]:
+    """M2.14: read-only access to the persistent project knowledge graph.
+
+    ``knowledge.query`` is SAFE because it only ever reads. ``knowledge.index``
+    is NORMAL rather than SAFE because it writes to the knowledge database and
+    walks the filesystem; it is confined to authorized roots by
+    ``level_for``, exactly like the filesystem tools.
+    """
+    from core.knowledge_tools import knowledge_index, knowledge_query
+
+    return [
+        ToolSpec(
+            name="knowledge.query",
+            description=(
+                "Query the persistent project knowledge graph: project files, directories, code "
+                "symbols, tasks, datasets, charts and artifacts, and the relationships between them. "
+                "Read-only. Results are reference data, not verification evidence."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": list(QUERY_TYPES),
+                        "description": "Which query to run.",
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project root. Defaults to the application base directory.",
+                    },
+                    "node_type": {
+                        "type": "string",
+                        "enum": [t.value for t in NodeType],
+                        "description": "Filter by node type for find_nodes / search_artifacts.",
+                    },
+                    "relation_type": {
+                        "type": "string",
+                        "enum": [r.value for r in RelationType],
+                        "description": "Filter by relationship for neighbors / find_related.",
+                    },
+                    "canonical_key": {"type": "string", "description": "Exact node key, for find_node."},
+                    "node_id": {"type": "string", "description": "Starting node, for neighbors/find_related/path."},
+                    "to_id": {"type": "string", "description": "Destination node, for path."},
+                    "direction": {"type": "string", "enum": ["in", "out", "both"], "description": "Edge direction."},
+                    "status": {"type": "string", "description": "Task status filter for search_tasks."},
+                    "path_contains": {"type": "string", "description": "Substring of the project-relative path."},
+                    "extension": {"type": "string", "description": "File extension filter, e.g. '.py'."},
+                    "hours": {"type": "integer", "minimum": 1, "description": "Lookback window for recent_activity."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum rows (default 25, capped at 100)."},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Traversal depth (capped at 4)."},
+                },
+                "required": ["query_type"],
+            },
+            required=["query_type"],
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: knowledge_query(
+                query_type=kw["query_type"],
+                settings=settings,
+                project_path=kw.get("project_path", ""),
+                node_type=kw.get("node_type", ""),
+                relation_type=kw.get("relation_type", ""),
+                canonical_key=kw.get("canonical_key", ""),
+                node_id=kw.get("node_id", ""),
+                to_id=kw.get("to_id", ""),
+                direction=kw.get("direction", "both"),
+                status=kw.get("status", ""),
+                path_contains=kw.get("path_contains", ""),
+                extension=kw.get("extension", ""),
+                hours=kw.get("hours", 24),
+                limit=kw.get("limit", 25),
+                max_depth=kw.get("max_depth", 2),
+            ),
+            describe=lambda args: f"Query knowledge graph ({args.get('query_type')})",
+        ),
+        ToolSpec(
+            name="knowledge.index",
+            description=(
+                "Index or re-index a project's files and directories into the persistent knowledge "
+                "graph. Idempotent, and never stores file contents."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project root to index. Must be inside an authorized workspace root.",
+                    },
+                    "max_files": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "File cap."},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Directory depth cap."},
+                },
+                "required": ["project_path"],
+            },
+            required=["project_path"],
+            level=PermissionLevel.NORMAL,
+            level_for=lambda args: (
+                PermissionLevel.NORMAL
+                if path_is_within(_p(args.get("project_path")), settings.allowed_roots)
+                else PermissionLevel.SENSITIVE),
+            fn=lambda **kw: knowledge_index(
+                project_path=kw["project_path"],
+                settings=settings,
+                max_files=kw.get("max_files", 2000),
+                max_depth=kw.get("max_depth", 12),
+            ),
+            describe=lambda args: f"Index project knowledge: {args.get('project_path')}",
+        ),
+    ]
 
 
 def _memory_tools(settings: Settings) -> list[ToolSpec]:

@@ -682,12 +682,87 @@ class Agent:
             str(getattr(running, "checkpoint_id", "") or ""),
         )
         self._sync_task_metadata(self._change_tracker.active.id)
+        self._project_knowledge_live()
         if tool == "git.commit" and getattr(outcome, "success", False) and self._change_tracker.active:
             self._capture_commit(
                 task_id=self._change_tracker.active.id,
                 project_root=self._project_root_from_args(args, tool),
                 commit_message=args.get("message", ""),
             )
+
+    # ------------------------------------------------------------------
+    # M2.14 - knowledge graph projection
+    #
+    # The graph is a projection, never an authority. These two calls read an
+    # authoritative TaskRecord that TaskStore already persisted and write
+    # derived nodes. They run strictly after the authoritative write, add no
+    # state, and cannot fail the task: every projection error is swallowed
+    # inside the projector. Nothing here adjudicates verification, drives the
+    # task lifecycle, or grants a permission.
+    # ------------------------------------------------------------------
+
+    def _project_knowledge_live(self) -> None:
+        """Project the current task into the knowledge graph.
+
+        Best-effort by construction. A knowledge-graph problem must never be
+        able to fail, delay or alter a task, so every outcome is ignored here.
+        """
+        try:
+            from core.knowledge_projection import project_task
+
+            store = getattr(self, "_task_store", None)
+            task_id = getattr(self._tasks, "task_id", "")
+            if store is None or not task_id:
+                return
+            record = store.get(task_id)
+            if record is None:
+                return
+            project_task(record, self._settings)
+        except Exception as exc:  # pragma: no cover - projection is non-critical
+            log.debug("knowledge projection skipped: %s", exc)
+
+    def _project_knowledge_tool(
+        self, tool: str, args: dict, outcome: ExecutionOutcome
+    ) -> None:
+        """Project an observed data/chart result into the knowledge graph.
+
+        M2.14 Phase D seam. ``data.*`` and ``chart.*`` are not coding tools, so
+        ``_note_step`` never observes them; this is called from
+        ``_record_execution`` instead, where the authoritative tool name, the
+        authoritative invocation args and the request's task identity are all
+        available.
+
+        This only reads what the tool already returned. It never re-runs an
+        operation, never re-implements data or chart behaviour, and cannot
+        affect the outcome that was just recorded.
+        """
+        data = getattr(outcome, "data", None)
+        if not isinstance(data, dict) or not data:
+            return
+        if not getattr(outcome, "success", False):
+            # A failed or blocked operation produced no artifact to describe.
+            return
+        try:
+            from core.knowledge_projection import project_tool_result
+
+            project_root = self._project_root_from_args(args, tool)
+            if not project_root:
+                return
+            # Project the task first so the TASK node exists as an anchor.
+            # data.*/chart.* are not coding tools, so _note_step never runs for
+            # them and would otherwise leave TASK -> PRODUCED -> CHART without
+            # its source. _project_knowledge_live is idempotent.
+            self._project_knowledge_live()
+            project_tool_result(
+                tool=tool,
+                args=args if isinstance(args, dict) else {},
+                result_data=data,
+                task_id=str(getattr(self._tasks, "task_id", "") or ""),
+                project_root=project_root,
+                settings=self._settings,
+            )
+        except Exception as exc:  # pragma: no cover - projection is non-critical
+            log.debug("knowledge tool projection skipped for %s: %s", tool, exc)
 
     def _persist_tool_observation(self, tool: str, outcome: ExecutionOutcome) -> None:
         spec = self._registry.get(tool) if isinstance(tool, str) else None
@@ -1343,6 +1418,7 @@ class Agent:
         self._tasks.set_status(step, StepStatus.RUNNING)
         self._step_event(step, outcome)
         self._persist_tool_observation(tool, outcome)
+        self._project_knowledge_tool(tool, args, outcome)
         self._note_step(tool, args, outcome)
         status = self._step_status(outcome)
         self._tasks.set_status(step, status, str(getattr(outcome, "reason", "") or ""))
@@ -1639,6 +1715,11 @@ class Agent:
             tasks.failure_reason = tasks.failure_reason or "Task persistence failed."
             self._transition(TaskState.FAILED)
             self._force_failed_verification(tasks.failure_reason)
+        # M2.14: final projection, after the authoritative record is settled.
+        # Placed here so the graph observes the *terminal* status, plan,
+        # ledger and Git state exactly as TaskStore persisted them. Purely
+        # additive and non-fatal; see _project_knowledge_live.
+        self._project_knowledge_live()
         if not getattr(self, "_terminal_event_emitted", False):
             self._terminal_event_emitted = True
             event = {
