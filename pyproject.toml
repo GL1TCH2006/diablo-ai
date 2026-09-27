@@ -3,7 +3,20 @@ name = "diablo-ai"
 version = "0.1.0"
 description = "DIABLO - personal AI assistant and development agent (Phase 1 core)"
 requires-python = ">=3.11"
-dependencies = ["rich>=13.7", "httpx>=0.28", "Pillow>=10.0", "numpy>=1.24"]
+# Runtime dependencies. ``chart.generate`` and ``chart.verify`` are registered
+# production capabilities, so the charting stack is a runtime requirement here
+# rather than an optional extra: without it the tools are registered and
+# reachable by the model, and only fail once invoked.
+#
+# ``requirements.txt`` is the full install set and additionally carries the
+# test dependency (pytest).
+dependencies = [
+    "rich>=13.7",
+    "httpx>=0.28",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

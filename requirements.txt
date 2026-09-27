@@ -3,3 +3,4 @@ httpx>=0.28
 pytest>=8.0
 Pillow>=10.0
 numpy>=1.24
+matplotlib>=3.7
