@@ -81,8 +81,36 @@ class TerminalUI:
             reply = f"Diablo hit an internal error: {exc}"
         self._console.print(Text(f"{APP_NAME}: {reply}", style="bold bright_green"))
         if self._voice_enabled:
+            self._speak(reply)
+
+    def _speak(self, reply: str) -> None:
+        """Speak a reply, if TTS is genuinely available.
+
+        M2.14.1: this used to call ``tts.speak`` unconditionally whenever voice
+        was enabled, with no availability check and no error handling. A machine
+        without SAPI voices, or a PowerShell failure, silently did nothing. It now
+        probes once and reports the state honestly, and never lets a voice
+        failure affect the turn the user actually asked for.
+        """
+        try:
+            from voice.capabilities import voice_status
+
+            status = self._voice_status() or voice_status()
+            if not status.tts_available:
+                log.info("TTS requested but unavailable: %s", status.notes or "no backend")
+                return
             import voice.text_to_speech as tts
             tts.speak(reply)
+        except Exception as exc:  # noqa: BLE001 - speech must never break a turn
+            log.warning("TTS failed: %s", exc)
+
+    def _voice_status(self):
+        cached = getattr(self, "_voice_status_cache", None)
+        if cached is None:
+            from voice.capabilities import voice_status as _probe
+            cached = _probe()
+            self._voice_status_cache = cached
+        return cached
 
     def _header(self) -> None:
         title = Text()
@@ -92,7 +120,8 @@ class TerminalUI:
         body.append(f"Model       : {self._model_label}\n")
         body.append(f"Provider    : {self._provider_state}\n")
         body.append(f"Blender     : {self._blender_desc}\n")
-        body.append(f"Voice (TTS) : {'enabled' if self._voice_enabled else 'disabled'}\n")
+        status = self._voice_status()
+        body.append(f"Voice       : {status.summary()}\n")
         body.append(f"Project     : {self._project_label}", style="cyan")
         self._console.print(Panel(body, title=title, border_style="bright_red", width=82, title_align="left"))
 

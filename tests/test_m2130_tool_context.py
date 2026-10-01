@@ -140,7 +140,9 @@ def test_derived_capability_needs_no_registration_changes():
     # M2.14: 2 new tools added (knowledge.query, knowledge.index). Both derive
     # the "knowledge" capability from their name namespace, so the invariant
     # this test exists to protect is unchanged.
-    assert len(registry.all_specs()) == 67
+    # M2.14.1: 1 new tool added (memory.policy), so the memory write policy is
+    # observable rather than implicit.
+    assert len(registry.all_specs()) == 68
     assert {spec.capability for spec in registry.all_specs()} == {
         "applications", "code", "filesystem", "gh", "git", "memory", "models",
         "project", "python", "rules", "system", "task", "terminal", "data", "chart",

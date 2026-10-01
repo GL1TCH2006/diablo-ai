@@ -1,6 +1,12 @@
 from .bridge import AgentBridge, AgentBridgeError, CoreEventBusBridge, MockAgentBridge
 from .companion import FloatingCompanionApp, create_companion_app, run_companion
 from .controller import UIController
+from .launch import (
+    CompanionRuntime,
+    CompanionUnavailable,
+    build_companion_for_agent,
+    run_companion_for_agent,
+)
 from .models import AgentEvent, UIActionResult, UIActivity, UIControllerError, UIStatus
 
 __all__ = [
@@ -18,6 +24,11 @@ __all__ = [
     "FloatingCompanionApp",
     "create_companion_app",
     "run_companion",
+    # M2.14.1 production launch path
+    "CompanionRuntime",
+    "CompanionUnavailable",
+    "build_companion_for_agent",
+    "run_companion_for_agent",
 ]
 
 

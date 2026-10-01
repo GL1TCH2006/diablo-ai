@@ -4,3 +4,6 @@ pytest>=8.0
 Pillow>=10.0
 numpy>=1.24
 matplotlib>=3.7
+# M2.15 native Windows systems layer. Windows-only; the agent degrades rather
+# than failing on a host without it (see core/windows/__init__.py).
+pywin32>=306; sys_platform == 'win32'

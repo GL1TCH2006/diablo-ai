@@ -143,6 +143,21 @@ class CapabilityBridge:
             return PermissionLevel.BLOCKED
         if operation == "execute_script":
             return PermissionLevel.BLOCKED
+        # M2.15: an adapter that declares which of its operations mutate state is
+        # authoritative for that decision. The native Windows layer is the first:
+        # `terminate` must not be SAFE just because its name does not contain a
+        # mutating keyword, and a query must not be SENSITIVE just because it
+        # lives beside one.
+        is_mutating = getattr(capability, "is_mutating", None)
+        if callable(is_mutating):
+            try:
+                if is_mutating(operation):
+                    return PermissionLevel.SENSITIVE
+            except Exception:  # noqa: BLE001 - a bad probe must not widen access
+                return PermissionLevel.SENSITIVE
+            if self._has_external_path(args.get("params") or {}):
+                return PermissionLevel.SENSITIVE
+            return PermissionLevel.SAFE
         if capability_name == "mock" and operation == "execute":
             return PermissionLevel.SENSITIVE if self._has_external_path(args.get("params") or {}) else PermissionLevel.SAFE
         if operation.startswith(_READ_ONLY_WORDS):
@@ -287,6 +302,8 @@ class CapabilityBridge:
                 "image_inspection",
                 evidence,
             )
+        if capability == "windows":
+            return self._windows_verification(result, request, data, operation)
         if capability == "blender_vision" and operation in {
             "render_and_inspect",
             "render_and_describe",
@@ -371,6 +388,109 @@ class CapabilityBridge:
             "Capability completed without an independent S1 verifier.",
             "capability_execution",
             self._json_safe({"capability": capability, "operation": operation, "status": result.status.value, "evidence": data.get("evidence")}),
+        )
+
+    def _windows_verification(
+        self,
+        result: CapabilityResult,
+        request: CapabilityRequest,
+        data: dict,
+        operation: str,
+    ) -> VerificationResult:
+        """Verification evidence for the M2.15 native Windows layer.
+
+        The rule that matters: a termination that was **requested** but not
+        **observed** can never be a ``PASSED``. The layer reports the two as
+        separate fields precisely so this function can refuse to conflate them,
+        and the ledger's invariant then refuses anything without observed
+        evidence anyway.
+        """
+        request_id = str(request.request_id or "")
+        common = {"capability": "windows", "operation": operation,
+                  "request_id": request_id}
+
+        if operation == "terminate":
+            requested = data.get("requested") is True
+            confirmed = data.get("confirmed") is True
+            evidence = self._json_safe({
+                **common,
+                "pid": data.get("pid"),
+                "requested": requested,
+                "confirmed": confirmed,
+                "exit_code": data.get("exit_code"),
+                "identity_created_at": data.get("identity_created_at"),
+            })
+            if requested and confirmed:
+                return VerificationResult(
+                    VerificationState.PASSED,
+                    "Termination was requested and the process exit was observed.",
+                    "capability_execution",
+                    evidence,
+                )
+            if requested and not confirmed:
+                return VerificationResult(
+                    VerificationState.FAILED,
+                    "Termination was requested but the exit was not observed; "
+                    "this is not a completed termination.",
+                    "capability_execution",
+                    evidence,
+                )
+            return VerificationResult(
+                VerificationState.UNVERIFIED,
+                "Termination was not requested; nothing to verify.",
+                "capability_execution",
+                evidence,
+            )
+
+        if operation == "system_info":
+            memory = data.get("memory") if isinstance(data.get("memory"), dict) else {}
+            cpu = data.get("cpu") if isinstance(data.get("cpu"), dict) else {}
+            total = float(memory.get("total_physical_mb") or 0.0)
+            available = float(memory.get("available_physical_mb") or 0.0)
+            # Internally consistent: available cannot exceed total, and a
+            # machine reporting zero physical memory is not reporting a system.
+            consistent = bool(total > 0.0 and 0.0 <= available <= total
+                              and data.get("os_caption"))
+            evidence = self._json_safe({
+                **common,
+                "os_caption": data.get("os_caption"),
+                "backend": data.get("backend"),
+                "total_physical_mb": total,
+                "available_physical_mb": available,
+                "logical_cores": cpu.get("logical_cores"),
+            })
+            return VerificationResult(
+                VerificationState.PASSED if consistent else VerificationState.FAILED,
+                "Native system snapshot was internally consistent."
+                if consistent else
+                "Native system snapshot was missing or inconsistent fields.",
+                "tool_observation",
+                evidence,
+            )
+
+        # list / get / find: structural validity of the returned rows.
+        rows = data.get("processes")
+        if operation == "get":
+            rows = [data] if data.get("pid") is not None else []
+        if not isinstance(rows, list):
+            rows = []
+        well_formed = all(
+            isinstance(row, dict) and isinstance(row.get("pid"), int) and row.get("pid") > 0
+            for row in rows
+        )
+        evidence = self._json_safe({
+            **common,
+            "count": data.get("count", len(rows)),
+            "returned": len(rows),
+            "well_formed": well_formed,
+        })
+        return VerificationResult(
+            VerificationState.PASSED if well_formed and rows else VerificationState.UNVERIFIED,
+            "Process metadata was structurally valid."
+            if well_formed and rows else
+            "No well-formed process metadata was returned.",
+            "tool_observation",
+            evidence,
         )
 
     def _workflow_verification(

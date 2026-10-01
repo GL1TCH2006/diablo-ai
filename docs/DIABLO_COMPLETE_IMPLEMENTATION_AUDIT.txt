@@ -1,0 +1,2304 @@
+================================================================================
+DIABLO COMPLETE IMPLEMENTATION AUDIT
+================================================================================
+
+Audit type      : READ-ONLY (no repository modification)
+Repository      : C:\PROJECTS\jarvis like ai for my computer\diablo-ai
+Branch          : main
+HEAD at audit   : ef7c49a478a9a3dd8a2b1e077a71003234618c07
+                   "M2.14 Phase 10 finalize validation and architecture audit"
+Baseline audited: M2.14 Phase 10 freeze (ef7c49a)
+Total commits   : 27
+
+================================================================================
+1. GIT / REPOSITORY STATE
+================================================================================
+
++---------------------------+--------------------------------------------------+
+| Check                     | Result                                          |
++---------------------------+--------------------------------------------------+
+| HEAD                      | ef7c49a478a9a3dd8a2b1e077a71003234618c07        |
+|                           | MATCHES the freeze commit                       |
+| Branch                    | main (only branch; no others exist)             |
+| Worktree                  | CLEAN - "nothing to commit, working tree clean" |
+| Total commits             | 27                                              |
+| Phase 10 history          | INTACT                                          |
+| Second branch / session   | NONE - confirmed                                |
++---------------------------+--------------------------------------------------+
+
+Phase 10 history verified: all of the following are ancestors of HEAD
+  ef7c49a -> 453b073 -> da8fb91 -> d86f674 -> ada0838 -> 91cc24e -> 4fb8e30
+  -> 0f4a08f -> 2a5b74a -> bb2fed9 -> 59eaa53 -> ffff890 -> b705e04
+  -> f44546d -> 70fb6ab -> 9824b16 -> 4287d3b -> f776476 -> a01a925
+  -> 3bcf831 -> c6ad065 -> e8fbfd7 -> 1419545 -> 47ac455
+
+git show --stat ef7c49a
+  core/agent.py                                      |  18 +
+  core/task_manager.py                               | 244 +++-
+  docs/M2.14_PHASE10Q_VALIDATION.md                  | 163 ++
+  docs/M2.14_PHASE10R_AUDIT.md                       | 155 ++
+  docs/M2.14_PHASE10_FREEZE.md                       | 250 ++
+  docs/M2.14_PHASE10_REPORT.md                       | 315 ++
+  docs/contracts/cross_layer_execution_contracts.md  | 128 ++
+  tests/test_phase10q_validation.py                  | 259 ++
+  tests/test_recovery_p10_real_model.py              |  76 +-
+  tests/test_terminal_state_invariant.py            | 588 ++
+  10 files changed, 2174 insertions(+), 22 deletions(-)
+
+VERIFICATION OF THE FREEZE CLAIMS
+----------------------------------
+
++---------------------------------+--------------+-------------------------------+
+| Claim                           | Verified?    | Method                       |
++---------------------------------+--------------+-------------------------------+
+| worktree clean                  | YES          | git status                   |
+| 2212 passed / 42 skipped        | CONSISTENT   | pytest --collect-only = 2254 |
+|                                 |              | 2212 + 42 = 2254             |
+| repeated three times            | NOT RE-VER.  | needs a re-run               |
+| qwen3:14b 21 passed             | NOT RE-VER.  | needs ~50 min gated run      |
+| real Blender 97 / 0 skipped     | NOT RE-VER.  | needs gated run; Blender     |
+|                                 |              | 5.2.2 IS installed           |
+| compileall clean                | NOT RE-VER.  | -                            |
+| pip check clean                 | NOT RE-VER.  | -                            |
+| 10Q / 10R complete              | PARTIAL      | both docs exist; 10R lists   |
+|                                 |              | 2 open defects; 10Q marks    |
+|                                 |              | 3 rows "not here"            |
++---------------------------------+--------------+-------------------------------+
+
+Collection count corroborates the test-count claim but does not independently
+re-prove the three full-suite runs. Those remain unverifiable historical claims
+in a read-only audit.
+
+Two docs exist for 10Q / 10R. No pre-existing definition anywhere.
+README.md mentions neither.
+
+================================================================================
+2. CURRENT ARCHITECTURE
+================================================================================
+
+TWO CORRECTIONS to the assumed package layout:
+
+  * There is NO knowledge/ package.  Knowledge Graph is 8 modules inside core/.
+  * There is NO companion/ package. The companion UI is ui/.
+
+ASCII trace
+-----------
+
+  USER (rich console, ui/terminal.py)
+   |
+   v
+  main.py  -- CLI: --offline --model --host --demo --demo-phase2 --log-level
+   |         (run.ps1 -> .venv\Scripts\python.exe main.py)
+   v
+  Agent (core/agent.py, 117KB)  -- single class, request-scoped
+   |  RequestContext (core/request_context.py) -> BoundedRequestGate (max 1)
+   |  TaskManager (core/task_manager.py) <- authoritative task + terminal verdict
+   |
+   +-> Planner (core/planner.py)  greet / fast_intent / coding_intent
+   |     ExecutionPlan -> PlanStepRecord -> ExecutionPlanRecord (durable)
+   |
+   +-> ModelProvider (ai/provider.py ABC)
+   |     +- OllamaProvider  (httpx -> /api/chat, tools)
+   |     +- OfflineProvider (rule-based, 3 canned flows)
+   |     ModelRouter (ai/model_router.py) - auto/complexity/project/escalation
+   |     + resource guard (ctypes kernel32 GlobalMemoryStatusEx)  <- ONLY ctypes
+   |
+   +-> ToolContextSelector (core/tool_context.py)  <- PRESENTATION ONLY
+   |     registry stays authoritative (agent.py:2088)
+   |
+   +-> ToolRegistry (tools/registry.py) = 67 tools
+   |     + capability.execute -> CapabilityBridge -> CapabilityRegistry
+   |         blender(16 ops) vision(8 adv / 3 real) blender_vision(7) mock
+   |
+   +-> PermissionManager (config/permissions.py)
+   |     SAFE / NORMAL / SENSITIVE / BLOCKED + destructive-command policy
+   |     + RuleEngine restrict-only injection (memory/rule_engine.py)
+   |     + allowed_roots containment (path_is_within)
+   |
+   +-> Executor (core/executor.py)  <- single dispatch, single permission eval
+   |
+   +-> VerificationLedger (core/verification_ledger.py) <- ONLY PASSED authority
+   |     VerificationEntry + EvidenceTrust(UNTRUSTED/CLAIMED/OBSERVED)
+   |
+   +-> RecoveryPolicy (core/recovery.py)  <- single recovery decision layer
+   |     FailureObservation -> RecoveryDecision (6 actions)
+   |
+   +-> TaskStore (core/task_store.py)  <- durable truth, JSON per task
+   |     ChangeTracker (coding/change_tracker.py) - sessions, checkpoints
+   |     SnapshotManager (coding/snapshot_manager.py) - git snapshots
+   |
+   +-> Memory + Knowledge Graph (PROJECTION-ONLY)
+         memory/{conversation,preferences,memory_store,project_memory,
+                 rules_store}
+         core/knowledge_{graph,ingest,code,data,query,projection,tasks,
+                         tools}.py
+
+LAYER AUTHORITY (verified by trace, not assumption)
+-----------------------------------------------------
+
++---------------------+--------------------------------------+---------------------+
+| Layer               | Implementation                       | Authoritative state |
++---------------------+--------------------------------------+---------------------+
+| Request             | BoundedRequestGate                  | in-memory           |
+|                     |                                      | RequestContext ONLY |
+|                     |                                      | - NOT persisted     |
++---------------------+--------------------------------------+---------------------+
+| Task                | TaskManager                         | state, steps,       |
+|                     |                                      | ledger, verification|
++---------------------+--------------------------------------+---------------------+
+| Execution           | Executor                            | transient           |
+|                     |                                      | ExecutionOutcome    |
++---------------------+--------------------------------------+---------------------+
+| Verification        | VerificationLedger                  | VerificationEntry   |
+|                     |                                      | .state              |
++---------------------+--------------------------------------+---------------------+
+| Recovery            | RecoveryPolicy                      | pure function,      |
+|                     |                                      | no state            |
++---------------------+--------------------------------------+---------------------+
+| Persistence         | TaskStore                           | TaskRecord on disk  |
++---------------------+--------------------------------------+---------------------+
+| Git                 | git CLI                             | porcelain output    |
++---------------------+--------------------------------------+---------------------+
+| Knowledge           | KnowledgeGraphManager               | PROJECTION ONLY -   |
+|                     |                                      | never authoritative |
++---------------------+--------------------------------------+---------------------+
+| Memory              | MemoryStore / RuleStore             | JSON; rules ARE     |
+|                     |                                      | enforced            |
++---------------------+--------------------------------------+---------------------+
+
+================================================================================
+3. COMPLETE CAPABILITY INVENTORY
+================================================================================
+
+TWO PACKAGES THE ROADMAP NEVER NAMES
+--------------------------------------
+
++----------+-------------------------------+--------------+------------------+
+| Package  | Contents                      | Status       | In roadmap?      |
++----------+-------------------------------+--------------+------------------+
+| config/  | settings.py, permissions.py,   | Real,        | NO               |
+|          | default_config.toml            | load-bearing |                  |
++----------+-------------------------------+--------------+------------------+
+| integration| capabilities.py, contracts.py,| Real,        | NO               |
+|          | workflows.py (84KB),           | load-bearing |                  |
+|          | protocol.py, errors.py         |              |                  |
++----------+-------------------------------+--------------+------------------+
+
+integration/ is the S2<->S1 contract layer. It is absent from the roadmap
+entirely.
+
+LIVE PRODUCTION MODULES BY PACKAGE
+----------------------------------
+
+  core/       28 files - agent, planner, task_manager, task_store, executor,
+                       recovery, verification(+ledger), request_context,
+                       tool_context, context(+builder), debug_loop,
+                       dev_workflow, project_task_history, logging_setup,
+                       constants, cancellation, events, + 8 knowledge modules
+  tools/      18 - registry, capability_bridge, + 14 tool modules
+  coding/     15 - change_tracker, commands, patch, profile, project_index,
+                    relevance, snapshot_manager, test_runner, + 6 more
+  vision/     10
+  blender/    16
+  voice/      20
+  ui/          6
+  memory/      8
+  ai/          7
+
+================================================================================
+4. CORE AGENT
+================================================================================
+
+Agent exposes 22 public methods. THERE IS NO resume().
+
++------------------------------+-----+-----+-----+----------+-------------+
+| Capability                   | IMP | WIR | TEST| REAL-VAL| LIMITATION |
++------------------------------+-----+-----+-----+----------+-------------+
+| Request handling             |  Y  |  Y  |  Y  |    Y     | single-     |
+|                              |     |     |     |          | flight only |
+|                              |     |     |     |          | (max_conc  |
+|                              |     |     |     |          | =1)        |
+| Planning / ExecutionPlan     |  Y  |  Y  |  Y  |    Y     | plans are   |
+|                              |     |     |     |          | per-turn    |
+| Tool calls                   |  Y  |  Y  |  Y  |    Y     | -           |
+| Model calls                  |  Y  |  Y  |  Y  |    Y     | 8B declines |
+|                              |     |     |     |          | tools ~50%  |
+| Task create / persist        |  Y  |  Y  |  Y  |    Y     | -           |
+| Verification                 |  Y  |  Y  |  Y  |    Y     | -           |
+| Recovery                     |  Y  |  Y  |  Y  |    Y     | -           |
+| Cancellation                 |  Y  |  Y  |  Y  |    Y     | Blender     |
+|                              |     |     |     |          | child not   |
+|                              |     |     |     |          | interrupt.  |
+| Memory                       |  Y  |  Y  |  Y  |    N     | conversation|
+|                              |     |     |     |          | never restor|
+|                              |     |     |     |          | ed to model |
+| Knowledge Graph              |  Y  |  Y  |  Y  |    Y     | projection  |
+|                              |     |     |     | (2 proc)  | only        |
+| Git                          |  Y  |  Y  |  Y  |    Y     | -           |
+| Coding                       |  Y  |  Y  |  Y  |    Y     | -           |
+|                              |     |     |     | (real     |             |
+|                              |     |     |     |  repair)   |             |
+| Data / Chart                 |  Y  |  Y  |  Y  |    Y     | -           |
+|                              |     |     |     | PROBED    |             |
+|                              |     |     |     | LIVE BY   |             |
+|                              |     |     |     | AUDITOR   |             |
+| Blender                      |  Y  |  Y  |  Y  |    Y     | via         |
+|                              |     |     |     | (real bin)| capability  |
+|                              |     |     |     |          | layer only  |
+| Vision                       |  Y  |  Y  |  Y  | PARTIAL   | fallback    |
+|                              |     |     |     |          | only; VLM   |
+|                              |     |     |     |          | dead        |
+| Voice                        |  N  |  N  |  Y  |    Y     | NOT WIRED   |
+|                              |     |     |     | (TTS only)| TO AGENT AT |
+|                              |     |     |     |          | ALL         |
+| Companion UI                 |  Y  |  N  |  Y  |    N     | NO ENTRY    |
+|                              |     |     |     |          | POINT       |
+| System / Apps                |  Y  |  Y  |  Y  |    N     | PowerShell  |
+|                              |     |     |     |          | shell-out   |
++------------------------------+-----+-----+-----+----------+-------------+
+
+TWO THINGS THE AGENT DOES NOT HAVE
+(both verified by grep for "voice|Voice" across core/ -> ZERO hits)
+
+1. VOICE IS NOT INTEGRATED INTO THE AGENT.
+   core/ contains no reference to voice. The entire production voice path is
+   3 lines in ui/terminal.py:75-85.
+   VoiceService, VoicePipeline, VoiceCommandRouter, VoiceOutputRouter,
+   VoiceUIAdapter, WakeWordListener are NEVER INSTANTIATED IN PRODUCTION -
+   only in voice/ and tests/.
+   settings.voice_enabled defaults False in 4 places.
+   No voice capability adapter is registered (integration/contracts.py
+   registers blender, vision, blender_vision - no voice).
+
+2. core/dev_workflow.py (355 lines, the "M2.13.1 Autonomous Development
+   Workflow") IS LIBRARY-ONLY.
+   Grep for DevWorkflow in core/agent.py, main.py, ui/, tools/ -> ZERO hits.
+   The autonomous-development coordinator is NOT REACHABLE from the agent.
+
+================================================================================
+5. MODELS / PROVIDERS
+================================================================================
+
++-----------------------+-----------------------------+----------------------+
+| Provider              | Status                      | Evidence             |
++-----------------------+-----------------------------+----------------------+
+| AIProvider (ABC)      | Real                        | ai/provider.py:122   |
+| OllamaProvider        | REAL, WORKING               | ai/ollama_provider   |
+|                       |                             | .py:30, httpx ->     |
+|                       |                             | /api/chat            |
+| OfflineProvider       | Real                        | 3 canned flows,      |
+|                       |                             | honest model_label   |
++-----------------------+-----------------------------+----------------------+
+
+MODELS ACTUALLY INSTALLED ON THIS MACHINE (live /api/tags probe)
+----------------------------------------------------------------
+
++-----------------------------+----------+-------------------+
+| Model                      | Size     | Real-validated?   |
++-----------------------------+----------+-------------------+
+| qwen3:8b                   | 5.2 GB   | YES - Phase 9/10  |
+| qwen3:latest               | 5.2 GB   | alias of 8b       |
+|                             |          | (model_router.py  |
+|                             |          |  :82 assumes it)  |
+| qwen3:14b                  | 9.3 GB   | YES - Phase 10,   |
+|                             |          | 21/21             |
+| nemotron-3.5-lightning:30b | 25.4 GB  | NO - NEVER TESTED |
++-----------------------------+----------+-------------------+
+
+ModelRouter (ai/model_router.py:71) is real and multi-mode:
+  FORCE_8B, FORCE_14B, PROJECT, complexity threshold,
+  verification-failure escalation
+
+  Adaptive routing          real, estimate_complexity at :279
+  Resource guard            real, :200-240. FIXED at 2a5b74a (previously
+                            compared against AVAILABLE RAM, which collapsed
+                            under memory pressure)
+  Provider failure          real, structured.
+                            AIProviderError.to_dict() returns EXACTLY
+                            {category, model, latency, retryable, status,
+                             message}. 6 FailureCategory values,
+                            NON_RETRYABLE set at provider.py:24
+  Timeout                   ai/ollama_provider.py:10 - generous by design
+                            for 30B thinking models
+  Tool context adaptation   real, core/tool_context.py
+  Model fallback            real. ModelManager._resolve_model falls back
+                            configured -> pattern -> preferred_models ->
+                            first-installed, with an honest note each time
+                            (model_manager.py:70-93)
+  Offline-after-execution   fail-closed, agent.py:2200
+
+NEMOTRON IS INSTALLED BUT ENTIRELY UNVALIDATED AND INVISIBLE TO THE CODE.
+  - preferred_models in conftest.py lists only qwen3
+  - model_router._family_of (:328) does not include "nemotron"
+
+================================================================================
+6. TOOLS / CAPABILITIES
+================================================================================
+
+67 TOOLS REGISTERED IN build_registry
+(verified by live registry instantiation)
+Plus capability.execute (1 bridge tool).
+
+--- CORE / PROJECT (4) -------------------------------------------------------
+  project.info          SAFE      level_for
+  project.files         SAFE      level_for
+  project.grep          SAFE      level_for
+  project.verify        SENSITIVE level_for   <- the real independent verifier
+
+--- FILESYSTEM (4) -----------------------------------------------------------
+  filesystem.read_file   SAFE      level_for
+  filesystem.list_dir    SAFE      level_for
+  filesystem.write_file  SENSITIVE level_for
+  filesystem.delete_file SENSITIVE
+
+--- TERMINAL / PYTHON (2) ----------------------------------------------------
+  terminal.execute      SENSITIVE
+  python.run_script     SENSITIVE level_for
+
+--- CODING (1) ---------------------------------------------------------------
+  code.patch_file       NORMAL    level_for  -> coding/patch.py
+                                       (hunk parser, dry-run default,
+                                        backups)
+
+--- GIT (18) -----------------------------------------------------------------
+SAFE READ (7):
+  git.status            SAFE      level_for
+  git.diff              SAFE      level_for
+  git.log               SAFE      level_for
+  git.fetch             SAFE      level_for
+  git.branch            SAFE      level_for
+  git.branch.list       SAFE
+  git.snapshot          SAFE      level_for
+  git.snapshot.list     SAFE
+
+MUTATING (11):
+  git.add               NORMAL    level_for
+  git.commit            NORMAL    level_for
+  git.pull              NORMAL    level_for
+  git.branch.create     NORMAL    level_for
+  git.branch.switch     NORMAL    level_for
+  git.push              SENSITIVE level_for
+  git.reset             SENSITIVE level_for
+  git.restore           SENSITIVE level_for
+  git.rebase            SENSITIVE level_for
+  git.snapshot.restore  SENSITIVE level_for
+
+tools/git.py:85 _gate() enforces three config policies, ALL DEFAULT "blocked":
+  git_push_policy, git_restore_policy, git_branch_policy
+Restore, reset and rebase all route through git_restore_policy.
+
+--- GITHUB (7) ---------------------------------------------------------------
+SAFE READ (4):
+  gh.status             SAFE
+  gh.issue_list         SAFE      level_for
+  gh.pr_list            SAFE      level_for
+  gh.repo_view          SAFE      level_for
+
+MUTATING (3):
+  gh.issue_create       SENSITIVE level_for
+  gh.pr_create          SENSITIVE level_for
+  gh.release_create     SENSITIVE level_for
+
+Shells out to the gh CLI. NOT real-model-validated.
+
+--- TASKS (2) ----------------------------------------------------------------
+  task.info             SAFE
+  task.list             SAFE
+
+--- MEMORY (7) ---------------------------------------------------------------
+  memory.search         SAFE
+  memory.get            SAFE
+  memory.list           SAFE
+  memory.categories     SAFE
+  memory.remember       NORMAL     <- model-writable, no confirmation
+  memory.update         NORMAL     <- overwrites any entry by key
+  memory.delete         NORMAL
+
+--- RULES (8) ----------------------------------------------------------------
+  rules.list            SAFE
+  rules.get             SAFE
+  rules.check           SAFE
+  rules.conflicts       SAFE
+  rules.create          NORMAL
+  rules.update          NORMAL    + CONFIRM
+  rules.enable          NORMAL    + CONFIRM
+  rules.delete          SENSITIVE + CONFIRM
+
+--- KNOWLEDGE (2) -----------------------------------------------------------
+  knowledge.query       SAFE
+  knowledge.index       NORMAL    level_for (demotes to SENSITIVE outside
+                                        allowed roots)
+
+--- DATA (4) --- LIVE-VERIFIED WORKING BY AUDITOR ---------------------------
+  data.load_csv         SAFE      level_for
+  data.load_json        SAFE      level_for
+  data.inspect          SAFE      level_for
+  data.analyze          SAFE      level_for
+
+  7 operations: stats, groupby, filter, sort, correlation, unique, head
+  Formats: .csv, .json
+  50 MB cap, 50-row preview
+
+--- CHARTS (4) --- LIVE-VERIFIED WORKING BY AUDITOR -------------------------
+  chart.generate        NORMAL    level_for
+  chart.verify          SAFE      level_for
+  chart.list            SAFE
+  chart.delete          SENSITIVE level_for
+
+  5 types: line, bar, scatter, histogram, pie
+  10 000-point cap, matplotlib backend
+
+  LIVE PROBE BY AUDITOR:
+    chart.generate -> True, wrote PNG
+    chart.verify   -> True, "990x590, PNG"
+    chart.list     -> True
+
+--- APPLICATIONS / SYSTEM (2) -----------------------------------------------
+  applications.open     NORMAL    level_for
+  system.info           SAFE      level_for
+
+--- MODELS (2) ---------------------------------------------------------------
+  models.status         SAFE
+  models.set_mode       NORMAL    <- model-writable, persists across restart,
+                                    NO CONFIRMATION
+
+--- CAPABILITY LAYER (1 tool -> 4 capabilities, 31 advertised ops) ----------
+
+  +----------------+----------+------+-----------------------------------------+
+  | Capability     | Advert. | Real | Notes                                   |
+  +----------------+----------+------+-----------------------------------------+
+  | blender        |   16    |  16  |                                         |
+  | vision         |    8    |   3  | detect_objects / extract_text /         |
+  |                |          |      | analyze_ui will ALWAYS raise             |
+  | blender_vision |    7    |   7  |                                         |
+  | mock           |    -    |   -  | test fixture                            |
+  +----------------+----------+------+-----------------------------------------+
+
+FINDING: The Vision adapter advertises 8 operations to the model; only 3 can
+ever succeed. integration/contracts.py:782-785 lists all 8.
+vision/capabilities.py:86-101 computes the truth correctly but the adapter
+never consults it.
+
+--- VERIFICATION / RECOVERY / VOICE / COMPANION / SCREEN / INPUT / UIA -------
+ZERO REGISTERED TOOLS.
+
+There is no voice.*, companion.*, window.*, screen.*, mouse.*, keyboard.* or
+uia.* tool. Blender/Vision are reachable ONLY through capability.execute.
+
+================================================================================
+7. TASKS / EXECUTION
+================================================================================
+
++-------------------+---------------------------------+-------+
+| Component         | Location                        | Real  |
++-------------------+---------------------------------+-------+
+| TaskManager       | core/task_manager.py            |   Y   |
+| TaskStore         | core/task_store.py:319          |   Y   |
+| TaskRecord        | core/task_store.py:170          |   Y   |
+| TaskState (9)     | task_manager.py:80              |   Y   |
+| TaskStep          | task_manager.py:135             |   Y   |
+| StepStatus (7)    | task_manager.py:15              |   Y   |
+| ExecutionPlan     | core/planner.py:95              |   Y   |
+| PlanStepRecord    | planner.py:181                  |   Y   |
+| ExecutionPlanRecord| planner.py:389                  |   Y   |
+| Executor          | core/executor.py                |   Y   |
+| Snapshots         | coding/snapshot_manager.py:60   |   Y   |
+| Reconciliation    | core/agent.py:460               |   Y   |
+| Cancellation      | core/cancellation.py            |   Y   |
+| Recovery          | core/recovery.py                |   Y   |
++-------------------+---------------------------------+-------+
+
+STEP STATE MACHINE - 7 states, explicit transition table
+(task_manager.py:45-64). Only FAILED->PENDING is a retry edge.
+Terminal: DONE / CANCELLED / BLOCKED / SKIPPED.
+
+TASK STATE MACHINE - 9 states (task_manager.py:92-132).
+COMPLETED / FAILED / CANCELLED have empty transition sets = terminal.
+
+RECONCILIATION
+  _reconcile_interrupted_tasks marks pending/active -> failed, never
+  auto-resumes, emits plan_step_interrupted with replayable=False.
+  FAIL-CLOSED.
+
+PHASE 10 TERMINAL INVARIANT - VERIFIED BY LIVE PROBE
+-----------------------------------------------------
+
+  TaskState   Verification  TerminalVerdict   succeeded  violation
+  ---------    -----------   --------------   ---------  ---------
+  completed    passed        verified          True       -
+  completed    unverified    unverified        None       -
+  completed    not_required  unverified        None       -
+  completed    not_run       unverified        None       -
+  completed    failed        unverified        None       REFUSED
+  failed       failed        failed            False      -
+  failed       unverified    failed            False      -
+  failed       passed        failed            False      REFUSED
+  cancelled    (any of 5)   cancelled         None       -
+
+Exactly as documented. TaskState and VerificationState remain separate enums;
+TerminalVerdict is a pure classification. The pair is REFUSED in
+TaskManager.transition, not merely reported.
+
+================================================================================
+8. VERIFICATION
+================================================================================
+
+core/verification_ledger.py, 823 lines.
+
+ENTRY SCHEMA - 16 fields
+  state, requested_state, subject_kind, method_kind, trust, detail, evidence,
+  legacy_kind, reason, task_id, run_id, request_id, step_id, seq, recorded_at,
+  downgraded (property)
+
+TRUST LEVELS
+  UNTRUSTED / CLAIMED / OBSERVED
+  ONLY OBSERVED CAN SUPPORT PASSED (adjudicate:370)
+
+METHODS - 12 values, including PROJECT_TESTS
+SUBJECTS - 7 values
+
+EVIDENCE RULES
+  must be a mapping; rejected if empty, narration-string, non-JSON,
+  non-substantive, or if a boolean assertion key is False
+
+PERSISTENCE
+  bounded projection, PERSISTED_TAIL = 20, rides in
+  TaskRecord.metadata["lifecycle"]["verification_ledger"]
+
+MAX SIZE   MAX_ENTRIES = 200, oldest-first, "dropped" counter
+TASK CORRELATION     yes - task_id, run_id on every entry
+STEP CORRELATION     PARTIAL - intent-path writers pass no step_id
+
+LOAD HARDENING
+  a persisted PASSED failing the invariant is downgraded to UNVERIFIED with
+  the reason retained (from_dict:792)
+
+OPERATIONS THAT PRODUCE REAL OBSERVED EVIDENCE
+  project.verify     runs the suite, records exit_code / tests_passed,
+                     method PROJECT_TESTS
+  chart.verify       PNG decode + dimensions
+  render_inspect     PNG size probe
+  capability evidence contracts
+
+BYPASS PATHS
+  TaskManager.set_verification bypasses adjudication. Still called by
+  record_verification internally and by 2 tests.
+  invalidate_verification sets state with NO ledger entry - correct (a
+  retraction is not an adjudication), preserved in verification_history.
+
+================================================================================
+9. RECOVERY
+================================================================================
+
+core/recovery.py, 462 lines.
+
+FailureObservation
+  21 fields, redacted on construction (__post_init__:232)
+  Carries decision inputs only; deliberately no goal / plan / git / snapshot.
+
+RecoveryPolicy
+  pure, 4 bounds:
+    max_retries    = 3
+    max_rerun_verify= 1
+    max_escalations = 2
+    allow_skip     = False
+  8-rule precedence, cancellation FIRST.
+
+Actions: NONE / RETRY_STEP / RERUN_VERIFY / ESCALATE_MODEL / SKIP_STEP / ABORT
+Categories: 8, reusing CapabilityStatus / StepStatus vocabulary
+
+NO DUPLICATE RECOVERY SYSTEM
+  all three pre-P3 mechanisms route through it (commit b705e04)
+
+NO WORDING INFERENCE
+  _failure_category (agent.py:2390) classifies from fields only
+  (commit ffff890)
+
+EXHAUSTION PERSISTED?  NO.
+  RecoveryDecision is emitted as an event and logged, but exhaustion is NOT
+  written to TaskRecord. The terminal FAILED verdict is.
+
+CROSS-TURN / RESTART?  NO.
+  recovery_attempts is an in-memory counter reset by begin_task.
+
+recovery_hint IS CARRIED BUT NEVER PARSED - and that IS the documented design
+(recovery.py:32-40): "never parsed for intent". Carried for diagnostics only.
+
+DebugLoop (core/debug_loop.py, 17.5KB) has its OWN signature-dedup recovery.
+b705e04 unified the FINAL DECISION, but the signature-dedup loop remains
+separate. LIMITATION, not a duplicate authority.
+
+================================================================================
+10. CODING AGENT
+================================================================================
+
++---------------------------+--------------------------+--------------------+
+| Capability                | Real production path?    | Evidence           |
++---------------------------+--------------------------+--------------------+
+| Inspect project           | Y                        | project.files,     |
+|                           |                          | project.grep,      |
+|                           |                          | project.info       |
+| Edit / create files       | Y                        | filesystem.write_  |
+|                           |                          | file, code.patch_  |
+|                           |                          | file               |
+| Run tests                 | Y                        | coding/test_runner |
+|                           |                          | .py (pytest +      |
+|                           |                          | single file)       |
+| Independent verify        | Y                        | project.verify,    |
+|                           |                          | isolated via       |
+|                           |                          | PYCACHEPREFIX      |
+| Diagnose failures         | Y                        | structured         |
+|                           |                          | FailureObservation |
+| Repair code               | Y                        | real-model repair  |
+|                           |                          | validated          |
+| Git integration           | Y                        | 18 tools +         |
+|                           |                          | ChangeTracker +    |
+|                           |                          | SnapshotManager    |
+| Recovery                  | Y                        | RecoveryPolicy     |
+| Model tool selection      | Y                        | ToolContextSelector|
++---------------------------+--------------------------+--------------------+
+
+HELPER UTILITIES vs PRODUCTION PATHS
+
+LIVE (7):
+  change_tracker     <- core/agent.py:41
+  commands           <- core/agent.py:2174
+  patch              <- tools/patches.py:14
+  profile            <- core/agent.py:2379
+  project_index      <- core/agent.py:2380
+  relevance          <- core/agent.py:2381
+  snapshot_manager   <- core/agent.py:42
+  test_runner        <- tools/coding.py:108
+
+LIVE TRANSITIVELY via profile.py (4):
+  code_analyzer, dependency_analyzer, entry_points, frameworks
+
+DEAD - NO IMPORTER ANYWHERE (2):
+  coding/code_reader.py   (3 functions)
+  coding/code_writer.py   (1 function)
+  Superseded by the filesystem.* and project.* tools.
+
+================================================================================
+11. GIT / GITHUB
+================================================================================
+
+SAFE READ
+  git.status  git.diff  git.log  git.fetch  git.branch  git.branch.list
+  git.snapshot  git.snapshot.list
+  gh.status  gh.issue_list  gh.pr_list  gh.repo_view
+
+MUTATING
+  git.add  git.commit  git.pull  git.branch.create  git.branch.switch
+  git.push  git.reset  git.restore  git.rebase  git.snapshot.restore
+  gh.issue_create  gh.pr_create  gh.release_create
+
+PERMISSION BOUNDARIES - VERIFIED LAYERED
+  1. Declared level: destructive git ops are SENSITIVE
+  2. CONFIG POLICY (tools/git.py:85): git_push_policy, git_restore_policy,
+     git_branch_policy - ALL DEFAULT "blocked", raising ToolBlockedError
+     BEFORE the subprocess runs
+  3. explicit_confirmation on the 4 rule-mutating tools
+
+CHECKPOINTS
+  SnapshotManager snapshots full git diff + status + recent log into a temp
+  dir (data/sessions/snapshots/<task>/). 19 tests.
+
+================================================================================
+12. MEMORY
+================================================================================
+
++----------------------+--------------------------------------------------+
+| Aspect               | Finding                                          |
++----------------------+--------------------------------------------------+
+| Persistent memory    | memory.json - MemoryStore, in-memory dict        |
+|                      | re-loaded per instance                           |
+| Categories           | 5 hardcoded: facts, preferences, tasks, notes,   |
+|                      | projects                                          |
+| Limits               | key 120, value 20 000, note 500.                 |
+|                      | NO CAP ON ENTRY COUNT.                           |
+| User rules           | rules.json - GENUINELY ENFORCED, not just        |
+|                      | injected                                         |
+| Model context        | 4 blocks appended by Agent._reference_sections   |
+|                      | (agent.py:1188-1216):                            |
+|                      |  active rules (<=8)                              |
+|                      |  -> memory (<=2500 ch)                           |
+|                      |  -> project profile (<=1200)                     |
+|                      |  -> task history (<=900)                         |
+| Restart persistence  | Conversation: NO. Written to disk, NEVER read   |
+|                      | back into the model.                             |
+| Write policy         | memory.remember/update/delete are NORMAL -       |
+|                      | auto-allow, no confirmation                      |
+| Security             | NO redaction on memory writes.                   |
+|                      | logging_setup.redact exists but is NEVER         |
+|                      | applied here.                                    |
++----------------------+--------------------------------------------------+
+
+THE RULES SYSTEM IS THE STRONGEST PART
+  Agent installs RuleEngine into PermissionManager (agent.py:119)
+  every one of 13 evaluate return paths goes through _finalize -> engine.apply
+  Executor.run:156 is the single call site
+  Restrict-only is ENFORCED: a blocked decision is never unblocked, and no
+  path returns a lower level.
+  A "block" rule on a tool CANNOT BE BYPASSED.
+
+DEAD MEMORY MECHANISMS (proven by grep)
+---------------------------------------
+
+  Settings.memory_write_policy
+      DEAD SETTING. Declared settings.py:74, loaded :152,
+      ZERO production reads. Setting "implicit" changes NOTHING.
+
+  Rule.scope = "tool" / "task"
+      DEAD + MISLEADING. Validated, stored, displayed to the model, but
+      Rule.matches only branches on "project". A scope="task" rule enforces
+      as if GLOBAL.
+
+  ProjectMemory prose sections (7)
+      DEAD. set_section / get_section / set_profile_summary /
+      add_history_entry have no production caller.
+      The #PROJECT PROFILE prompt block currently emits NOTHING.
+
+  PermissionManager.persistent_deny
+      DEAD. Read at permissions.py:260, written nowhere.
+
+  RuleStore._max_active
+      DEAD FIELD. Assigned, never read.
+
+  RuleEngine.set_project, *.clear() x3
+      DEAD. Zero callers.
+
+PROMPT-INJECTION CHANNEL (FINDING)
+  memory.remember is NORMAL, writes up to 20 000 chars, and that content is
+  injected into the SYSTEM PROMPT on every subsequent turn via render_active.
+  The "reference data only - not instructions" frame is a LABEL in the same
+  string as the data, not a defence. Combined with the dead
+  memory_write_policy, there is NO GATE on this at all.
+
+================================================================================
+13. KNOWLEDGE GRAPH
+================================================================================
+
+8 modules, ~180KB. ONE SQLite DB PER PROJECT.
+
+SCHEMA (knowledge_graph.py:501-561)
+  schema_meta, nodes, edges + 8 indexes
+  PRAGMA foreign_keys=ON -> ON DELETE CASCADE is live.
+
+NODE TYPES: 15
+  project, file, directory, code_symbol, task, plan, test, dataset, analysis,
+  chart, artifact, git_commit, checkpoint, verification, decision
+
+EDGE TYPES: 14
+  contains, depends_on, defines, imports, tests, generated_from, produced,
+  derived_from, executed_by, verified_by, part_of, changed_by,
+  checkpointed_as, related_to
+
+QUERY TYPES: 12
+  find_node, find_nodes, neighbors, find_related, path, search_files,
+  search_tasks, search_artifacts, search_datasets, search_charts,
+  recent_activity, find_stale
+
+MIGRATIONS
+  mechanism present (_migrate), SCHEMA_VERSION=1, body is a version-stamp
+  only. No forward-version guard.
+  Per-row schema_version columns exist and are NEVER READ.
+
+INDEXING
+  files, directories, code symbols (stdlib ast), tasks, plans, verifications,
+  checkpoints, git commits, tests, datasets, analyses, charts, artifacts
+
+CONTENT HASHING
+  3 independent sha256 hashes (file content, symbol source, dataset bytes),
+  16-hex truncated
+
+STALENESS
+  STALE_CHANGED / STALE_UNREADABLE / STALE_DELETED / STALE_SOURCE_CHANGED
+  Enforced in SQL via STALE_CURRENT_PREDICATE.
+  Marking NOT deleting; currency-asserting edges are dropped on stale.
+
+DELETED FILES
+  reconcile_deleted_files - TWO tests on purpose (walk-set for files,
+  filesystem probe for artifacts); "cannot tell" leaves the node alone.
+
+PROJECT IDENTITY
+  canonical_project_key = sha256(resolved_path)[:16]
+
+*** CRITICAL: PROJECTION-ONLY - VERIFIED, NO VIOLATIONS ***
+--------------------------------------------------------------------
+Searched every execution-layer module (agent.py, executor.py, task_manager.py,
+verification_ledger.py, recovery.py) for reads of KnowledgeGraphManager /
+knowledge_query that could influence a decision:
+
+  Task state:     NEVER read from the graph. TaskManager.state is
+                  authoritative.                                    [OK]
+  Execution state:NEVER. StepStatus + ExecutionPlanRecord are
+                  authoritative.                                    [OK]
+  Verification:   knowledge_projection.py:10-17 states the graph copies
+                  VerificationEntry.state from the ledger projection only.
+                  A graph node CANNOT create a PASSED.            [OK]
+  Git history:    GitTaskState from porcelain; the graph never writes
+                  git state from graph content.                     [OK]
+
+  Writes into the graph are all downstream of a decision made elsewhere. [OK]
+
+  NO AUTHORITY VIOLATIONS FOUND.
+
+KNOWLEDGE-GRAPH DEFECTS (findings, unfixed)
+--------------------------------------------
+
+  NO CASE NORMALISATION ON PROJECT IDENTITY
+    canonical_project_key (graph.py:211) uses Path.resolve() with no
+    normcase. C:\Proj and c:\proj - the same directory - mint TWO project
+    ids. project_task_history.py:117 does it correctly with
+    os.path.normcase; the graph does not. UNTESTED.
+
+  relation_type ENUM ADVERTISES RELATIONS THAT CAN NEVER EXIST
+    DEPENDS_ON and TESTS have ZERO WRITERS anywhere, yet both are exposed
+    in the model-facing relation_type enum (tools/__init__.py:938).
+
+  NodeType.DECISION NEVER PRODUCED IN PRODUCTION
+    Only in tests/test_knowledge_p8_matrix.py:210.
+
+  git_commit KEY USES project_name, NOT project_id
+    knowledge_tasks.py:230 - the comment admits the id is wrong. Contained
+    by the per-project DB split.
+
+  recent_activity(hours=) SILENTLY CLAMPS
+    knowledge_tools.py:328 applies _limit() (max 100) to a WINDOW.
+    Asking 30 days returns ~4 days, with no indication.
+
+  DEAD LEGACY DISPATCHER CREATES WRITABLE DBs ON READ
+    knowledge_query.query_graph_tool:412 uses get_graph (writable) where
+    the live path correctly uses get_existing. Test-only, but a trap.
+
+  NO CHECK CONSTRAINT ON node_type / relation_type
+    An unknown value makes NodeType(...) raise and fails the whole query.
+
+  include_stale REACHABLE BUT NOT IN THE TOOL SCHEMA
+    Model cannot request stale-inclusive results.
+
+  _DATASET_TOOLS CONTAINS "data.load", NOT A REGISTERED TOOL
+    knowledge_projection.py:319
+
+================================================================================
+14. DATA / CHARTS
+================================================================================
+
+BOTH LIVE-VERIFIED WORKING BY THE AUDITOR.
+
+  Formats              .csv, .json only. 50 MB cap, 50-row preview
+  Operations           load_csv, load_json, inspect, analyze (7 sub-ops)
+  Charts               5 types, matplotlib, 10 000-point cap,
+                       auto-named output
+  Chart verification   REAL - verify_chart decodes the PNG and reports
+                       dimensions/format
+  Persistence          artifacts under settings.data_dir/charts/
+  Model integration    data.*/chart.* are SAFE/NORMAL and directly
+                       tool-callable
+  Dependencies         matplotlib, numpy - declared in BOTH requirements.txt
+                       and pyproject.toml (fixed at ccf29f7)
+
+LIMITATIONS
+  No Excel / parquet.
+  filter uses a hand-rolled expression parser (data_tool.py:360).
+  correlation is a plain Pearson.
+
+DevWorkflow (core/dev_workflow.py, 355 lines) coordinates
+inspect -> plan -> implement -> test -> verify -> repair -> report with
+bounded repair attempts. LIBRARY-ONLY - NEVER INSTANTIATED IN PRODUCTION.
+
+================================================================================
+15. BLENDER
+================================================================================
+
+GENUINE, REAL-VALIDATED AUTOMATION.
+Binary Blender 5.2.2 DETECTED LIVE at
+  C:\Program Files\Blender Foundation\Blender 5.2\blender.exe
+
+  Detection
+    NOT hardcoded - globs Blender*, reverse-sorts for the highest version,
+    caches successes only, SELF-INVALIDATES if the binary disappears
+    (controller.py:116-133)
+
+  Operations
+    EXACTLY 16 from one authoritative table (operations.py:74-94)
+    15 subprocess + 1 local. 3 read-only, 12 mutating.
+    Drift prevented by a test asserting handler parity.
+
+  bpy IMPLEMENTATION IS REAL
+    541 lines in scripts/diablo_blender_ops.py:
+      - unique-name collision handling
+      - Principled-BSDF lookup by name OR type
+      - Blender 4.1 unit-property rename tolerance
+      - engine alias normalisation (EEVEE -> BLENDER_EEVEE)
+      - post-render existence proof
+
+  RUNNER SUPERVISION - EXCELLENT
+    --disable-autoexec
+    --python-exit-code 1
+    --factory-startup
+    bounded 64 KB stream with concurrent drain (no pipe deadlock)
+    deadline polling
+    typed spawn errors
+    terminate -> kill escalation with the Windows no-SIGKILL rationale
+    BlenderCancelledError.terminated reads a FLAG rather than assuming
+      termination
+
+  CONCURRENCY
+    threading.RLock around the ENTIRE read-modify-write of the session file,
+    with the "torn session" rationale inline.
+
+  VERIFICATION
+    Structural only - rendered PNG exists, decodes, >=64x64.
+
+THIS IS BLENDER AUTOMATION, NOT GENERAL WINDOWS DESKTOP CONTROL.
+It reaches ONE SPECIFIC BINARY through a FIXED PROTOCOL.
+
+LIMITATIONS
+  A RUNNING CHILD CANNOT ALWAYS BE INTERRUPTED - confirmed, TWO independent
+  causes:
+    (1) long ops are declared interruptible=False BY DESIGN
+        (operations.py:53-61) because killing mid-write would corrupt the
+        session file
+    (2) the WORKFLOW PATH calls the layer through _call_layer
+        (workflows.py:876) which NEVER BINDS THE CANCELLATION TOKEN - only
+        direct capability calls get _scopes
+
+  gate-save.blend, gate-save.blend1, x.blend sit in the repo root as
+  untracked test artifacts (correctly .gitignore'd, so the worktree stays
+  clean).
+
+================================================================================
+16. VISION
+================================================================================
+
+LIVE PROBE:
+  available_backends: ["fallback"]
+  supported_operations: ["compare","describe","inspect_render"]
+  ONE BACKEND. NO ML.
+
++----------------------+-------------------------------------------------------+
+| Backend              | Verdict                                               |
++----------------------+-------------------------------------------------------+
+| FallbackBackend      | REAL. Pixel-diff compare; inspect_render = 6           |
+|                      | structural checks (format, dimensions, non-zero,      |
+|                      | readable, >=64x64).                                    |
++----------------------+-------------------------------------------------------+
+| LocalVLMBackend      | UNRUNNABLE. Real transformers code                    |
+|                      | (local_vlm.py:46-153), local_files_only=True, never  |
+|                      | downloads, never calls a server - but requires torch  |
+|                      | + transformers (BOTH ABSENT) and a model_path to a    |
+|                      | non-empty dir (NEVER CONFIGURED).                      |
+|                      | HAS NEVER EXECUTED.                                    |
++----------------------+-------------------------------------------------------+
+
+IS A REAL LOCAL VLM INSTALLED?  NO.
+  torch         False
+  transformers False
+  Absent from requirements.txt (6 deps) and pyproject.toml (5 deps).
+  No [vision] section in default_config.toml.
+
+IMAGE INSPECTION IS REAL WORK (vision/inspect.py)
+  full numpy pixel decode
+  per-channel mean/std/min/max
+  dominant colours via 32-level quantisation
+  Shannon entropy
+  uniformity
+  Sobel edge density
+  Blender-render heuristics
+
+vision/loader.py IS THE BEST-ENGINEERED VISION FILE
+  Pillow verify() to defeat lazy-parse truncation
+  dimension/pixel guards
+  pure-stdlib PNG fallback gated on
+     b"IDAT" in data and b"IEND" in data
+  with the correct rationale.
+
+BLENDER+VISION "VERIFICATION" MEANS
+  Blender wrote a non-empty, decodable PNG >=64x64.
+  A BLACK 64x64 SQUARE PASSES EVERY CHECK.
+  No semantic claim whatsoever.
+  The system KNOWS this and labels its evidence "kind": "deterministic"
+  (workflows.py:1536).
+
+FINDING
+  compare_images (inspect.py:269-271) divides per-channel diff elements by
+  per-pixel count, so diff_ratio ranges to 3.0, NOT 1.0, while the gate at
+  workflows.py:1364 tests <= 0.01. A legitimately different render scores
+  ~2.9.
+
+================================================================================
+17. VOICE
+================================================================================
+
+TTS AND STT AUDITED SEPARATELY. DO NOT CONFLATE THEM.
+
+--- TTS - WORKS --------------------------------------------------------------
+
++--------------------+-------------------------------------------------------+
+| Backend            | Verdict                                                |
++--------------------+-------------------------------------------------------+
+| SAPI               | REAL-VALIDATED. PowerShell ->                          |
+|                    | System.Speech.Synthesis.SpeechSynthesizer.             |
+|                    | LIVE PROBE BY AUDITOR: 2 voices installed,             |
+|                    | Microsoft David Desktop, Microsoft Zira Desktop.      |
+|                    | Factory selects sapi.                                  |
++--------------------+-------------------------------------------------------+
+| Neural (kokoro)    | PURE STUB. neural.py:25-31 - speak() raises           |
+|                    | UNCONDITIONALLY, even when fully provisioned. No       |
+|                    | torch, no inference code.                              |
++--------------------+-------------------------------------------------------+
+| Mock               | test fixture                                           |
++--------------------+-------------------------------------------------------+
+
+  Voice profiles   NONE. The voice name is a HARDCODED CONSTANT
+                   (text_to_speech.py:16).
+  Output queue     NONE. VoiceOutputRouter is synchronous, single-subscriber.
+  Caching          NONE. grep for cache|profile|queue in voice/ -> 1 hit, a
+                   test mock.
+
+  CANCELLATION - REAL AND STRONG
+    CancellationToken (idempotent, raise_if_cancelled, reset)
+    InterruptionManager with structured task_cancel_requested /
+      task_cancel_failed / task_cancelled events
+    bridge-result hardening
+    one-shot wildcard semantics
+    8-thread safety test
+
+  BARGE-IN - NOT IMPLEMENTED AT THE AUDIO LEVEL
+    The TTS thread handle is DISCARDED (text_to_speech.py:48-60) and the
+    speaker is a subprocess.run, NOT Popen - nothing can be stopped.
+    No mic, no VAD, no half-duplex.
+    set_muted only suppresses FUTURE utterances.
+
+--- STT - 0 OF 3 PATHS TRANSCRIBE AUDIO ---------------------------------------
+
++-----------------------------+-----------------------------------------------+
+| Backend                     | Verdict                                        |
++-----------------------------+-----------------------------------------------+
+| UnavailableSpeechToText     | raises SpeechToTextUnavailable                |
+| Backend                     |                                               |
++-----------------------------+-----------------------------------------------+
+| LocalSpeechToTextBackend    | DETECTION ONLY; transcribe raises on BOTH      |
+|                             | branches (local.py:40-43). Needs               |
+|                             | faster_whisper (absent) + explicit model_path. |
++-----------------------------+-----------------------------------------------+
+| MockSpeechToTextBackend     | test fixture                                   |
++-----------------------------+-----------------------------------------------+
+
+NO AUDIO DECODING, VAD OR ASR CODE EXISTS ANYWHERE IN THE REPOSITORY.
+
+--- WAKE WORD - STUB ---------------------------------------------------------
+  A regex STRING-MATCHER on already-produced text (wake_wording.py:52-63),
+  binary 1.0/0.0 confidence.
+  No microphone, no model, no embeddings.
+  THE PRODUCTION DEFAULT IS DisabledWakeWordDetector (voice/service.py:52).
+
+--- WIRING -------------------------------------------------------------------
+  voice_enabled defaults False in 4 places.
+  No voice capability adapter is registered.
+  VoiceService, VoicePipeline, VoiceCommandRouter, VoiceOutputRouter,
+  VoiceUIAdapter, WakeWordListener are NEVER INSTANTIATED IN PRODUCTION.
+
+================================================================================
+18. COMPANION UI
+================================================================================
+
+TWO ENTIRELY SEPARATE UIs.
+
++--------------+---------------------------+---------------------------+
+|              | Companion                 | Terminal UI               |
++--------------+---------------------------+---------------------------+
+| Framework    | TKINTER (ui/companion.py:24)| RICH (ui/terminal.py:5)   |
+| Nature       | Real floating always-on-   | Console panels / prompt / |
+|              | top window:               | markdown                  |
+|              |   geometry("520x620")     |                           |
+|              |   -topmost                |                           |
+|              |   iconify                 |                           |
+|              |   lift / focus_force       |                           |
+|              |   WM_DELETE_WINDOW        |                           |
+| WIRED TO     | NO - NO ENTRY POINT       | YES - the only UI         |
+| main.py      | EXISTS                    | constructed               |
++--------------+---------------------------+---------------------------+
+
+STATES: 9, FROM CODE (ui/models.py:11)
+  idle, ready, thinking, executing, verifying, success, cancelled, error,
+  closed
+  Explicit transition table (ui/controller.py:33-67), CLOSED terminal.
+
+  "listening", "sleeping", "returning" DO NOT EXIST in ui/.
+  grep -> 1 hit, a time.sleep.
+  "listening" exists only as VoiceStatus.LISTENING in voice/events.py:15,
+  never surfaced by the UI.
+
+  WIDGETS: REAL. 20+ widgets, 6 colour tags, incremental diffing renderer
+  via _rendered_count, compact mode 360x92.
+
+  BRIDGE
+    CoreEventBusBridge exists (ui/bridge.py:163) and subscribes to 4 bus
+    topics - but submit_message raises without an injected submitter, and NO
+    PRODUCTION CODE INJECTS ONE. Default bridge is MockAgentBridge, so the
+    companion talks to nothing.
+
+  VALIDATED ONLY AS A WITHDRAWN-ROOT SMOKE TEST
+  (test_floating_companion.py:342-376). No evidence a human has ever seen it.
+
+  LIMITATION: Tkinter is not a declared dependency.
+
+================================================================================
+19. WINDOWS / APPLICATIONS / SYSTEM
+================================================================================
+
+GREP ACROSS ALL PRODUCTION .py FOR:
+  pywin32|win32gui|win32process|uiautomation|pyautogui|ctypes|EnumWindows|
+  SetForegroundWindow|ShowWindow|SendInput|SetCursorPos|keybd_event|
+  mouse_event|ImageGrab|mss
+
+EXACTLY ONE HIT
+  ai/model_router.py:347,363
+    ctypes.WinDLL("kernel32") calling GlobalMemoryStatusEx for the resource
+    guard.
+  That is a memory METRIC, not a capability layer.
+
+INSTALLED PACKAGES: httpx matplotlib numpy pillow rich
+NO pywin32, NO psutil, NO mss, NO uiautomation, NO pyautogui, NO torch,
+NO transformers, NO sounddevice, NO pywinauto, NO comtypes.
+
++--------------------+-------------------------------------------------------+
+| Area               | Status                                                |
++--------------------+-------------------------------------------------------+
+| PROCESS            | PARTIAL - applications.open + _confirm_process via    |
+|                    | Get-Process; system.info via Get-CimInstance.         |
+|                    | No enumeration, no ownership, no tree, no signals.     |
++--------------------+-------------------------------------------------------+
+| APPLICATION        | PARTIAL - Get-StartApps lookup + os.startfile.        |
+|                    | UWP LAUNCHING EXPLICITLY UNSUPPORTED                  |
+|                    | (applications.py:67). Discovery shells out on every  |
+|                    | miss (15 s timeout), no cache.                        |
++--------------------+-------------------------------------------------------+
+| WINDOW             | NOT IMPLEMENTED - zero code                          |
++--------------------+-------------------------------------------------------+
+| SYSTEM             | PARTIAL - cpu/mem/os via a PowerShell CIM script.     |
+|                    | 25 s timeout                                          |
++--------------------+-------------------------------------------------------+
+| SCREEN             | NOT IMPLEMENTED                                      |
++--------------------+-------------------------------------------------------+
+| INPUT              | NOT IMPLEMENTED - no mouse, no keyboard              |
++--------------------+-------------------------------------------------------+
+| UI AUTOMATION      | NOT IMPLEMENTED                                      |
++--------------------+-------------------------------------------------------+
+
+Both Windows tools are POWERSHELL SHELL-OUTS, which is precisely what M2.15
+is meant to replace with a typed native layer.
+
+================================================================================
+20. M2.15 READINESS
+================================================================================
+
++----------------------------+---------------+---------------------------+
+| Component                  | Status        | Reusable code            |
++----------------------------+---------------+---------------------------+
+| Native process layer       | MISSING       | -                         |
+| Native window layer        | MISSING       | -                         |
+| Application discovery      | PARTIAL       | tools/applications.py -  |
+|                            |               | the alias/whitelist/     |
+|                            |               | Start-Menu resolution    |
+|                            |               | logic and its 4 tests   |
+|                            |               | are reusable; the        |
+|                            |               | transport is not         |
+| System metrics             | PARTIAL       | tools/system.py +         |
+|                            |               | model_router._memory_    |
+|                            |               | status (already uses      |
+|                            |               | ctypes kernel32 - the    |
+|                            |               | ONE genuine native       |
+|                            |               | precedent)               |
+| Subprocess supervision     | EXISTS -      | blender/runner.py 22KB:  |
+|                            | EXCELLENT     | bounded streaming, drain |
+|                            |               | threads, deadline        |
+|                            |               | polling, typed spawn     |
+|                            |               | errors, terminate->kill  |
+|                            |               | escalation,              |
+|                            |               | C_CANCELLATION_PENDING.  |
+|                            |               | THIS IS THE TEMPLATE     |
+|                            |               | M2.15 SHOULD GENERALISE. |
+| Screen abstraction          | MISSING       | vision/loader.py shows   |
+|                            |               | the validation discipline|
+|                            |               | but no capture           |
+| Typed Windows capability   | MISSING       | -                         |
+| API                        |               |                           |
+| Permissions                 | EXISTS        | PermissionLevel 4-tier,  |
+|                            |               | evaluate, path_is_within, |
+|                            |               | destructive-command      |
+|                            |               | policy, RuleEngine       |
+|                            |               | restrict-only            |
+| Cancellation               | EXISTS        | CancellationToken,       |
+|                            |               | cancellation_scope,      |
+|                            |               | cancellation_requested   |
+| Verification               | EXISTS        | VerificationLedger +     |
+|                            |               | VerificationEntry +      |
+|                            |               | trust axes - a new       |
+|                            |               | Windows capability can   |
+|                            |               | produce evidence without|
+|                            |               | inventing anything       |
+| Request/task correlation   | EXISTS        | CapabilityRequest,       |
+|                            |               | CapabilityResult,        |
+|                            |               | trusted_model_context,   |
+|                            |               | _scopes                  |
+| Cross-layer contract       | EXISTS        | integration/contracts.py |
+|                            |               | (39KB) +                 |
+|                            |               | integration/protocol.py  |
+|                            |               | - a new layer plugs in   |
+|                            |               | here                     |
+| Capability registration    | EXISTS        | CapabilityRegistry,      |
+|                            |               | _LayerAdapter,           |
+|                            |               | build_capability_tool    |
+| Model-tool binding         | EXISTS        | CapabilityBridge - the   |
+|                            |               | model never touches raw  |
+|                            |               | OS APIs, it calls        |
+|                            |               | capability.execute       |
++----------------------------+---------------+---------------------------+
+
+VERDICT: The entire cross-layer scaffolding M2.15 needs ALREADY EXISTS and is
+PROVEN. What is missing is only the Windows-specific layer itself.
+
+================================================================================
+21. M2.16 READINESS
+================================================================================
+
+NO GENERAL DESKTOP-CONTROL CAPABILITY EXISTS.
+
++--------------------+-------------------------------------------------------+
+| Capability         | Status                                                |
++--------------------+-------------------------------------------------------+
+| Mouse control      | NOT IMPLEMENTED                                      |
+| Keyboard control   | NOT IMPLEMENTED                                      |
+| Screen capture     | NOT IMPLEMENTED                                      |
+| Window focus       | NOT IMPLEMENTED                                      |
+| Window enumeration | NOT IMPLEMENTED                                      |
+| UI Automation      | NOT IMPLEMENTED                                      |
+| Visual grounding   | PARTIAL and not for the desktop - vision/inspect.py   |
+|                    | does real pixel statistics; FallbackBackend.describe  |
+|                    | CANNOT RECOGNISE AN OBJECT; the VLM is dead         |
++--------------------+-------------------------------------------------------+
+
+EXPLICITLY NOT DESKTOP CONTROL:
+  Blender control (one fixed binary via a fixed protocol)
+  terminal control
+  filesystem operations
+
+M2.16 DEPENDS ENTIRELY ON M2.15.
+  Screen capture needs a screen abstraction.
+  Window focus needs a window layer with an ownership model.
+  Visual grounding needs a working VLM, which needs process supervision
+    for GPU model processes.
+  NOTHING in M2.16 is startable before M2.15.
+
+================================================================================
+22. LONG-HORIZON AUTONOMY
+================================================================================
+
++-----------------------------------+------------------------------------------+
+| Capability                        | Status                                   |
++-----------------------------------+------------------------------------------+
+| Agent.resume()                    | ABSENT - grep for "def resume" in core/  |
+|                                   | -> ZERO hits                             |
++-----------------------------------+------------------------------------------+
+| Persistent goals                  | ABSENT - no goal store;                  |
+|                                   | TaskRecord.goal is ONE string per task  |
++-----------------------------------+------------------------------------------+
+| Multi-turn durable plans          | PARTIAL - ExecutionPlanRecord persists  |
+|                                   | within a task, but final_status()       |
+|                                   | recomputes from step statuses and a    |
+|                                   | terminal task is NEVER reopened         |
++-----------------------------------+------------------------------------------+
+| Long-running task scheduler        | ABSENT - BoundedRequestGate exists      |
+|                                   | (max_concurrent_requests=1);            |
+|                                   | request_context.py:38-41 names a        |
+|                                   | "bounded request scheduler" as INTENDED |
+|                                   | NEXT LAYER. No scheduler code.          |
++-----------------------------------+------------------------------------------+
+| Cross-restart autonomous           | ABSENT - AND EXPLICITLY REFUSED.        |
+| continuation                      | _reconcile_interrupted_tasks marks      |
+|                                   | interrupted work failed and never       |
+|                                   | resumes it. FAIL-CLOSED BY DESIGN.      |
++-----------------------------------+------------------------------------------+
+| Checkpoint/resume                  | PARTIAL - SnapshotManager snapshots are |
+|                                   | git-state backups with restore;         |
+|                                   | PlanStepRecord.is_replayable is         |
+|                                   | computed but read only by diagnostics   |
++-----------------------------------+------------------------------------------+
+| Long-horizon verification         | PARTIAL - the ledger bounds at 200     |
+|                                   | entries in memory / 20 persisted.       |
+|                                   | Long enough to accumulate.              |
++-----------------------------------+------------------------------------------+
+| Autonomous multi-turn planning    | PARTIAL - max_turns reasoning loop with |
+|                                   | escalation, bounded. A turn ends and the |
+|                                   | durable plan is finalised.              |
++-----------------------------------+------------------------------------------+
+
+THE CURRENT DURABLE EXECUTION PLAN MUST NOT BE DESCRIBED AS LONG-HORIZON
+AUTONOMY. It survives WITHIN a turn and AS A RECORD across restarts. Nothing
+reopens it.
+
+The M2.17 requirement is not "add resume" but "make reopening a safe,
+authorised, auditable decision" - and the Phase 10A invariant now specifies
+exactly what a reopened COMPLETED + UNVERIFIED record must mean.
+
+================================================================================
+23. SECURITY
+================================================================================
+
++-----------------------------+--------+----------------------------------------+
+| Boundary                    | Status | Evidence                               |
++-----------------------------+--------+----------------------------------------+
+| Filesystem containment      | PASS   | path_is_within (permissions.py:294)    |
+|                             |        | against allowed_roots; canonicalised   |
+|                             |        | before comparison                      |
++-----------------------------+--------+----------------------------------------+
+| Project roots               | PASS   | Agent._within_project uses              |
+|                             |        | _canonical_root                        |
++-----------------------------+--------+----------------------------------------+
+| Path traversal              | PASS   | Real-model test: prompt asks the agent  |
+|                             |        | to write outside the project -> target |
+|                             |        | stays "intact"                         |
++-----------------------------+--------+----------------------------------------+
+| Knowledge DB path isolation | PASS   | knowledge_dir(settings) from settings  |
+|                             |        | only; _resolve_project falls back to   |
+|                             |        | settings.base_dir, NEVER to model input|
++-----------------------------+--------+----------------------------------------+
+| Secrets (logging)           | PASS   | redact applied in                      |
+|                             |        | FailureObservation.__post_init__ on    |
+|                             |        | construction                           |
++-----------------------------+--------+----------------------------------------+
+| Secrets (MEMORY)            | FAIL   | redact is NEVER applied to memory/rules|
+|                             |        | writes. MemoryStore._safe only strips  |
+|                             |        | \0 and \x01. A memory.remember value   |
+|                             |        | is injected into the SYSTEM PROMPT     |
+|                             |        | EVERY TURN.                            |
++-----------------------------+--------+----------------------------------------+
+| Model-supplied metadata     | PASS   | EvidenceTrust.CLAIMED never supports   |
+|                             |        | PASSED; only OBSERVED can              |
++-----------------------------+--------+----------------------------------------+
+| request_id                  | PASS   | minted by RequestContext;              |
+|                             |        | with_identity stamps from the caller,  |
+|                             |        | never the model                        |
++-----------------------------+--------+----------------------------------------+
+| task_id                     | PASS   | authoritative on TaskManager +          |
+|                             |        | TaskRecord; _valid_task_id rejects      |
+|                             |        | unsafe ids                             |
++-----------------------------+--------+----------------------------------------+
+| Destructive terminal cmds   | PASS   | Two layers: config substring blocklist |
+|                             |        | + structured destructive_shell_        |
+|                             |        | invocation verb analysis               |
+|                             |        | (permissions.py:169)                    |
++-----------------------------+--------+----------------------------------------+
+| Git mutations               | PASS   | 3 config policies, DEFAULT "blocked"   |
++-----------------------------+--------+----------------------------------------+
+| GitHub mutations            | PASS   | SENSITIVE, no config gate              |
+|                             |        | (worth noting)                         |
++-----------------------------+--------+----------------------------------------+
+| Blender ops                 | PASS   | --disable-autoexec, --factory-startup, |
+|                             |        | temp dir isolation, SENSITIVE at the   |
+|                             |        | bridge for external paths              |
++-----------------------------+--------+----------------------------------------+
+| Vision inputs               | PASS   | extension allowlist, 8192 max dim,    |
+|                             |        | 50 MP cap, Image.verify()              |
++-----------------------------+--------+----------------------------------------+
+| Cross-project isolation     | PASS   | per-project DB, canonical_project_key  |
++-----------------------------+--------+----------------------------------------+
+| Subprocess handling         | PASS   | shell=False throughout, argv lists, no |
+|                             |        | string interpolation                   |
++-----------------------------+--------+----------------------------------------+
+| Vision: untrusted image     | LIMIT  | images are DESCRIBED, never interpreted|
+| content in the prompt       |        | semantically - currently harmless;     |
+|                             |        | becomes a REAL RISK when a VLM lands   |
++-----------------------------+--------+----------------------------------------+
+
+FINDINGS (unfixed)
+------------------
+1. PERSISTENT PROMPT-INJECTION CHANNEL (HIGH)
+   memory.remember (NORMAL, no confirmation, no redaction) -> system prompt
+   every turn. The dead memory_write_policy was the intended gate.
+
+2. Rule.scope "tool"/"task" SILENTLY DEGRADES TO GLOBAL (MEDIUM)
+   rules_store.py:13,34,143. User-visible false scoping.
+
+3. NON-ATOMIC MEMORY/RULES WRITES (MEDIUM)
+   memory_store._save and rules_store._save use plain write_text with OSError
+   swallowed. A crash mid-write DESTROYS memory.json / rules.json.
+   storage.save_json IS atomic; these two do not use it.
+
+4. CONVERSATION AMNESIA ON RESTART (MEDIUM)
+   Transcript persisted but NEVER restored to model context. User-visible
+   surprise.
+
+5. DevWorkflow UNREACHABLE (MEDIUM)
+   355 lines of "autonomous development" that no path invokes.
+
+6. COMPANION UI UNLAUNCHABLE (MEDIUM)
+   S2.4 marked complete; product cannot start it.
+
+7. VISION ADAPTER OVER-ADVERTISES (MEDIUM)
+   8 ops to the model, 3 real. Model will call and repeatedly fail.
+
+8. compare_images METRIC BUG (MEDIUM)
+   diff_ratio up to 3.0 vs a <= 0.01 gate. Will misjudge real comparisons.
+
+9. KNOWLEDGE GRAPH CASE-NORMALISATION (LOW-MED)
+   C:\Proj vs c:\proj -> two project ids, two DBs. No detection.
+
+10. RECOVERY EXHAUSTION NOT PERSISTED (LOW)
+    Not auditable across turns.
+
+11. BLENDER WORKFLOW PATH DROPS THE CANCELLATION TOKEN (LOW)
+    Direct calls get _scopes; workflow calls do not.
+
+12. :wipe DOES NOT WIPE MEMORY/RULES (LOW)
+    User expectation vs behaviour.
+
+13. 23 SKILLS OF DEAD CODE (LOW)
+    Hurts navigation and invites reimplementation.
+
+================================================================================
+24. TEST COVERAGE
+================================================================================
+
+2254 TESTS COLLECTED across 87 TEST MODULES.
+
++-------------------------------+----------+----------------------+
+| Category                      | Modules  | Tests (approx)        |
++-------------------------------+----------+----------------------+
+| S2 hardening                  |    6     | ~160                  |
+| Knowledge Graph               |   22     | ~600                  |
+| Recovery / Verification / P3  |    6     | ~266                  |
+| Durable plans / task          |    4     | ~119                  |
+| Blender                       |    3     | ~94                   |
+| Phase 10                      |    3     | ~95                   |
+| Voice                         |    1     |  33                   |
+| Floating companion            |    1     |  23                   |
+| Real-model gated              |    2     |  47                   |
+| Rest                          |   ~39    | remainder             |
++-------------------------------+----------+----------------------+
+
+GATES - 42 TOTAL, MATCHES THE FREEZE CLAIM EXACTLY
+  21  test_recovery_p10_real_model      (DIABLO_REAL_MODEL_TESTS)
+  19  test_knowledge_p9_real_model      (DIABLO_REAL_MODEL_TESTS)
+   2  test_blender_concurrency          (DIABLO_REAL_BLENDER_TESTS)
+No test skips for a missing dependency.
+
+REAL-VALIDATED
+  Blender       97 passed / 0 skipped, binary confirmed installed
+  qwen3:8b      Phase 9/10
+  qwen3:14b     21/21
+
+UNTESTED AGAINST REALITY
+  nemotron-3.5-lightning:30b  installed, ZERO tests
+  GitHub gh.* tools            3 tests, no real gh run
+  TTS in the app              probed directly, not via main.py
+  Companion UI                withdrawn-root smoke only
+  DevWorkflow                 14 tests, but NEVER instantiated in production
+
+================================================================================
+25. DOCUMENTATION vs REALITY
+================================================================================
+
+DOCUMENTATION CLAIMS THAT DO NOT MATCH THE CODE
+-----------------------------------------------
+
++------------------------------------------+--------------------------------+
+| Documentation Claim                      | Repository Reality            |
++------------------------------------------+--------------------------------+
+| README.md:1,8 "Phase 1 + Phase 2        | M2.14 Phase 10 is frozen; 8   |
+| complete"                                | more milestones exist.       |
+|                                          | README IS ~2 YEARS OF        |
+|                                          | MILESTONES STALE. Never      |
+|                                          | updated after Phase 2.       |
++------------------------------------------+--------------------------------+
+| README.md:43-44 "STT & wake word are     | Accurate in substance - both  |
+| documented interfaces only (Phase 6)"    | are non-functional. But      |
+|                                          | "Phase 6" is NOT the roadmap's|
+|                                          | numbering (it is M2.19).     |
++------------------------------------------+--------------------------------+
+| README.md:173 "STT and wake word are     | NO NotImplementedError EXISTS|
+| interfaces only (NotImplementedError)"   | ANYWHERE IN voice/. They     |
+|                                          | raise SpeechToTextUnavailable|
+|                                          | / return detected=False.     |
+|                                          | WRONG MECHANISM NAMED.       |
++------------------------------------------+--------------------------------+
+| README.md:172 "web_search remains an     | web_search DOES NOT EXIST AT |
+| interface only (stub)"                   | ALL. Not in the registry, not|
+|                                          | in any provider.             |
+|                                          | DESCRIBES A CAPABILITY THAT  |
+|                                          | WAS NEVER BUILT.             |
++------------------------------------------+--------------------------------+
+| README.md:166 "Phase 4 - Blender scene    | Blender has 16 REAL          |
+| building" (listed as UPCOMING)           | operations, REAL-VALIDATED.  |
+|                                          | LISTED AS FUTURE; ACTUALLY   |
+|                                          | SHIPPED.                     |
++------------------------------------------+--------------------------------+
+| README.md:167-168 "Phase 5 multi-agent", | No multi-agent anywhere;     |
+| "Phase 6 STT + wake word" (upcoming)     | STT/wake still dead.         |
+|                                          | ROADMAP DRIFT.               |
++------------------------------------------+--------------------------------+
+| README.md:162 "Phase 1 OK: core agent,    | True only of a much smaller  |
+| tools, permissions, coding Hello World,  | system than today's.         |
+| memory, TTS, UI"                         | UNDERSTATES MASSIVELY.       |
++------------------------------------------+--------------------------------+
+| pyproject.toml:4 "description = ...      | M2.14                       |
+| (Phase 1 core)"                          | STALE METADATA.              |
++------------------------------------------+--------------------------------+
+| Docs never mention config/ or            | BOTH are load-bearing;       |
+| integration/                             | integration/ is 84KB of      |
+|                                          | contract layer.             |
+|                                          | WHOLE SUBSYSTEMS ABSENT FROM |
+|                                          | DOCS.                        |
++------------------------------------------+--------------------------------+
+| No doc mentions core/dev_workflow.py     | 355 lines of autonomous-dev  |
+|                                          | coordinator. UNDOCUMENTED.   |
++------------------------------------------+--------------------------------+
+| No doc mentions that DevWorkflow is      | Dead in production.          |
+| unreachable                              | UNDOCUMENTED.                |
++------------------------------------------+--------------------------------+
+| No doc mentions the companion UI has     | main.py cannot launch it.    |
+| no entry point                           | UNDOCUMENTED.                |
++------------------------------------------+--------------------------------+
+
+IMPLEMENTED CAPABILITIES ABSENT FROM THE ROADMAP
+------------------------------------------------
+
++------------------------------------------+-------------------------------+
+| Implemented Capability                   | Documentation Status         |
++------------------------------------------+-------------------------------+
+| integration/ cross-layer contract layer  | ABSENT FROM THE ROADMAP      |
+| (84KB)                                   | ENTIRELY                     |
++------------------------------------------+-------------------------------+
+| config/permissions.py RuleEngine         | ABSENT. One of the strongest |
+| restrict-only rule enforcement           | security properties in the   |
+|                                          | codebase; no milestone claims|
+|                                          | it.                          |
++------------------------------------------+-------------------------------+
+| blender/runner.py subprocess supervision | ABSENT - and it is the M2.15 |
+| as a reusable pattern                   | TEMPLATE                     |
++------------------------------------------+-------------------------------+
+| ai/model_router.py RESOURCE GUARD via   | ABSENT - and it is the ONLY  |
+| ctypes kernel32                          | native Windows code in the   |
+|                                          | repo                         |
++------------------------------------------+-------------------------------+
+| coding/commands.py project-command       | Partial (Phase 2 only)       |
+| detection                                |                               |
++------------------------------------------+-------------------------------+
+| coding/dependency_analyzer,              | ABSENT                       |
+| entry_points, frameworks                 |                               |
++------------------------------------------+-------------------------------+
+| TaskStore.query_tasks / inspect_task     | ABSENT                       |
++------------------------------------------+-------------------------------+
+| Snapshot/checkpoint system               | Listed only as "Phase 3       |
+| (SnapshotManager, 3 tools)               | checkpoints"                 |
++------------------------------------------+-------------------------------+
+| TerminalVerdict + terminal invariant     | In contract doc, NOT in any  |
+|                                          | roadmap                      |
++------------------------------------------+-------------------------------+
+| Knowledge graph STALENESS / DELETION     | M2.14 listed it as "knowledge|
+| RECONCILIATION (5 stale reasons)         | graph" only                  |
++------------------------------------------+-------------------------------+
+| core/cancellation.py InterruptionManager | ABSENT                       |
++------------------------------------------+-------------------------------+
+| voice/ cancellation architecture         | ABSENT (voice listed as      |
+|                                          | "Phase 6")                   |
++------------------------------------------+-------------------------------+
+| 67-tool registry                         | ABSENT. No doc enumerates    |
+|                                          | the tool surface.            |
++------------------------------------------+-------------------------------+
+
+DEAD CODE / UNWIRED CODE INVENTORY
+-----------------------------------
+
++---------------------------------------+--------------+-----------------------+
+| Item                                  | Size         | Impact                |
++---------------------------------------+--------------+-----------------------+
+| coding/code_reader.py                 | 3 fns        | NO IMPORTER AT ALL     |
++---------------------------------------+--------------+-----------------------+
+| coding/code_writer.py                 | 1 fn         | NO IMPORTER AT ALL     |
++---------------------------------------+--------------+-----------------------+
+| core/dev_workflow.py                  | 355 lines    | NEVER INSTANTIATED IN  |
+|                                       |              | PRODUCTION             |
++---------------------------------------+--------------+-----------------------+
+| voice/service.py, pipeline.py,        | ~600 lines   | NEVER INSTANTIATED IN  |
+| commands.py, output.py, ui_adapter.py,|              | PRODUCTION             |
+| wake_word.py                          |              |                       |
++---------------------------------------+--------------+-----------------------+
+| ui/companion.py, ui/bridge.py         | ~22 KB       | NO ENTRY POINT         |
+| (CoreEventBusBridge)                  |              |                       |
++---------------------------------------+--------------+-----------------------+
+| settings.memory_write_policy          | 1 field      | Never read             |
++---------------------------------------+--------------+-----------------------+
+| Rule.scope "tool"/"task"              | 2 enum vals  | Enforced as global     |
++---------------------------------------+--------------+-----------------------+
+| ProjectMemory prose sections          | 7 sections   | No writer              |
++---------------------------------------+--------------+-----------------------+
+| PermissionManager.persistent_deny     | 1 field      | Never written          |
++---------------------------------------+--------------+-----------------------+
+| knowledge_query.query_graph_tool      | ~135 lines   | Test-only, creates     |
+|                                       |              | writable DBs on read   |
++---------------------------------------+--------------+-----------------------+
+| vision/backends/local_vlm.py          | ~200 lines   | torch/transformers    |
+|                                       |              | absent -> NEVER        |
+|                                       |              | EXECUTES               |
++---------------------------------------+--------------+-----------------------+
+| voice/tts/neural.py                   | 31 lines     | speak() raises         |
+|                                       |              | unconditionally        |
++---------------------------------------+--------------+-----------------------+
+| knowledge_graph DEPENDS_ON / TESTS /  | 3 enum vals  | Zero writers           |
+| DECISION                              |              |                       |
++---------------------------------------+--------------+-----------------------+
+
+================================================================================
+26. MASTER CAPABILITY MATRIX
+================================================================================
+
+Legend: IMP=Implemented  WIR=Wired to Agent  TST=Tested  RV=Real Validated
+        PER=Persistent     PRD=Production Ready
+
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Capability                       | IMP | WIR | TST | RV |PER | PRD| Limitation|
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Core agent + request gate        |  Y  |  Y  |  Y  | Y  | N  | Y  | single-    |
+|                                  |     |     |     |    |    |    | flight only|
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Planner / ExecutionPlan          |  Y  |  Y  |  Y  | Y  | Y  | Y  | per-turn    |
+|                                  |     |     |     |    |    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Model provider (Ollama)          |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Offline fallback provider        |  Y  |  Y  |  Y  | N  | N  | Y  | 3 canned   |
+|                                  |     |     |     |    |    |    | flows      |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| qwen3:8b                         |  Y  |  Y  |  Y  | Y  | N  | Y  | declines   |
+|                                  |     |     |     |    |    |    | tools ~50% |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| qwen3:14b                        |  Y  |  Y  |  Y  | Y  | N  | Y  | declines   |
+|                                  |     |     |     |    |    |    | cross-     |
+|                                  |     |     |     |21/21    |    |    | session    |
+|                                  |     |     |     |    |    |    | tools      |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| nemotron-30b                     | N/A |  N  |  N  | N  | N  |  N | installed; |
+|                                  |     |     |     |    |    |    | no code    |
+|                                  |     |     |     |    |    |    | path, no   |
+|                                  |     |     |     |    |    |    | tests      |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Adaptive model routing           |  Y  |  Y  |  Y  | Y  |prefs Y | family list|
+|                                  |     |     |     |    |    |    | lacks      |
+|                                  |     |     |     |    |    |    | nemotron   |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Resource guard (ctypes kernel32) |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Provider failure structure       |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Adaptive tool context            |  Y  |  Y  |  Y  | Y  | N  | Y  | present.   |
+|                                  |     |     |     |    |    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| 67 tools                         |  Y  |  Y  |  Y  |part|some| Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Capability bridge (4 caps)       |  Y  |  Y  |  Y  |part|  N | Y  | vision     |
+|                                  |     |     |     |    |    |    | over-      |
+|                                  |     |     |     |    |    |    | advertises |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| PermissionManager (4 tiers)      |  Y  |  Y  |  Y  | Y  |prefs Y | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Destructive-command policy       |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| RuleEngine restrict-only         |  Y  |  Y  |  Y  | N  | Y  | Y  | scope      |
+|                                  |     |     |     |    |    |    | tool/task  |
+|                                  |     |     |     |    |    |    | dead       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Path containment                 |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Executor                         |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| VerificationLedger               |  Y  |  Y  |  Y  | Y  | Y  | Y  | write-only |
+|                                  |     |     |     |    |    |    | in prod    |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| PASSED invariant                 |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Terminal verdict invariant       |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| RecoveryPolicy                   |  Y  |  Y  |  Y  | Y  | N  | Y  | exhaustion |
+|                                  |     |     |     |    |    |    | not        |
+|                                  |     |     |     |    |    |    | persisted  |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| FailureObservation               |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Cancellation tokens              |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| TaskStore                        |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Durable execution plans          |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Restart reconciliation           |  Y  |  Y  |  Y  | Y  | Y  | Y  | fail-      |
+|                                  |     |     |     |    |    |    | closed,    |
+|                                  |     |     |     |    |    |    | never      |
+|                                  |     |     |     |    |    |    | resumes    |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Snapshots / checkpoints          |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Task history                     |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Git (18 tools + policies)        |  Y  |  Y  |  Y  |part| Y  | Y  | gh.* not   |
+|                                  |     |     |     |    |    |    | real-      |
+|                                  |     |     |     |    |    |    | validated  |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| GitHub (7 tools)                 |  Y  |  Y  |  Y  | N  | N  | Y  | needs gh   |
+|                                  |     |     |     |    |    |    | CLI        |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Memory store                     |  Y  |  Y  |  Y  | N  | Y  | Y  | no         |
+|                                  |     |     |     |    |    |    | redaction; |
+|                                  |     |     |     |    |    |    | no entry   |
+|                                  |     |     |     |    |    |    | cap        |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Conversation history             |  Y  |  Y  |  Y  | N  |wrte|PART| NEVER      |
+|                                  |     |     |     |    |only|    | restored   |
+|                                  |     |     |     |    |    |    | to model   |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Preferences                      |  Y  |  N  |  Y  | N  | Y  | Y  | machine-   |
+|                                  |     |     |     |    |    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Project memory                   |  Y  |part|  Y  | N  | Y  |PART| prose      |
+|                                  |     |     |     |    |    |    | sections   |
+|                                  |     |     |     |    |    |    | dead       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Knowledge Graph                  |  Y  |  Y  |  Y  | Y  | Y  | Y  | projection |
+|                                  |     |     |     |2 pr|    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Graph staleness                  |  Y  |  Y  |  Y  | Y  | Y  | Y  | case-norm  |
+|                                  |     |     |     |    |    |    | bug        |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Graph queries (12 types)         |  Y  |  Y  |  Y  | Y  | N  | Y  | recent_act |
+|                                  |     |     |     |    |    |    | clamp bug  |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Data tools                       |  Y  |  Y  |  Y  | Y  | N  | Y  | csv/json   |
+|                                  |     |     |     |PROB|    |    | only       |
+|                                  |     |     |     |LIVE|    |    |            |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Chart tools                      |  Y  |  Y  |  Y  | Y  | Y  | Y  | -          |
+|                                  |     |     |     |PROB|    |    |            |
+|                                  |     |     |     |LIVE|    |    |            |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| DevWorkflow                      |  Y  |  N  |  Y  | N  | N  |PART| NEVER      |
+|                                  |     |     |     |    |    |    | instantiated|
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Blender (16 ops)                 |  Y  |  Y  |  Y  | Y  | N  | Y  | child not  |
+|                                  |     |     |     |5.2.|    |    | interrupt. |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Blender supervision              |  Y  |  Y  |  Y  | Y  | N  | Y  | workflow   |
+|                                  |     |     |     |    |    |    | path drops |
+|                                  |     |     |     |    |    |    | token      |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Vision fallback                  |  Y  |  Y  |  Y  | Y  | N  | Y  | structural |
+|                                  |     |     |     |    |    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Vision local VLM                 |  Y  |  N  |  Y  | N  | N  |  N | torch/     |
+|                                  |     |     |     |    |    |    | transformers|
+|                                  |     |     |     |    |    |    | absent     |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| TTS (SAPI)                       |  Y  |part|  Y  | Y  | N  | Y  | off by     |
+|                                  |     |     |     |    |    |    | default;   |
+|                                  |     |     |     |    |    |    | 3 lines    |
+|                                  |     |     |     |    |    |    | of wiring  |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Neural TTS                       |STUB |  N  |  Y  | N  | N  |  N | raises     |
+|                                  |     |     |     |    |    |    | uncondit.  |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| STT                              |STUB |  N  |  Y  | N  | N  |  N | 0 of 3     |
+|                                  |     |     |     |    |    |    | transcribe |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Wake word                        |STUB |  N  |  Y  | N  | N  |  N | string     |
+|                                  |     |     |     |    |    |    | matcher    |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Voice cancellation               |  Y  |  N  |  Y  | N  | N  |PART| library-   |
+|                                  |     |     |     |    |    |    | only       |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Barge-in (audio)                 |  N  |  N  |  N  | N  | N  |  N | not        |
+|                                  |     |     |     |    |    |    | implemented|
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Companion UI (Tk)                |  Y  |  N  |  Y  | N  | N  |PART| NO ENTRY   |
+|                                  |     |     |     |    |    |    | POINT      |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Terminal UI (rich)               |  Y  |  Y  |  Y  | Y  | N  | Y  | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| applications.open                |  Y  |  Y  |  Y  | N  | N  | Y  | PowerShell; |
+|                                  |     |     |     |    |    |    | no UWP     |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| system.info                      |  Y  |  Y  |  Y  | N  | N  | Y  | PowerShell |
+|                                  |     |     |     |    |    |    | CIM        |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| WINDOWS PROCESS LAYER            |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| WINDOWS WINDOW LAYER             |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| SCREEN CAPTURE                   |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| MOUSE / KEYBOARD                 |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| UI AUTOMATION                    |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Agent.resume()                   |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Task scheduler                   |  N  |  N  |  N  | N  | N  |  N | -          |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+| Cross-restart autonomy           |  N  |  N  |  N  | N  | N  |  N | explicitly |
+|                                  |     |     |     |    |    |    | refused    |
++----------------------------------+-----+-----+-----+----+----+----+-----------+
+
+================================================================================
+27. ROADMAP STATUS MATRIX
+================================================================================
+
+Status key: FROZEN / COMPLETE / PARTIAL / UNDER-VALIDATED / NOT STARTED /
+            DEFERRED / BLOCKED
+
++-----------------+---------------------+------------------------------------------+
+| Milestone       | Actual Status       | Evidence / Missing Work / Dependency      |
++-----------------+---------------------+------------------------------------------+
+| Phase 1         | FROZEN              | agent.py, executor, planner. None.       |
+| Core Agent      |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| Phase 2         | FROZEN              | 18 coding, 8 memory, 18 git tools,      |
+| Coding/Memory/  |                     | model_router.py. None.                   |
+| Git/Routing     |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| Phase 3         | FROZEN              | task_store.py, snapshot_manager.py.      |
+| Task/Git/       |                     | None.                                    |
+| Checkpoints     |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| Phase 4         | FROZEN              | executor.py, verification_ledger.py,    |
+| Execution       |                     | recovery.py. None.                       |
+| Orchestration   |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| S2.1            | FROZEN / REAL-      | 16 ops, Blender 5.2.2, 97/0. Missing:   |
+| Blender         | VALIDATED           | child interruption. Dep: M2.18.         |
++-----------------+---------------------+------------------------------------------+
+| S2.2            | FROZEN / UNDER-     | fallback real; VLM dead. Missing: a    |
+| Vision          | VALIDATED           | working VLM. Dep: M2.18.                |
++-----------------+---------------------+------------------------------------------+
+| S2.3            | FROZEN / STRUCTURAL | 7 ops. Missing: semantic verification.  |
+| Blender+Vision  | ONLY                | Dep: M2.18.                             |
++-----------------+---------------------+------------------------------------------+
+| S2.4            | FROZEN BUT NOT      | Tk widgets real, NO ENTRY POINT.        |
+| Floating        | SHIPPED             | Missing: an entry point; a real bridge. |
+| Companion UI    |                     | Dep: M2.20.                             |
++-----------------+---------------------+------------------------------------------+
+| S2.5            | FROZEN BUT MOSTLY   | TTS works; STT 0/3; wake stub.         |
+| Voice/          | STUB                | Dep: M2.19.                             |
+| Interruption    |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| S2.6            | FROZEN              | cancellation.py strong. None.           |
+| Voice Hardening |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| S2.7            | FROZEN              | integration/contracts.py, 25 tests.     |
+| Core Agent      |                     | None.                                   |
+| Integration     |                     |                                          |
+| Contract         |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| S2.8            | FROZEN              | 28 tests. Dep: M2.18.                   |
+| Production      |                     |                                          |
+| Blender+Vision  |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| S2.9            | FROZEN              | 87 tests. None.                         |
+| Runtime         |                     |                                          |
+| Hardening       |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.10           | FROZEN              | integration/. None.                     |
+| Runtime/        |                     |                                          |
+| Cross-layer     |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.12           | FROZEN              | request_context.py,                     |
+| Request Context |                     | BoundedRequestGate. Dep: M2.17.         |
++-----------------+---------------------+------------------------------------------+
+| M2.12           | FROZEN              | planner.py:389. Dep: M2.17.             |
+| Durable Plans   |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.12           | FROZEN              | 3 commits, 165 tests. Missing:          |
+| Ledger/Recovery |                     | exhaustion not persisted. Dep: M2.17.   |
++-----------------+---------------------+------------------------------------------+
+| M2.13           | FROZEN BUT PARTIAL  | repair loop real-validated. Missing:    |
+| Autonomous      |                     | DevWorkflow unwired.                    |
+| Coding          |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.14           | FROZEN              | 8 modules, ~600 tests. Missing:         |
+| Knowledge Graph |                     | case-norm bug.                          |
++-----------------+---------------------+------------------------------------------+
+| M2.14 Phase 8   | FROZEN              | durable cross-session. None.            |
++-----------------+---------------------+------------------------------------------+
+| M2.14 Phase 9   | FROZEN              | real-model knowledge. None.             |
++-----------------+---------------------+------------------------------------------+
+| M2.14 Phase 10  | FROZEN              | ef7c49a, 10R clean. Missing: 3x full-  |
+|                 |                     | suite re-verify.                        |
++-----------------+---------------------+------------------------------------------+
+| M2.15           | NOT STARTED         | ZERO - only ctypes for a RAM metric.    |
+| Native Windows  |                     | Missing: the entire layer.             |
+|                 |                     | Dependency: NONE - STARTABLE.           |
++-----------------+---------------------+------------------------------------------+
+| M2.16           | NOT STARTED         | zero. Dependency: M2.15.                |
+| Desktop Control |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.17           | NOT STARTED         | no resume, no scheduler.                |
+| Long-Horizon    |                     | Dependency: M2.15 (process supervision).|
++-----------------+---------------------+------------------------------------------+
+| M2.18           | NOT STARTED         | S2 baseline exists. Dependency: M2.15.  |
+| Advanced        |                     | SHOULD BE SPLIT (see Sec.30).           |
+| Blender+Vision  |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.19           | NOT STARTED         | TTS works; STT 0/3. Dependency: none.   |
+| STT + Neural    |                     |                                          |
+| Voice           |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.20           | NOT STARTED         | S2.4 Tk exists, unwired. Dependency:    |
+| Advanced        |                     | M2.15 (window layer).                   |
+| Companion UI    |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+| M2.21           | NOT STARTED         | applications.open PowerShell-only.      |
+| App/API         |                     | Dependency: M2.15. SHOULD BE MERGED    |
+| Integrations    |                     | INTO M2.15.                             |
++-----------------+---------------------+------------------------------------------+
+| M2.22           | NOT STARTED         | Dependency: M2.15-M2.21.               |
+| Full Computer   |                     |                                          |
+| Agent           |                     |                                          |
++-----------------+---------------------+------------------------------------------+
+
+================================================================================
+28. MISSING ROADMAP ITEMS
+================================================================================
+
+Genuine repository evidence. Not roadmap inflation.
+
++---+------------------------------------------+-------------------------------+
+| # | Item                                     | Why it belongs              |
++---+------------------------------------------+-------------------------------+
+| 1 | integration/ - the cross-layer contract  | A whole ARCHITECTURAL LAYER |
+|   | layer (6 files, 84KB workflows +         | with NO MILESTONE. It is    |
+|   | 39KB contracts)                          | what makes every future     |
+|   |                                          | capability safe.            |
++---+------------------------------------------+-------------------------------+
+| 2 | config/permissions.py RuleEngine         | The STRONGEST SECURITY      |
+|   | restrict-only enforcement                | PROPERTY in the codebase.   |
+|   | (agent.py:119, permissions.py:237-243,   | No milestone claims it. A   |
+|   | executor.py:156)                         | future milestone could      |
+|   |                                          | easily weaken it.           |
++---+------------------------------------------+-------------------------------+
+| 3 | blender/runner.py subprocess supervision | This is the M2.15 TEMPLATE  |
+|   | as a reusable pattern (22KB)            | and nothing in the roadmap  |
+|   |                                          | names it.                   |
++---+------------------------------------------+-------------------------------+
+| 4 | ai/model_router.py resource guard via   | The SINGLE PRECEDENT for    |
+|   | ctypes kernel32                          | native Windows interop.     |
+|   |                                          | M2.15 should build on it.   |
++---+------------------------------------------+-------------------------------+
+| 5 | coding/commands.py project-command       | Real project-awareness,     |
+|   | detection (6.8KB)                        | UNDOCUMENTED.               |
++---+------------------------------------------+-------------------------------+
+| 6 | TaskStore.query_tasks / inspect_task     | A query API over durable    |
+|   |                                          | tasks, undocumented.        |
++---+------------------------------------------+-------------------------------+
+| 7 | MAKING core/dev_workflow.py REACHABLE    | M2.13.1 shipped a           |
+|   | (355 lines, 14 tests, 0 callers)         | coordinator that no code    |
+|   |                                          | path invokes. Either wire  |
+|   |                                          | it or retire it.           |
++---+------------------------------------------+-------------------------------+
+| 8 | COMPANION UI ENTRY POINT                 | S2.4 is marked complete but |
+|   |                                          | the product cannot launch   |
+|   |                                          | it.                        |
++---+------------------------------------------+-------------------------------+
+| 9 | WIRING VOICE INTO THE AGENT             | Voice is architecturally    |
+|   |                                          | OUTSIDE the agent.         |
++---+------------------------------------------+-------------------------------+
+|10 | SECRET REDACTION ON MEMORY WRITES        | Closes the ONE security gap |
+|   |                                          | found.                     |
++---+------------------------------------------+-------------------------------+
+|11 | ATOMIC WRITES FOR MEMORY/RULES           | Data-loss risk the codebase |
+|   |                                          | already solved elsewhere    |
+|   |                                          | (storage.save_json).        |
++---+------------------------------------------+-------------------------------+
+|12 | README.md REFRESH                        | Stale at "Phase 1+2";       |
+|   |                                          | claims NotImplementedError  |
+|   |                                          | and a web_search stub that  |
+|   |                                          | do not exist.              |
++---+------------------------------------------+-------------------------------+
+
+ITEMS 7, 8, 9, 10, 11, 12 ARE CLEANUP, NOT NEW FEATURES. They are listed
+because each is currently a DEFECT or a DEAD ASSET, and none appears in any
+milestone.
+
+================================================================================
+29. ARCHITECTURAL RISKS / LIMITATIONS
+================================================================================
+
+STRUCTURAL (BY DESIGN - do not treat as bugs)
+----------------------------------------------
+  1. Single-flight requests - max_concurrent_requests=1. A scheduler does not
+     exist.
+  2. Durable plans do not reopen. _reconcile_interrupted_tasks fails closed by
+     design.
+  3. The Knowledge Graph is projection-only and CANNOT become authoritative
+     without a deliberate decision.
+  4. Recovery does not cross turns or restarts. recovery_attempts is in-memory.
+  5. Blender long ops are non-interruptible BY DESIGN - killing mid-write
+     would corrupt the session file.
+
+REAL RISKS
+----------
+
++----------------------------------------+----------+-------------------------+
+| Risk                                   | Severity | Evidence                |
++----------------------------------------+----------+-------------------------+
+| Persistent prompt injection via memory | HIGH     | memory.remember NORMAL + |
+|                                        |          | no confirmation + no    |
+|                                        |          | redaction -> system     |
+|                                        |          | prompt every turn. Dead |
+|                                        |          | memory_write_policy was |
+|                                        |          | the intended gate.      |
++----------------------------------------+----------+-------------------------+
+| Rule.scope tool/task degrades to global| MEDIUM   | rules_store.py:13,34,143|
+|                                        |          | User-visible false      |
+|                                        |          | scoping.                |
++----------------------------------------+----------+-------------------------+
+| Non-atomic memory/rules writes         | MEDIUM   | memory_store._save,     |
+|                                        |          | rules_store._save -      |
+|                                        |          | write_text, OSError     |
+|                                        |          | swallowed.              |
++----------------------------------------+----------+-------------------------+
+| Conversation amnesia on restart        | MEDIUM   | Transcript persisted but|
+|                                        |          | never restored to model |
+|                                        |          | context.                |
++----------------------------------------+----------+-------------------------+
+| DevWorkflow unreachable                | MEDIUM   | 355 lines of "autonomous|
+|                                        |          | development" that no   |
+|                                        |          | path invokes.           |
++----------------------------------------+----------+-------------------------+
+| Companion UI unlaunchable              | MEDIUM   | S2.4 marked complete;   |
+|                                        |          | product cannot start it.|
++----------------------------------------+----------+-------------------------+
+| Vision adapter over-advertises         | MEDIUM   | 8 ops to the model, 3   |
+|                                        |          | real. Model will call   |
+|                                        |          | and repeatedly fail.   |
++----------------------------------------+----------+-------------------------+
+| compare_images metric bug              | MEDIUM   | diff_ratio up to 3.0 vs |
+|                                        |          | a <= 0.01 gate.         |
++----------------------------------------+----------+-------------------------+
+| Knowledge graph case-normalisation     | LOW-MED  | C:\Proj vs c:\proj ->   |
+|                                        |          | two project ids, two    |
+|                                        |          | DBs. No detection.      |
++----------------------------------------+----------+-------------------------+
+| Recovery exhaustion not persisted      | LOW      | Not auditable across    |
+|                                        |          | turns.                  |
++----------------------------------------+----------+-------------------------+
+| Blender workflow path drops the        | LOW      | Direct calls get       |
+| cancellation token                     |          | _scopes; workflow calls |
+|                                        |          | do not.                 |
++----------------------------------------+----------+-------------------------+
+| :wipe does not wipe memory/rules       | LOW      | User expectation vs     |
+|                                        |          | behaviour.              |
++----------------------------------------+----------+-------------------------+
+| 23 skills of dead code                 | LOW      | Hurts navigation and   |
+|                                        |          | invites reimplementa-  |
+|                                        |          | tion.                   |
++----------------------------------------+----------+-------------------------+
+
+VERIFICATION POSTURE - THE STRONGEST THING HERE, AND IT SHOULD NOT BE LOST
+  VerificationLedger with a fail-closed PASSED invariant is a genuinely good
+  design, correctly enforced at ONE FUNNEL, correctly persisted, correctly
+  fail-closed on load.
+  RecoveryPolicy is a single pure decision layer.
+  The terminal verdict invariant is now ONE WRITTEN AUTHORITY.
+  The Knowledge Graph is PROVABLY NOT an authority.
+  Most subsystems degrade STRUCTURALLY rather than fabricating success.
+
+  DIABLO'S INTERNAL REASONING DISCIPLINE IS REAL AND WELL ABOVE TYPICAL.
+
+THE GAP IS ENTIRELY OUTWARD-FACING.
+  Internal reasoning is strong.
+  The OS interface is TWO POWERSHELL SHELL-OUTS and nothing else.
+
+================================================================================
+30. FINAL ROADMAP RECOMMENDATION
+================================================================================
+
+1. IS PHASE 10 GENUINELY FROZEN?
+   YES, with one caveat.
+   ef7c49a is HEAD, the worktree is clean, all history is intact, the terminal
+   invariant is enforced and live-probed, and the real-model module is 21/21.
+   CAVEAT: the three full-suite runs and the real-Blender 97/0 were NOT
+   re-executed in this audit (read-only). Collection count 2254 corroborates
+   2212+42 exactly. The freeze is honest.
+
+2. IS ANYTHING FROM PREVIOUS MILESTONES INCORRECTLY MARKED COMPLETE?
+   YES - THREE.
+
+   +-----------+---------------+-------------------------------------------+
+   | Milestone | Marked        | Actual                                    |
+   +-----------+---------------+-------------------------------------------+
+   | S2.4      | COMPLETE      | Widgets and state machine are real, but   |
+   | Floating  |               | NO ENTRY POINT EXISTS and the default     |
+   | Companion |               | bridge is a mock. The product cannot      |
+   | UI        |               | launch it.                                |
+   +-----------+---------------+-------------------------------------------+
+   | S2.5      | COMPLETE      | TTS works. STT IS 0/3 FUNCTIONAL, wake    |
+   | Voice     |               | word is a string matcher, barge-in does   |
+   |           |               | not exist, and voice has ZERO references  |
+   |           |               | in core/.                                 |
+   +-----------+---------------+-------------------------------------------+
+   | M2.13     | COMPLETE      | The repair loop is genuinely              |
+   | Autonomous|               | real-validated. But core/dev_workflow.py,  |
+   | Coding    |               | the named "Autonomous Development         |
+   |           |               | Workflow", is NEVER INSTANTIATED.         |
+   +-----------+---------------+-------------------------------------------+
+
+   None of these are dishonest - they are milestones that shipped a COMPONENT
+   and were then marked as the FEATURE. But a reader of the roadmap would
+   believe Diablo can listen, see, and run autonomous development workflows
+   end-to-end. IT CANNOT.
+
+3. IS ANYTHING IMPLEMENTED BUT MISSING FROM THE ROADMAP?
+   YES - 12 items (Section 28).
+   Four are architectural foundations the future milestones depend on and would
+   otherwise be reinvented: integration/, RuleEngine enforcement,
+   blender/runner.py supervision, and the ctypes resource guard.
+   Six are cleanup of dead or unreachable assets.
+   Two are documentation accuracy problems.
+
+4. IS M2.15 STILL THE CORRECT NEXT MILESTONE?
+   YES, AND THE EVIDENCE IS STRONGER THAN WHEN IT WAS PROPOSED.
+   The audit confirms:
+     - ZERO Windows-native code beyond a 22-line GlobalMemoryStatusEx call
+     - ZERO pywin32/psutil/mss/uiautomation/pyautogui installed
+     - applications.open and system.info are BOTH PowerShell shell-outs
+     - No process ownership, window, screen, mouse, keyboard or UI Automation
+       anywhere
+
+   CRITICALLY: ALL THE SCAFFOLDING M2.15 NEEDS ALREADY EXISTS AND IS PROVEN.
+   PermissionManager (4 tiers + containment + destructive policy),
+   CancellationToken, VerificationLedger with trust axes, CapabilityRequest /
+   CapabilityResult, CapabilityRegistry, integration/contracts.py,
+   blender/runner.py supervision.
+   M2.15 is a NEW LAYER, NOT A REDESIGN - which is exactly why it is safe to
+   do next and dangerous to skip.
+
+5. WHAT MUST M2.15 CONTAIN?
+   - pywin32 dependency, declared in pyproject.toml and requirements.txt
+   - core/windows/ package: process (enumerate, query, ownership, terminate),
+     window (enumerate, titles, handles, focus), system metrics (native,
+     replacing the PowerShell CIM path)
+   - window/ and process/ capability adapters registered through
+     CapabilityRegistry - the model calls capability.execute, never raw OS APIs
+   - Permission classification per operation, following the existing
+     SAFE/NORMAL/SENSITIVE/BLOCKED ladder
+   - Cancellation bound into every long-running operation, as
+     integration/contracts.py:_scopes already does for direct calls
+   - Verification evidence per operation, through the existing ledger
+   - Deterministic tests plus a real-Windows integration gate
+
+6. WHAT MUST M2.15 NOT CONTAIN?
+   - NO mouse, keyboard, screen capture, or UI Automation. Those are M2.16.
+   - NO desktop automation semantics. M2.15 is a SYSTEMS layer, not a CONTROL
+     layer.
+   - NO changes to frozen architecture. If a defect surfaces, minimal
+     compatible fix only.
+   - NO second permission system, second ledger, or second recovery layer.
+   - NO ctypes where pywin32 provides it. ONE native idiom, not two.
+
+7. WHAT SHOULD M2.16 DEPEND ON?
+   M2.15, ENTIRELY.
+   Screen capture needs a screen abstraction.
+   Window focus needs a window layer with an ownership model.
+   Visual grounding needs a working VLM, which needs process supervision for
+   GPU model processes.
+   NOTHING in M2.16 is startable before M2.15.
+
+8. WHAT SHOULD M2.17 DEPEND ON?
+   M2.15 for process supervision (a long-running desktop task needs a supervisor
+   that survives across turns).
+   M2.21 IS BETTER AFTER M2.17 THAN BEFORE IT - long-horizon autonomy over
+   desktop actions is much harder to bound safely than long-horizon autonomy
+   over git and tests, which Diablo already does.
+
+9. SHOULD ANY MILESTONE BE MERGED, SPLIT OR REORDERED?
+
+   SPLIT M2.18.
+   "Advanced Blender + Vision" is TWO UNRELATED PROBLEMS.
+   Blender needs better session/state management.
+   Vision needs a real VLM plus a fixed compare_images metric.
+   Recommend M2.18a VISION FOUNDATION (working VLM backend + fix the diff
+   metric + stop over-advertising) and M2.18b BLENDER DEPTH.
+   Vision is the weaker half and blocks more.
+
+   M2.19 (STT) BEFORE M2.20 (Companion UI) IS ALREADY CORRECT - and now MORE
+   correct, because the companion UI cannot be meaningfully "advanced" without
+   a working STT feeding it, and its current "listening" state does not even
+   exist in ui/models.py.
+
+   MERGE M2.21 INTO M2.15.
+   "Additional App/API Integrations" is largely what M2.15's
+   process/application layer enables. Once a native process layer exists, most
+   integrations become tool registrations against it. Keeping M2.21 separate
+   defers work M2.15 will largely do anyway.
+   Recommend folding the FIRST BATCH into M2.15 and reserving M2.21 for genuine
+   third-party APIs.
+
+   ADD A CLEANUP MILESTONE - M2.14.1 HOUSEKEEPING (small, BEFORE M2.15):
+   - wire or retire DevWorkflow
+   - add a companion-UI entry point or mark S2.4 partial
+   - apply redact to memory writes
+   - make memory/rules writes atomic
+   - fix Rule.scope
+   - refresh README.md
+   Six small, evidence-backed defects. Cheap now, and they remove traps before
+   a new subsystem lands.
+
+================================================================================
+31. ONE RECOMMENDED NEXT TASK
+================================================================================
+
+  M2.15.1 - NATIVE WINDOWS PROCESS AND SYSTEM FOUNDATION
+  =====================================================
+
+  Add pywin32 to pyproject.toml and requirements.txt.
+
+  Create core/windows/ with:
+    - a native PROCESS layer (enumerate by name/parent, query PID/exe/cmdline/
+      memory, terminate)
+    - a native SYSTEM-METRICS layer (CPU/memory/OS without PowerShell)
+
+  Register window-independent process and system capability adapters through
+  the existing CapabilityRegistry, so the model reaches them ONLY via
+  capability.execute.
+
+  Classify every operation with the existing PermissionLevel ladder, bind
+  cancellation through the existing cancellation_scope path, and emit
+  verification evidence through the existing VerificationLedger.
+
+  NO NEW PERMISSION SYSTEM. NO NEW LEDGER. NO NEW RECOVERY LAYER.
+  NO CHANGE TO ANY FROZEN MILESTONE.
+
+  EXPLICITLY OUT OF SCOPE: mouse, keyboard, screen capture, UI Automation, and
+  window enumeration. Those are M2.16 and depend on this layer.
+
+  DONE WHEN:
+    - system.info and applications.open no longer shell out to PowerShell
+    - a new process.* capability enumerates and terminates a real spawned
+      process on this machine
+    - deterministic tests pass
+    - a DIABLO_REAL_WINDOWS_TESTS gate proves the native layer against the
+      real OS
+    - the full suite is green at or above 2212 passed / 42 skipped
+
+WHY THIS ONE TASK:
+  It is the ONLY work item where every prerequisite already exists, no frozen
+  architecture must change, and THREE later milestones (M2.16, M2.17, M2.18)
+  are unblocked by finishing it.
+
+  It is also the SMALLEST CHANGE that replaces Diablo's last PowerShell
+  dependency with a native, typed, permissioned, cancellable, verifiable
+  layer.
+
+================================================================================
+END OF AUDIT
+================================================================================

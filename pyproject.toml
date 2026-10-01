@@ -1,12 +1,18 @@
 [project]
 name = "diablo-ai"
 version = "0.1.0"
-description = "DIABLO - personal AI assistant and development agent (Phase 1 core)"
+description = "DIABLO - local AI assistant, development agent, and Windows capability layer (M2.15)"
 requires-python = ">=3.11"
 # Runtime dependencies. ``chart.generate`` and ``chart.verify`` are registered
 # production capabilities, so the charting stack is a runtime requirement here
 # rather than an optional extra: without it the tools are registered and
 # reachable by the model, and only fail once invoked.
+#
+# ``pywin32`` backs the M2.15 native Windows systems layer. It is required only
+# on Windows; ``core/windows/system.py`` and ``core/windows/processes.py`` report
+# the layer unavailable and the agent falls back (``system.info`` to its
+# PowerShell path, the ``windows`` capability to not being registered), so a
+# non-Windows host is degraded rather than broken.
 #
 # ``requirements.txt`` is the full install set and additionally carries the
 # test dependency (pytest).
@@ -16,6 +22,7 @@ dependencies = [
     "Pillow>=10.0",
     "numpy>=1.24",
     "matplotlib>=3.7",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [tool.pytest.ini_options]

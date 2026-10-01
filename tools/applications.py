@@ -70,6 +70,29 @@ def _resolve_app(app: str, settings: Settings | None) -> tuple[str | None, str, 
 
 
 def _start_apps_lookup(key: str) -> tuple[bool, str] | None:
+    """Native Start Menu discovery.
+
+    M2.15 replaced ``Get-StartApps``. That cmdlet has no Win32 equivalent, but it
+    is a PowerShell *call* whose data comes from the registry and the Start Menu
+    directories, both of which can be read directly - see
+    :mod:`core.windows.start_menu`.
+
+    The PowerShell path is kept only as a fallback, because a user whose Start
+    Menu layout defeats the native reader should still be able to launch things.
+    """
+    try:
+        from core.windows.start_menu import start_menu_lookup
+
+        found = start_menu_lookup(key)
+        if found:
+            return found
+    except Exception as exc:  # noqa: BLE001 - never block a launch on discovery
+        log.debug("native start menu lookup failed for %r: %s", key, exc)
+    return _start_apps_lookup_powershell(key)
+
+
+def _start_apps_lookup_powershell(key: str) -> tuple[bool, str] | None:
+    """The previous ``Get-StartApps`` probe, kept as the fallback path."""
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-StartApps | ConvertTo-Json -Compress"],
@@ -100,7 +123,61 @@ def _start_apps_lookup(key: str) -> tuple[bool, str] | None:
 
 
 def _confirm_process(display: str, launch_path: str) -> bool:
+    """Whether the launched process is actually running.
+
+    M2.15: uses the native Windows process layer instead of polling PowerShell
+    ``Get-Process`` six times. One native enumeration answers it, in milliseconds,
+    with no subprocess per poll.
+
+    Still a *confirmation*, not a guarantee: Windows reports a successful launch
+    and the process can still exit immediately, which is why this reports what it
+    saw rather than claiming the app is open.
+    """
     exe_base = os.path.splitext(os.path.basename(launch_path or ""))[0].lower()
+    wanted = {exe_base}
+    try:
+        from core.windows.processes import ProcessLayer
+
+        layer = ProcessLayer()
+    except Exception as exc:  # noqa: BLE001 - fall through to the PowerShell path
+        log.debug("native process layer unavailable: %s", exc)
+        return _confirm_process_powershell(exe_base, wanted)
+
+    matches = [
+        p for p in layer.find_processes(name=exe_base, limit=MAX_CONFIRM_MATCHES)
+        if _name_matches(p.name, exe_base) or _name_matches(p.executable_path, exe_base)
+    ]
+    if matches:
+        return True
+    # Known apps whose name does not derive from the launched path.
+    return _confirm_process_powershell(exe_base, wanted)
+
+
+#: Confirmations only consult these known names; see the historical list.
+_CONFIRM_PROCESS_EXES = frozenset({
+    "calc", "notepad", "chrome", "msedge", "code", "explorer", "blender",
+    "mspaint", "cmd",
+})
+
+_DYNAMIC_LOOKUP_TIMEOUT = 15
+
+#: Upper bound on matches inspected while confirming. Bounded so a name that
+#: matches many processes cannot turn a status line into a long loop.
+MAX_CONFIRM_MATCHES = 20
+
+
+def _name_matches(candidate: str, wanted: str) -> bool:
+    text = str(candidate or "").strip().lower()
+    if not text:
+        return False
+    base = os.path.basename(text.replace("\\", "/"))
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base == wanted
+
+
+def _confirm_process_powershell(exe_base: str, wanted: set[str]) -> bool:
+    """The previous PowerShell probe, kept as the fallback path."""
     for known in _CONFIRM_PROCESS_EXES:
         if exe_base == known or exe_base.startswith(known) or known.startswith(exe_base):
             for _ in range(6):

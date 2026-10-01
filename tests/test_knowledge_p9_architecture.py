@@ -350,5 +350,6 @@ class TestAdaptiveContextStaysPresentationOnly:
         selector = ToolContextSelector(build_registry(tmp_settings))
         full = selector.select(full=True)
         adaptive = selector.select(user_text="add a function")
-        assert full.tool_count == 67
+        # M2.14.1 added memory.policy, taking the registry to 68.
+        assert full.tool_count == 68
         assert adaptive.tool_count < full.tool_count
