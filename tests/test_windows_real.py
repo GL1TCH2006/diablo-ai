@@ -480,24 +480,33 @@ def test_no_orphan_python_children_remain_after_the_module(child):
     """
     time.sleep(0.2)
     assert child.poll() is not None or child.pid is not None
-    child.terminate()
-    deadline = time.time() + 5.0
-    while time.time() < deadline and child.poll() is None:
-        time.sleep(0.05)
-    assert child.poll() is not None, (
-        f"the spawned child (pid {child.pid}) was never reaped")
 
-    # Uses the layer under test rather than a new dependency: the point is that
-    # no process holding this file's marker pid survives, and ProcessLayer is
-    # already a dependency of this module.
+    # Capture the child's identity before killing it. Both halves are required:
+    # a PID alone is ambiguous the moment Windows recycles it, which on a busy
+    # machine happens within seconds. A previous version of this test matched
+    # the pid digits anywhere in a process row, so a `Dell.Digital.Delivery`
+    # service that happened to be assigned the same number failed the suite -
+    # a false positive, not an orphan.
     from core.windows.processes import ProcessLayer
 
     layer = ProcessLayer()
     try:
+        before = layer.get_process(child.pid)
+        identity = (child.pid, before.created_at if before else "")
+
+        child.terminate()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and child.poll() is None:
+            time.sleep(0.05)
+        assert child.poll() is not None, (
+            f"the spawned child (pid {child.pid}) was never reaped")
+
         survivors = [
             p.to_dict() for p in layer.enumerate_processes()
-            if str(child.pid) in str(p.to_dict())
+            if (p.pid, p.created_at) == identity
         ]
     finally:
         layer.close()
-    assert not survivors, f"orphan Python children remain: {survivors}"
+    assert not survivors, (
+        f"a process with this child's identity (pid, created_at)={identity} "
+        f"survived: {survivors}")

@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -514,6 +515,10 @@ class BlenderVisionWorkflow:
         self._closed = False
         self._lock = threading.RLock()
         self._run_lock = threading.RLock()
+        # The cancellation token for the request currently executing on this
+        # thread. Thread-local rather than an attribute: the workflow object is
+        # shared, and a request-scoped token must not leak across threads.
+        self._request_local = threading.local()
 
     @property
     def integration(self) -> Any:
@@ -792,12 +797,13 @@ class BlenderVisionWorkflow:
         publisher.tool("running", f"Starting {operation}", operation=operation)
         publisher.emit("workflow_started", {"operation": operation, "task_id": task_id})
         try:
-            with self._run_lock:
-                if self._cancelled(token):
-                    raise _WorkflowCancelled()
-                value = callback(publisher)
-                if self._cancelled(token):
-                    raise _WorkflowCancelled()
+            with self._request_token(token):
+                with self._run_lock:
+                    if self._cancelled(token):
+                        raise _WorkflowCancelled()
+                    value = callback(publisher)
+                    if self._cancelled(token):
+                        raise _WorkflowCancelled()
             duration = (time.perf_counter() - started) * 1000
             if isinstance(value, WorkflowResult):
                 result = value
@@ -873,6 +879,55 @@ class BlenderVisionWorkflow:
         }
         return fn(**accepted)
 
+    def _active_token(self) -> Any | None:
+        """The cancellation token for the call currently executing on this thread.
+
+        Thread-local for the same reason the Blender layer's own cancellation
+        scope is: a workflow object is shared, and a request-scoped token must
+        not leak across threads or between requests.
+        """
+        return getattr(self._request_local, "token", None)
+
+    @contextmanager
+    def _request_token(self, token: Any | None):
+        """Bind ``token`` as this request's active token for the duration."""
+        previous = self._active_token()
+        self._request_local.token = token
+        try:
+            yield token
+        finally:
+            self._request_local.token = previous
+
+    @contextmanager
+    def _blender_cancellation(self) -> Any:
+        """Hand this request's token to the Blender layer for one layer call.
+
+        M2.15.2. This is where the token was being lost.
+
+        The workflow checked its own token between steps, so a cancel that landed
+        between two Blender operations was caught. A cancel that landed *during*
+        a long ``render`` was not: the layer's :meth:`BlenderCapabilityLayer._run`
+        reads ``self._cancel_token()``, which is only populated by its
+        ``cancellation_scope`` context manager, and nothing ever entered it. The
+        runner therefore received ``cancel_token=None``, never polled for
+        cancellation, and let the Blender child run to completion after the user
+        had cancelled. ``BlenderRunner._spawn_and_collect`` already knows how to
+        terminate a child on cancellation; it was simply never told there was
+        anything to poll.
+
+        Entering the existing scope is the whole fix - no second cancellation
+        mechanism is introduced, and the layer's own contract for "this token
+        governs my calls" is respected.
+        """
+        token = self._active_token()
+        layer = self.blender
+        scope = getattr(layer, "cancellation_scope", None) if layer is not None else None
+        if token is None or not callable(scope):
+            yield None
+            return
+        with scope(token):
+            yield token
+
     def _call_layer(self, method: str, **kwargs: Any) -> dict[str, Any]:
         layer = self.blender
         fn = getattr(layer, method, None) if layer is not None else None
@@ -883,7 +938,8 @@ class BlenderVisionWorkflow:
                 stage="blender",
                 code="unsupported_operation",
             )
-        value = self._invoke(fn, kwargs)
+        with self._blender_cancellation():
+            value = self._invoke(fn, kwargs)
         return self._normalize_value(value, method, "blender")
 
     def _call_vision(self, method: str, **kwargs: Any) -> dict[str, Any]:
