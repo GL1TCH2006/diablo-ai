@@ -243,14 +243,19 @@ class _StubLayer:
 
 class TestCapabilitySurface:
     def test_the_operation_set_is_closed(self):
-        # M2.16 extended the surface from five to eleven. Enumerated explicitly
-        # rather than counted: the point of this test is that the set is known and
-        # deliberate, so a future addition has to be a conscious edit here.
+        # M2.16 extended the surface from five to eleven and M2.16.2/.3 took it to
+        # twenty-two. Enumerated explicitly rather than counted: the point of this
+        # test is that the set is known and deliberate, so a future addition has to
+        # be a conscious edit here.
         assert WINDOWS_OPERATIONS == (
             "list", "get", "find", "system_info",
             "list_windows", "get_window",
             "terminate",
             "window_focus", "window_minimize", "window_restore", "window_close",
+            "get_cursor_pos", "get_foreground_window",
+            "mouse_move", "mouse_left_click", "mouse_right_click",
+            "mouse_double_click",
+            "key_press", "key_release", "key_tap", "hotkey", "type_text",
         )
 
     def test_the_adapter_advertises_what_the_layer_offers(self):
@@ -267,26 +272,34 @@ class TestCapabilitySurface:
 
     def test_terminate_is_the_only_mutating_operation(self):
         """M2.16 renamed for what it now asserts: every mutation is declared.
-
+    
         The original intent was that nothing could join the mutating set without a
         permission level and a test. That intent is stronger now that there are
-        five mutating operations rather than one, so it is asserted over all of
+        fourteen mutating operations rather than one, so it is asserted over all of
         them: each is declared, each is SENSITIVE, and no read is.
+    
+        The pointer and keyboard verbs matter most here. Each one reaches a window
+        the user did not necessarily name, so an input verb judged SAFE would
+        dispatch input with no permission asked for at all.
         """
         from config.permissions import PermissionLevel
-
+    
         adapter = WindowsCapabilityAdapter(_StubLayer())
         assert adapter.is_mutating("terminate") is True
         for op in ("window_focus", "window_minimize", "window_restore",
-                    "window_close"):
+                   "window_close", "mouse_move", "mouse_left_click",
+                   "mouse_right_click", "mouse_double_click", "key_press",
+                   "key_release", "key_tap", "hotkey", "type_text"):
             assert adapter.is_mutating(op) is True, f"{op} was not declared mutating"
         for op in ("list", "get", "find", "system_info", "list_windows",
-                   "get_window"):
+                   "get_window", "get_cursor_pos", "get_foreground_window"):
             assert adapter.is_mutating(op) is False, f"{op} was declared mutating"
-        assert adapter.mutating_operations == (
+        assert adapter.mutating_operations == tuple(sorted({
             "terminate", "window_close", "window_focus", "window_minimize",
-            "window_restore",
-        )
+            "window_restore", "mouse_move", "mouse_left_click",
+            "mouse_right_click", "mouse_double_click", "key_press",
+            "key_release", "key_tap", "hotkey", "type_text",
+        })), "the adapter's mutating tuple is not the declared set, sorted"
         _ = PermissionLevel
 
     def test_unsupported_operation_is_refused_before_any_native_call(self):

@@ -60,11 +60,14 @@ from .errors import (
     WindowsCancelledError,
     WindowsInvalidRequestError,
     WindowsNotFoundError,
+    WindowsWindowIdentityMismatchError,
 )
+from .coordinates import require_anchored
 from .processes import ProcessLayer
 from .system import SystemLayer, system_available
 from .window_models import WindowIdentity
 from .windows import WindowLayer, windows_available
+from .input import InputLayer
 
 log = get_logger("windows.capabilities")
 
@@ -81,11 +84,17 @@ __all__ = ["WindowsCapabilityLayer", "WINDOWS_OPERATIONS", "build_windows_capabi
 WINDOWS_OPERATIONS = (
     # process and system queries (M2.15)
     "list", "get", "find", "system_info",
-    # window queries (M2.16)
+    # window queries (M2.16.1)
     "list_windows", "get_window",
-    # mutations (M2.15 process, M2.16 window)
+    # mutations (M2.15 process, M2.16.1 window)
     "terminate",
     "window_focus", "window_minimize", "window_restore", "window_close",
+    # pointer queries (M2.16.2)
+    "get_cursor_pos", "get_foreground_window",
+    # pointer mutations (M2.16.2)
+    "mouse_move", "mouse_left_click", "mouse_right_click", "mouse_double_click",
+    # keyboard mutations (M2.16.3)
+    "key_press", "key_release", "key_tap", "hotkey", "type_text",
 )
 
 #: Operations that change machine state. Everything else is a query.
@@ -93,12 +102,37 @@ WINDOWS_OPERATIONS = (
 #: This set is the single authority for mutation classification. The bridge reads
 #: it through the adapter's ``is_mutating``; nothing anywhere else decides
 #: mutation from an operation's name.
+#:
+#: M2.16.2/3 added every pointer and keyboard verb. All of them mutate: they
+#: change what the user's machine does, in front of the user, and are not
+#: reversible by the product. Note that none of these names contains a keyword
+#: from the bridge's legacy word list - which is exactly why the declaration
+#: exists rather than name matching.
 _MUTATING_OPERATIONS = frozenset({
     "terminate",
     "window_focus",
     "window_minimize",
     "window_restore",
     "window_close",
+    "mouse_move",
+    "mouse_left_click",
+    "mouse_right_click",
+    "mouse_double_click",
+    "key_press",
+    "key_release",
+    "key_tap",
+    "hotkey",
+    "type_text",
+})
+
+#: Input operations that cannot work without the window layer, because each one
+#: resolves and re-verifies a target through it. ``get_cursor_pos`` and
+#: ``get_foreground_window`` are reads; the first needs only the pointer and the
+#: virtual screen, and the second is how a host without windows would establish
+#: that there is no target at all.
+_WINDOW_DEPENDENT_INPUT_OPERATIONS = frozenset({
+    "mouse_move", "mouse_left_click", "mouse_right_click", "mouse_double_click",
+    "key_press", "key_release", "key_tap", "hotkey", "type_text",
 })
 
 #: Upper bound on returned processes, so one call cannot flood the context.
@@ -153,7 +187,15 @@ class WindowsCapabilityLayer:
         window_native = windows_available()
         operations = list(WINDOWS_OPERATIONS) if native else []
         if native and not window_native:
-            operations = [op for op in operations if not op.startswith("window_")]
+            # Both halves depend on the window layer, not just the ones named
+            # "window". The pointer and keyboard verbs resolve and re-verify a
+            # target through ``WindowLayer``, so advertising them on a host that
+            # cannot read windows would offer operations that can only refuse.
+            # ``get_cursor_pos`` is the exception: it reads only the pointer and
+            # the virtual screen, neither of which needs the window APIs.
+            operations = [op for op in operations
+                          if not op.startswith("window_")
+                          and op not in _WINDOW_DEPENDENT_INPUT_OPERATIONS]
         return {
             "available": native,
             "operations": operations,
@@ -172,7 +214,8 @@ class WindowsCapabilityLayer:
             return
         self._closed = True
         with self._lock:
-            for layer in (self._processes, self._system, self._windows):
+            for layer in (self._processes, self._system, self._windows,
+                           getattr(self, "_input", None)):
                 closer = getattr(layer, "close", None)
                 if callable(closer):
                     try:
@@ -447,6 +490,216 @@ class WindowsCapabilityLayer:
     def window_close(self, window: Any = None, **_ignored: Any) -> dict:
         """Close a window and confirm it went away. Mutating."""
         return self._window_mutation("close_window", window)
+
+    # ------------------------------- M2.16.2 pointer and M2.16.3 keyboard
+
+    def _input_layer(self) -> InputLayer:
+        """The native input layer, built on the same window layer.
+
+        Deliberately shares the window layer: resolving a target and confirming a
+        foreground window are that layer's job, and a second copy of that logic
+        here is how the two would drift apart and start disagreeing about whether
+        a target is valid.
+        """
+        layer = getattr(self, "_input", None)
+        if layer is None:
+            layer = self._input = InputLayer(self._window_layer())
+        return layer
+
+    def get_cursor_pos(self, **_ignored: Any) -> dict:
+        """Read the pointer position and the virtual desktop geometry.
+
+        Read-only.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the pointer query.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            payload = self._input_layer().get_cursor_pos()
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
+
+    def get_foreground_window(self, **_ignored: Any) -> dict:
+        """Read the foreground window as a logical identity.
+
+        Read-only, and returns the same identity every other window operation
+        uses so a caller can hand it straight back as an input target.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the foreground query.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            payload = self._input_layer().get_foreground_window()
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        return {"window": payload, "has_foreground": payload is not None,
+                "trusted_request_id": self.trusted_request_id()}
+
+    def _input_mutation(self, method: str, *, allow_cancelled: bool = False,
+                        **kwargs: Any) -> dict:
+        """Shared shape for every pointer and keyboard verb.
+
+        Preflight cancellation, then the caller's own resolve/verify/dispatch
+        sequence, which is where target verification lives. The token reaches the
+        settle polls through ``self._cancelled``.
+
+        ``allow_cancelled`` exists for release-only cleanup. It waives the *token*
+        check and nothing else - the operation is still classified as mutating, so
+        it still requires permission. What it deliberately does not waive is target
+        verification: freeing a key is the one thing that must keep working when
+        everything else has already failed.
+        """
+        self._guard()
+        if not allow_cancelled and self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the input dispatch.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            result = getattr(self._input_layer(), method)(
+                cancelled=self._cancelled, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        payload = result.to_dict()
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
+
+    def _resolve_for_input(self, target: Any, *, window: Any = None,
+                           require_foreground: bool = True):
+        """Resolve a target and confirm it, in that order.
+
+        A caller may name the target either as a point carrying its own window
+        identity, or as a separate ``window`` plus a point. Both are accepted;
+        neither skips verification.
+
+        Every input verb routes through here, so this is also where anchoring is
+        enforced for the whole surface: a resolved point that is not anchored to a
+        verified window is refused here rather than by each verb separately. One
+        place to get wrong is better than twelve.
+
+        The separate-window form requires a *window point*, so the coordinates are
+        resolved against freshly-read bounds. A bare screen point given alongside a
+        verified window is refused rather than quietly trusted because a window
+        happened to be supplied - that combination says "somewhere", and
+        "somewhere" is exactly what this layer exists to replace.
+        """
+        inputs = self._input_layer()
+        if window is not None:
+            confirmed = inputs.confirm_target(window)
+            point = inputs.resolve(target, require_foreground=False)
+            if not point.verified_target:
+                raise WindowsInvalidRequestError(
+                    "a screen point was given alongside a target window; use a "
+                    "window point so the coordinates are resolved against that "
+                    "window's verified bounds.",
+                    diagnostics=point.to_dict())
+            if not point.identity.matches(confirmed.identity):
+                # The two names have to be the same window. Overwriting the
+                # resolved provenance with the confirmed one would launder a
+                # mismatch into a plausible-looking point: the coordinates would
+                # be reported against a window they were never resolved from.
+                raise WindowsWindowIdentityMismatchError(
+                    "the window and the target point name different windows, so "
+                    "the coordinates cannot be resolved against the target.",
+                    diagnostics={
+                        "window_key": confirmed.identity.key,
+                        "point_window_key": point.window_key,
+                    })
+            return point
+
+        point = inputs.resolve(target, require_foreground=require_foreground)
+        if require_foreground and point.verified_target:
+            # Re-confirm after resolution: the window was read once during the
+            # resolve and the foreground could have changed since.
+            inputs.confirm_target(point.identity)
+        require_anchored(point)
+        return point
+
+    def mouse_move(self, target: Any = None, window: Any = None,
+                   **_ignored: Any) -> dict:
+        """Move the pointer to a verified target. Mutating.
+
+        Foreground confirmation is required here exactly as it is for a click.
+        A pointer moved into a background window's rectangle lands on whatever is
+        actually on top there, so a move that skipped the foreground check would
+        be a click aimed at an unknown window wearing a move's clothes.
+        """
+        point = self._resolve_for_input(target, window=window,
+                                        require_foreground=True)
+        return self._input_mutation("move_cursor", point=point)
+
+    def _click(self, button: str, count: int, target: Any,
+               window: Any) -> dict:
+        point = self._resolve_for_input(target, window=window)
+        return self._input_mutation("move_and_click", point=point,
+                                    button=button, count=count)
+
+    def mouse_left_click(self, target: Any = None, window: Any = None,
+                         **_ignored: Any) -> dict:
+        """Left-click a verified target. Mutating."""
+        return self._click("left", 1, target, window)
+
+    def mouse_right_click(self, target: Any = None, window: Any = None,
+                          **_ignored: Any) -> dict:
+        """Right-click a verified target. Mutating."""
+        return self._click("right", 1, target, window)
+
+    def mouse_double_click(self, target: Any = None, window: Any = None,
+                           **_ignored: Any) -> dict:
+        """Double-click a verified target. Mutating."""
+        return self._click("left", 2, target, window)
+
+    def _keyboard(self, method: str, target: Any, window: Any, *,
+                    allow_cancelled: bool = False, **kwargs: Any) -> dict:
+        # Keyboard input is only received by the focused window, so foreground
+        # confirmation is mandatory rather than advisory here. The resolved point
+        # is threaded into the dispatch as well as checked here, so the native
+        # layer re-verifies the target immediately before SendInput rather than
+        # trusting a check that happened one layer up.
+        point = self._resolve_for_input(target, window=window,
+                                        require_foreground=True)
+        return self._input_mutation(method, point=point,
+                                    allow_cancelled=allow_cancelled, **kwargs)
+
+    def key_press(self, key: Any = None, target: Any = None, window: Any = None,
+                  **_ignored: Any) -> dict:
+        """Hold a named key down in a verified target. Mutating."""
+        return self._keyboard("press_key", target, window, key=key)
+
+    def key_release(self, key: Any = None, target: Any = None, window: Any = None,
+                    **_ignored: Any) -> dict:
+        """Release a held key. Mutating.
+
+        Waives the cancellation token on purpose. A cancelled request is exactly
+        the state in which a key may have been left held, so refusing to release
+        because of cancellation would convert a recoverable interruption into a
+        machine stuck with Ctrl down until the user intervenes.
+        """
+        return self._keyboard("release_key", target, window, key=key,
+                              allow_cancelled=True)
+
+    def key_tap(self, key: Any = None, target: Any = None, window: Any = None,
+                **_ignored: Any) -> dict:
+        """Press and release one key in a verified target. Mutating."""
+        return self._keyboard("tap_key", target, window, key=key)
+
+    def hotkey(self, keys: Any = None, target: Any = None, window: Any = None,
+               **_ignored: Any) -> dict:
+        """Dispatch a combination in a verified target. Mutating."""
+        return self._keyboard("hotkey", target, window, keys=list(keys or []))
+
+    def type_text(self, text: Any = None, target: Any = None, window: Any = None,
+                  **_ignored: Any) -> dict:
+        """Type text into a verified target. Mutating."""
+        return self._keyboard("write_text", target, window, text=text)
 
     # ---------------------------------------------------------------- utils
 

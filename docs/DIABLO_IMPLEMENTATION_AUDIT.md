@@ -1,7 +1,8 @@
 # DIABLO IMPLEMENTATION AUDIT AND ROADMAP STATUS
 
-M2.14.1 hardening, M2.15 Native Windows Process/System Foundation, and M2.15.2
-Trust, Interruption and Durability.
+M2.14.1 hardening, M2.15 Native Windows Process/System Foundation, M2.15.2
+Trust, Interruption and Durability, and M2.16 Desktop Control — M2.16.1 window
+identity, M2.16.2 pointer and mouse, M2.16.3 keyboard.
 
 Baseline: `ef7c49a` (M2.14 Phase 10 freeze). Phase 10 history is unchanged; no
 commit was rewritten, rebased or amended.
@@ -13,18 +14,33 @@ Source audit: `docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt` (31 sections,
 
 ## 1. Verification summary
 
+### M2.16.2 / M2.16.3
+
 | Check | Result |
 |---|---|
-| Full suite, deterministic | **2593 passed, 80 skipped** |
-| Full suite, real Windows + real Blender gates | **2633 passed, 40 skipped** |
-| Real Windows layer (`DIABLO_REAL_WINDOWS_TESTS=1`) | **37 passed** |
-| Real Blender (`DIABLO_REAL_BLENDER_TESTS=1`, `-k blender`) | **165 passed** |
+| Full suite, deterministic | **2895 passed, 120 skipped** |
+| Full suite, real-Windows gates (`DIABLO_REAL_WINDOWS_TESTS=1`) | **2972 passed, 43 skipped** |
+| Real input module, `tests/test_m2162_input_real.py` | **30 passed**, three consecutive runs |
+| Real window + input modules together | **56 passed** |
 | `python -m compileall` | clean |
 | `pip check` | no broken requirements |
 
-Phase 10 baseline was 2212 passed / 42 skipped. The suite grew by 421 tests and
-no test was weakened to reach green. Each of the two M2.15.2 commits was
-verified green in isolation before the next was written.
+M2.16.1 baseline was 2702 passed / 90 skipped deterministic. The suite grew by 193
+tests and no test was weakened to reach green. No Blender gate was rerun: M2.16
+touches neither the Blender scene path nor the shared executor, so a rerun would
+have measured nothing new.
+
+### Earlier milestones
+
+| Check | Result |
+|---|---|
+| M2.15.2 full suite, deterministic | **2593 passed, 80 skipped** |
+| M2.15.2 full suite, real Windows + real Blender gates | **2633 passed, 40 skipped** |
+| Real Windows layer (`DIABLO_REAL_WINDOWS_TESTS=1`) | **37 passed** |
+| Real Blender (`DIABLO_REAL_BLENDER_TESTS=1`, `-k blender`) | **165 passed** |
+
+Phase 10 baseline was 2212 passed / 42 skipped. Each commit was verified green in
+isolation before the next was written.
 
 ---
 
@@ -271,50 +287,183 @@ stale copy back over the wipe — and clears `self._messages` too, or the
 
 ---
 
-## 7. Still not done
+## 7. M2.16 Desktop Control
+
+### 7.1 M2.16.1 — window identity
+
+The foundation the rest of M2.16 stands on: a window is addressed as
+`(hwnd, process (pid, created_at), class, instance)` rather than by handle. HWND
+alone is not an identity, because Windows recycles handles and a stale one names a
+different window that happens to sit at the same address.
+
+Activation failure is reported, never faked. Windows refuses
+`SetForegroundWindow` from a process that does not own the foreground, and that
+refusal is returned as "requested but not confirmed" rather than as success.
+
+### 7.2 M2.16.2 — `core/windows/coordinates.py`
+
+**A coordinate is not a target.** `click(x, y)` names a point on a screen, not a
+thing: by the time input reaches Windows the window may have moved, closed, or
+lost foreground, and the point may now lie over a different application. A caller
+that supplied bare coordinates has no way to notice any of that.
+
+So every coordinate carries the target it was meant for:
+
+- `ScreenPoint` — absolute screen coordinates, explicitly *unanchored*. Accepted
+  and inspectable, and refused for anything that changes the machine.
+- `WindowPoint` — window-relative coordinates plus a `WindowIdentity`. Resolution
+  re-reads the window and re-verifies the identity, so a stale rect cannot be
+  applied to a recycled handle.
+- `ResolvedPoint` — the result, carrying the provenance of the window it was
+  computed from.
+
+`mode` is declared explicitly and never inferred. Inferring it from which keys
+happen to be present would let a caller smuggle a window identity in and have it
+silently treated as absolute coordinates — discarding the anchoring exactly when
+it was most wanted.
+
+Bounds are half-open. `SM_CXVIRTUALSCREEN` is a width, so the last addressable
+pixel is `left + width - 1`; `GetWindowRect` reports a right/bottom one past the
+last covered pixel. Accepting `left + width` would admit a coordinate Windows
+clamps back to the edge, so a caller would believe it had aimed at a position that
+does not exist.
+
+### 7.3 M2.16.2 / 7.4 M2.16.3 — `core/windows/input.py`
+
+The only module that talks to Windows input. `SendInput` rather than
+`mouse_event`/`keybd_event`: those are the 16-bit-era calls, they truncate
+coordinates, and they cannot express Unicode. `KEYEVENTF_UNICODE` makes typed text
+independent of the active keyboard layout.
+
+**Every verb requires a target.** The keyboard verbs take a `point` even though no
+coordinate is involved, because keystrokes go to whichever window holds
+foreground, and without naming a target there is no way to notice that foreground
+belongs to a different application than the caller meant.
+
+**The target is re-read immediately before dispatch.** Resolution happens earlier;
+the gap between resolving and dispatching is exactly where a window closes, gets
+recycled, or loses foreground. Re-reading shrinks the race to the microseconds
+inside `SendInput`, which is as close as a caller without an atomic kernel
+primitive can get.
+
+**A short `SendInput` return is an error, not a count.** A user-installed
+`LLMHF_INJECT` block makes the call return zero, and a *partial* return means some
+events of a modifier chord never went in — leaving the modifier down. Both are
+raised from `_send_input` itself rather than left for each caller to check,
+because the one that forgot would report input as delivered when it never reached
+Windows.
+
+**`release_key` consults neither the target nor the cancellation token.** This is
+the one deliberate exception. A cancelled or half-finished press is exactly when a
+key needs releasing, and refusing because the target changed or the request was
+torn up would strand Ctrl down for the rest of the session. Every other verb is
+cancelled at preflight and again before dispatch.
+
+**Clicks and keystrokes are never verified.** Their effect lives inside an
+application this code cannot observe. `dispatched` says Windows accepted the
+events; it says nothing about whether a menu opened or a field changed. Only
+pointer movement is verifiable, because the pointer is global state that can be
+read back — within a 1px tolerance, since Windows clamps to the desktop edge.
+
+### 7.5 Operations added
+
+Twenty-two total, fourteen mutating. Pointer and keyboard verbs are all declared
+mutating, so all eleven reach the bridge already escalated to SENSITIVE. Reads
+(`get_cursor_pos`, `get_foreground_window`) are not.
+
+A host without the window APIs does not advertise the input verbs. Each one
+resolves and re-verifies a target through `WindowLayer`, so offering them where
+that is impossible would advertise operations that can only refuse. `get_cursor_pos`
+is the exception: it reads the pointer and the virtual screen, and needs no window
+APIs.
+
+### 7.6 Real-window testing
+
+`tests/test_m2162_input_real.py` drives real `SendInput` at a Tk window the test
+owns, with a single `Entry` and a click counter. Typed text and click counts are
+asserted by reading the `Entry` back through Tk — the only way to observe a
+keystroke's effect from outside, and the concrete demonstration of why clicks and
+keys cannot be verified.
+
+Two things about that file are worth stating plainly:
+
+- **Every target is test-owned.** The foreground-race test uses a *second probe
+  this module started*, not an unrelated application. Borrowing a user's window
+  would mean changing something they are actually using.
+- **`AttachThreadInput` is harness-only.** Windows refuses activation from a
+  process that does not own the foreground, which a test harness never does, so
+  the fixture uses the documented technique to raise its own window. The *product*
+  does not: `focus_window` still honours Windows' refusal, which is M2.16.1
+  behaviour with tests asserting it, and `test_no_native_input_api_is_referenced_outside_the_input_layer`
+  keeps `SendInput` confined to the one module.
+
+Teardown terminates the window's *owning* process as well as the direct child,
+because a venv `python.exe` re-executes and the window belongs to a grandchild —
+terminating only the direct child leaves it alive. Verified: zero probe windows
+and no probe processes survive a run.
+
+### 7.7 Three assertions that were wrong, not the code
+
+Found while testing, and worth recording because in each case the *test* encoded
+the weaker behaviour:
+
+1. `test_contains_includes_the_edges` asserted `contains(100, 100)` on a 100×100
+   screen was true. That is the bug, not the test: see §7.2.
+2. `test_a_partially_injected_batch_is_also_a_refusal` replaced `_send_input`
+   wholesale, which skipped the very check under test — a replacement can simply
+   ignore the count it is handed. It now patches `user32.SendInput` so the real
+   logic runs.
+3. The Unicode test waited for "some text appeared" and then asserted the whole
+   string, so it could catch a half-typed value. Waiting for the condition being
+   *asserted* is the difference between a flaky test and a real one.
+
+Two Tk-specific traps, also worth naming: returning `"break"` from a binding stops
+the *default class binding*, which is what gives an `Entry` keyboard focus on
+click; and a single physical click bound at three levels of the bind chain fires
+all three handlers unless one returns `"break"`. Binding once on the toplevel and
+returning `None` is what makes a click both count once and focus.
+
+---
+
+## 8. Still not done
 
 1. **Knowledge Graph case-normalisation** (audit #9). Not addressed.
 2. **23 skills of dead code** (audit #13). `coding/code_reader.py`,
    `coding/code_writer.py` and others are still on disk with no importers.
 3. **Real-model runs.** `DIABLO_P9_TIMEOUT=300` gated suites
    (`test_knowledge_p9_real_model.py`, `test_recovery_p10_real_model.py`) were
-   not rerun for M2.15 or M2.15.2; they need Ollama and ~50 minutes. Last
-   verified at Phase 10. **M2.15.2 touches recovery and the agent turn path
-   directly, so these are now worth rerunning before M2.16.**
+   not rerun for M2.16; they need Ollama and ~50 minutes. Last verified at
+   Phase 10. **Deferred, not claimed.**
 4. **Packaged application launch** still costs a PowerShell process (§3.3).
 
 Nothing here is claimed complete that is not.
 
 ---
 
-## 8. Recommended next task
+## 9. Recommended next task
 
-**Rerun the real-model suites, then M2.16.**
+**M2.16.4 — screen capture, then UI Automation.**
 
-M2.15.2 closed the three findings that sat directly on the seams M2.16 extends:
-a user could not delete their stored data, a cancelled render could not be
-stopped, and an exhausted task got a fresh budget after every restart. Those were
-the blockers, and they are gone.
+M2.16 now has the model the rest of desktop control depends on: a target is a
+verified window identity rather than a coordinate, every input is permission-gated
+and cancellable, and the one effect that can be observed is the only one ever
+reported as verified. Capture is the natural next step because it is read-only and
+introduces no new mutation surface — and because it is what makes UIA and vision
+targeting possible at all.
 
-What remains before M2.16 is one validation gap and two pieces of navigation
-debt:
+Two boundaries that M2.16.4 must respect, both established above:
 
-1. **Rerun `test_knowledge_p9_real_model.py` and `test_recovery_p10_real_model.py`**
-   (`DIABLO_P9_TIMEOUT=300`, ~50 min, needs Ollama). This is now genuinely worth
-   doing rather than deferring again: M2.15.2 modified the agent turn path
-   (`_restore_conversation`, `_apply_restored_recovery_state`,
-   `_apply_recovery_policy`) and the recovery policy itself, which is precisely
-   what those two suites exercise. Their last verification was at Phase 10,
-   before three milestones of change. No fresh real-model validation is claimed
-   for M2.14.1, M2.15 or M2.15.2.
-2. **Knowledge Graph case-normalisation** (audit #9), then the dead-code removal
-   (audit #13). Neither is a security or runtime risk; they are navigation debt
-   that invites reimplementation.
+- A capture result must be anchored the same way input is. A screenshot of the
+  whole screen is a `ScreenPoint` with no target, so anything derived from it needs
+  a target before it can be acted on.
+- **UI Automation is a separate package.** It would be a new capability with its
+  own mutating set, not more verbs on this one.
 
-Then **M2.16 desktop control**, which now has the process, window, ownership and
-cancellation model it was specified to depend on — and, critically, a
-cancellation path that is proven to reach a real blocking child process.
+Alongside that, the deferred real-model suites (`test_knowledge_p9_real_model.py`,
+`test_recovery_p10_real_model.py`, `DIABLO_P9_TIMEOUT=300`, ~50 min, needs Ollama)
+remain unrerun since Phase 10. M2.16 does not touch the agent turn path or
+recovery, so this is not urgent — but it is now four milestones stale, and no
+fresh real-model validation is claimed for M2.14.1, M2.15, M2.15.2 or M2.16.
 
-Window enumeration, screen capture, mouse, keyboard and UI Automation remain out
-of scope for M2.15 and M2.15.2, and are deliberately absent from both
-implementations.
+Still deliberately out of scope for M2.16: autonomous workflows that chain input
+without a caller in the loop.

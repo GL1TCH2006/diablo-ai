@@ -287,6 +287,231 @@ _WINDOW_LIFECYCLE_VERIFIERS: dict[str, _WindowLifecycleVerifier] = {
 }
 
 
+# ═══════════════════════════════════════════════════ M2.16.2/3 input verification
+#
+# Input has one property none of the window verbs has: most of its effects happen
+# inside an application this process cannot see. A click may open a menu, change a
+# field, or do nothing at all, and the OS gives no way to tell which.
+#
+# So verification is split by what is genuinely observable:
+#
+#   * pointer position is *global OS state* and can be read back, so movement can
+#     reach PASSED on real evidence;
+#   * a click, a key, a hotkey and text cannot be observed from outside the target
+#     application, so the strongest honest answer is FAILED with the reason
+#     spelled out - never PASSED.
+#
+# Reporting those as PASSED because Windows accepted the input would be inventing
+# evidence, and a PASSED row in the ledger is something downstream reasoning is
+# allowed to trust.
+
+
+def _input_evidence(bridge: "CapabilityBridge", common: dict, data: dict) -> dict:
+    detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+    observed = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+    return bridge._json_safe({
+        **common,
+        "dispatched": data.get("dispatched") is True,
+        "confirmed": data.get("confirmed") is True,
+        "window_key": detail.get("window_key", data.get("window_key")),
+        "requested": detail.get("requested", observed or {}),
+        "observed": observed,
+        "effect": detail.get("effect", ""),
+    })
+
+
+def _verify_pointer_position(self: "CapabilityBridge", common: dict,
+                             data: dict) -> VerificationResult:
+    """Movement passes only when the pointer is actually where it was asked to go.
+
+    The pointer is global state, so this is a real observation rather than an
+    assumption. Windows clamps to the desktop edge and warps the pointer in
+    fractional steps, so the comparison uses the layer's tolerance and always
+    reports the observed value.
+    """
+    detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+    observed = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+    requested = detail.get("requested") if isinstance(detail.get("requested"), dict) else {}
+    dispatched = data.get("dispatched") is True
+    tolerance = int(detail.get("tolerance_px", 1) or 1)
+    evidence = _input_evidence(self, common, data)
+
+    if not dispatched:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "Windows did not inject the pointer move.",
+            "capability_execution", evidence,
+        )
+    if not requested or "x" not in observed:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The pointer position could not be read back, so the move is "
+            "unverified rather than passed.",
+            "capability_execution", evidence,
+        )
+    within = (abs(int(observed["x"]) - int(requested["x"])) <= tolerance
+              and abs(int(observed["y"]) - int(requested["y"])) <= tolerance)
+    evidence["within_tolerance"] = within
+    return VerificationResult(
+        VerificationState.PASSED if within else VerificationState.FAILED,
+        f"The pointer is at ({observed['x']}, {observed['y']}), within "
+        f"{tolerance}px of the requested position."
+        if within else
+        f"The pointer is at ({observed['x']}, {observed['y']}), which is not the "
+        f"requested ({requested['x']}, {requested['y']}). Windows may clamp the "
+        f"pointer to the edge of the virtual desktop.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_pointer_click(self: "CapabilityBridge", common: dict,
+                          data: dict) -> VerificationResult:
+    """A dispatched click is unverified, never passed.
+
+    The effect belongs to the receiving application. ``dispatched`` says Windows
+    injected the events; it says nothing about whether a menu opened. Reporting
+    PASSED here would put an unsupported claim into the ledger.
+    """
+    evidence = _input_evidence(self, common, data)
+    if data.get("dispatched") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "Windows did not inject the click.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.UNVERIFIED,
+        "The click was dispatched to the verified target. Its effect occurs "
+        "inside the target application and cannot be observed from outside it, "
+        "so this is recorded as dispatched rather than verified.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_keyboard_dispatch(self: "CapabilityBridge", common: dict,
+                              data: dict) -> VerificationResult:
+    """A dispatched keystroke is unverified, never passed.
+
+    Same reasoning as the click: the effect is the target application's business.
+    """
+    evidence = _input_evidence(self, common, data)
+    if data.get("dispatched") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "Windows did not inject the key event.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.UNVERIFIED,
+        "The key event was dispatched to the verified foreground target. Its "
+        "effect occurs inside the target application and cannot be observed from "
+        "outside it.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_pointer_claim(self: "CapabilityBridge", common: dict,
+                          data: dict) -> VerificationResult:
+    """Movement-plus-click: the move is observable, the click is not.
+
+    This is the strongest evidence available for a click, so it is reported
+    separately from ``confirmed`` rather than being flattened into it.
+    """
+    evidence = _input_evidence(self, common, data)
+    detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+    cursor_confirmed = detail.get("cursor_confirmed") is True
+    evidence["cursor_confirmed"] = cursor_confirmed
+    evidence["click_confirmed"] = False
+    if data.get("dispatched") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "Windows did not inject the click.",
+            "capability_execution", evidence,
+        )
+    if cursor_confirmed:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The pointer reached the requested position inside the verified "
+            "target and the click was dispatched. The click's own effect occurs "
+            "inside the target application and cannot be observed from outside "
+            "it, so this is recorded as dispatched rather than verified.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.FAILED,
+        "The click was dispatched but the pointer did not reach the requested "
+        "position inside the verified target, so the click cannot be attributed "
+        "to it.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_pointer_read(self: "CapabilityBridge", common: dict,
+                         data: dict) -> VerificationResult:
+    """A cursor or foreground read: structural validity only."""
+    if "x" in data:
+        try:
+            x, y = int(data["x"]), int(data["y"])
+            screen = data.get("virtual_screen") or {}
+            within = screen.get("width", 0) and screen.get("height", 0)
+        except (TypeError, ValueError):
+            x = y = None
+            within = False
+        if x is None or not within:
+            return VerificationResult(
+                VerificationState.UNVERIFIED,
+                "The pointer position could not be read as a valid screen "
+                "coordinate.", "tool_observation",
+                self._json_safe({**common, "x": data.get("x"), "y": data.get("y")}),
+            )
+        return VerificationResult(
+            VerificationState.PASSED,
+            "The pointer position and virtual screen geometry were read and are "
+            "internally consistent.",
+            "tool_observation",
+            self._json_safe({**common, "x": x, "y": y,
+                             "virtual_screen": data.get("virtual_screen")}),
+        )
+
+    window = data.get("window") if isinstance(data.get("window"), dict) else None
+    if window is None:
+        # No foreground window is a real answer on a locked or service desktop,
+        # not a failure - but it is not evidence either.
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "There is no foreground window to verify; nothing was fabricated.",
+            "tool_observation",
+            self._json_safe({**common, "has_foreground": False}),
+        )
+    anchored = bool(window.get("identity_created_at")) and bool(window.get("class_name"))
+    return VerificationResult(
+        VerificationState.PASSED if anchored else VerificationState.UNVERIFIED,
+        "The foreground window was read with a process-anchored identity."
+        if anchored else
+        "The foreground window could not be anchored to a process creation time, "
+        "so it cannot be safely targeted.",
+        "tool_observation",
+        self._json_safe({**common, "has_foreground": True,
+                         "window_key": window.get("window_key"),
+                         "anchored": anchored}),
+    )
+
+
+_INPUT_VERIFIERS: dict[str, Any] = {
+    "mouse_move": _verify_pointer_position,
+    "mouse_left_click": _verify_pointer_click,
+    "mouse_right_click": _verify_pointer_click,
+    "mouse_double_click": _verify_pointer_claim,
+    "key_press": _verify_keyboard_dispatch,
+    "key_release": _verify_keyboard_dispatch,
+    "key_tap": _verify_keyboard_dispatch,
+    "hotkey": _verify_keyboard_dispatch,
+    "type_text": _verify_keyboard_dispatch,
+}
+
+_POINTER_READ_VERIFIERS = frozenset({"get_cursor_pos", "get_foreground_window"})
+
+
 class CapabilityBridge:
     def __init__(
         self,
@@ -662,6 +887,15 @@ class CapabilityBridge:
         # was asked to change.
         if operation in _WINDOW_LIFECYCLE_VERIFIERS:
             return _WINDOW_LIFECYCLE_VERIFIERS[operation](self, common, data)
+
+        # M2.16.2/3 pointer and keyboard. Reads verify structurally; mutations verify
+        # against observed state, and a dispatched click or keystroke is reported
+        # UNVERIFIED rather than PASSED because its effect lives inside the target
+        # application where this process cannot observe it.
+        if operation in _POINTER_READ_VERIFIERS:
+            return _verify_pointer_read(self, common, data)
+        if operation in _INPUT_VERIFIERS:
+            return _INPUT_VERIFIERS[operation](self, common, data)
 
         # list / get / find: structural validity of the returned rows.
         rows = data.get("processes")

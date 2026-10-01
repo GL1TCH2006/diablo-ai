@@ -59,14 +59,20 @@ def layer():
 
 class TestTheOperationSurfaceIsClosed:
     def test_the_operations_are_exactly_the_documented_ones(self):
-        # M2.16 took the surface from five to eleven. Enumerated rather than
-        # counted, because the property under test is that the set is known and
-        # deliberate, not that it has some length.
+        # M2.16 took the surface from five to eleven, and M2.16.2/.3 took it to
+        # twenty-two. Enumerated rather than counted, because the property under
+        # test is that the set is known and deliberate, not that it has a length.
         assert WINDOWS_OPERATIONS == (
             "list", "get", "find", "system_info",
             "list_windows", "get_window",
             "terminate",
             "window_focus", "window_minimize", "window_restore", "window_close",
+            # M2.16.2 pointer.
+            "get_cursor_pos", "get_foreground_window",
+            "mouse_move", "mouse_left_click", "mouse_right_click",
+            "mouse_double_click",
+            # M2.16.3 keyboard.
+            "key_press", "key_release", "key_tap", "hotkey", "type_text",
         )
 
     def test_every_mutation_is_declared(self):
@@ -74,16 +80,27 @@ class TestTheOperationSurfaceIsClosed:
 
         The M2.15 wording was "terminate is the only one", which was true then
         and is not now. The property it guarded is still worth guarding, over all
-        five.
+        fourteen.
         """
         assert _MUTATING_OPERATIONS == frozenset({
             "terminate", "window_focus", "window_minimize",
             "window_restore", "window_close",
+            "mouse_move", "mouse_left_click", "mouse_right_click",
+            "mouse_double_click",
+            "key_press", "key_release", "key_tap", "hotkey", "type_text",
         }), (
             "the mutating set changed; a new mutation needs a test and a "
             "permission level like the others have")
         assert _MUTATING_OPERATIONS <= set(WINDOWS_OPERATIONS), (
             "an operation is declared mutating but is not on the surface")
+
+    def test_reading_the_pointer_and_the_foreground_is_not_a_mutation(self):
+        """Both only read OS state. Nothing about them needs permission beyond
+        the read itself, and classifying them as mutating would make asking where
+        the pointer is a privileged act."""
+        for operation in ("get_cursor_pos", "get_foreground_window"):
+            assert operation not in _MUTATING_OPERATIONS, (
+                f"{operation} was declared mutating; it only reads")
 
     def test_an_unlisted_operation_is_refused(self):
         """A closed surface: PowerShell could express anything, so the surface
@@ -395,7 +412,9 @@ class TestThePermissionBoundaryIsDeclared:
         assert self._adapter().is_mutating("terminate") is True
 
     def test_queries_are_not_declared_mutating(self):
-        for operation in ("list", "get", "find", "system_info"):
+        for operation in ("list", "get", "find", "system_info",
+                          "list_windows", "get_window",
+                          "get_cursor_pos", "get_foreground_window"):
             assert self._adapter().is_mutating(operation) is False, (
                 f"{operation} was declared mutating; it only reads")
 
@@ -408,10 +427,22 @@ class TestThePermissionBoundaryIsDeclared:
         from core.windows.capabilities import _MUTATING_OPERATIONS as layer_set
 
         assert set(self._adapter().mutating_operations) == set(layer_set)
-        assert self._adapter().mutating_operations == (
-            "terminate", "window_close", "window_focus", "window_minimize",
-            "window_restore",
-        )
+        assert self._adapter().mutating_operations == tuple(sorted(layer_set)), (
+            "the adapter's tuple is not the declared set, sorted; a drift here "
+            "would mean the two orderings disagree about what it protects")
+
+    def test_every_input_mutation_is_declared_mutating(self):
+        """Input reaches another application on the user's machine.
+
+        Each of these is a mutation of a window the user did not necessarily name,
+        so each one has to arrive at the bridge already escalated. An input verb
+        that read SAFE would need no permission at all.
+        """
+        for operation in ("mouse_move", "mouse_left_click", "mouse_right_click",
+                          "mouse_double_click", "key_press", "key_release",
+                          "key_tap", "hotkey", "type_text"):
+            assert self._adapter().is_mutating(operation) is True, (
+                f"{operation} was not declared mutating; it dispatches input")
 
     def test_an_unknown_operation_is_not_mutating(self):
         assert self._adapter().is_mutating("delete") is False

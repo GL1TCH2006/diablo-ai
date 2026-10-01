@@ -65,6 +65,14 @@ from .models import (
     TerminationResult,
     process_identity,
 )
+from .coordinates import (
+    ResolvedPoint,
+    ScreenPoint,
+    VirtualScreen,
+    WindowPoint,
+    require_anchored,
+)
+from .input import CURSOR_TOLERANCE, InputDispatchResult, InputLayer, Keys
 from .processes import ProcessLayer
 from .system import SystemLayer, read_memory, read_system_info, system_available
 from .window_models import WindowIdentity, WindowInfo
@@ -86,6 +94,15 @@ __all__ = [
     "ProcessLayer",
     "SystemLayer",
     "WindowLayer",
+    "InputLayer",
+    "Keys",
+    "InputDispatchResult",
+    "CURSOR_TOLERANCE",
+    "ScreenPoint",
+    "WindowPoint",
+    "ResolvedPoint",
+    "VirtualScreen",
+    "require_anchored",
     "windows_available",
     "ProcessInfo",
     "TerminationResult",
