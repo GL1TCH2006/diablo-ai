@@ -203,6 +203,15 @@ class FailureObservation:
     attempt: int = 0
     recovery_attempts: int = 0
     escalations_used: int = 0
+    #: M2.15.2: recovery for this task is already spent, terminally.
+    #:
+    #: ``recovery_attempts`` and ``escalations_used`` are counters, and counters
+    #: alone only imply exhaustion relative to *the budgets they are compared
+    #: against*. If a restarted process rebuilt those counters from zero, or if a
+    #: raised budget made spent counters look affordable again, an exhausted
+    #: recovery path would look fresh. This flag is the durable statement that the
+    #: path already terminated, and it dominates every budget comparison below.
+    recovery_exhausted: bool = False
     verification_state: VerificationState = VerificationState.NOT_RUN
     verification_evidence: Mapping[str, Any] = field(default_factory=dict)
     #: Explicit override. ``None`` means "use the category prior".
@@ -269,8 +278,9 @@ class FailureObservation:
             "error_type": self.error_type,
             "error_message": self.error_message,
             "attempt": int(self.attempt or 0),
-            "recovery_attempts": int(self.recovery_attempts or 0),
-            "escalations_used": int(self.escalations_used or 0),
+"recovery_attempts": int(self.recovery_attempts or 0),
+        "escalations_used": int(self.escalations_used or 0),
+        "recovery_exhausted": bool(self.recovery_exhausted),
             "verification_state": state.value if isinstance(state, VerificationState) else str(state),
             "verification_evidence": dict(self.verification_evidence or {}),
             "retryable": self.retryable,
@@ -372,6 +382,16 @@ class RecoveryPolicy:
             return answer(
                 RecoveryAction.NONE,
                 "cancellation is active; cancellation dominates recovery",
+            )
+
+        # 1b. M2.15.2: durable exhaustion dominates every budget below. Checked
+        # before the counters because a raised ``max_retries`` must not make a
+        # terminally-spent recovery path look affordable again after a restart.
+        if observation.recovery_exhausted:
+            return answer(
+                RecoveryAction.ABORT,
+                "recovery for this task was already exhausted and exhausted "
+                "state was restored from durable task state",
             )
 
         # 2/3. Plan state. A terminal state, RUNNING, or PENDING offers no

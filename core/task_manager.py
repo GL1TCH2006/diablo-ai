@@ -340,8 +340,32 @@ class TaskManager:
     #: the existing durable projection of that decision, not a second authority.
     ledger: VerificationLedger = field(default_factory=VerificationLedger)
     recovery_attempts: int = 0
+    #: M2.15.2. True once recovery for this task terminally stopped.
+    #:
+    #: A counter cannot express this on its own: ``recovery_attempts`` only
+    #: implies exhaustion relative to a budget, so a restart that rebuilt the
+    #: counter from zero - or a raised budget - would make a spent recovery path
+    #: look fresh. This flag is the durable, monotonic statement and is restored
+    #: from ``TaskRecord.metadata["lifecycle"]`` on restart. It is only ever set,
+    #: never cleared by recovery logic, so exhaustion cannot be undone by a
+    #: later failure.
+    recovery_exhausted: bool = False
+    #: Why recovery stopped terminally, for diagnostics. Read by nothing but the
+    #: lifecycle projection; the decision itself lives in ``RecoveryPolicy``.
+    recovery_termination: str = ""
     partial: bool = False
     failure_reason: str = ""
+
+    def mark_recovery_exhausted(self, reason: str = "") -> None:
+        """Record that recovery for this task is terminally spent.
+
+        Monotonic by construction: a second call updates the reason but never
+        clears the flag. Recovery is bounded, so "exhausted" is a terminal fact
+        about a task, not a phase it can come back from.
+        """
+        self.recovery_exhausted = True
+        if reason:
+            self.recovery_termination = str(reason)
 
     def begin_task(self, title: str, task_id: str = "") -> None:
         self.task_title = title
@@ -355,6 +379,8 @@ class TaskManager:
         self.verification_history = []
         self.ledger = VerificationLedger()
         self.recovery_attempts = 0
+        self.recovery_exhausted = False
+        self.recovery_termination = ""
         self.partial = False
         self.failure_reason = ""
 

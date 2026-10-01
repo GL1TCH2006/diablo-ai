@@ -175,12 +175,21 @@ class TerminalUI:
                 self._console.print(JSON.from_data(prefs.all()))
             return False
         if cmd == ":wipe":
-            if Prompt.ask("Delete all stored memory? [y/n]", default="n").lower().startswith("y"):
-                for attr in ("_conversation", "_preferences"):
-                    store = getattr(self._agent, attr, None)
-                    if store and hasattr(store, "clear"):
-                        store.clear()
-                self._console.print("[green]Memory cleared.[/]")
+            if Prompt.ask("Delete all stored memory and rules? [y/n]", default="n").lower().startswith("y"):
+                # Agent.wipe_user_data() is the authoritative implementation.
+                # This used to clear only _conversation and _preferences, so
+                # memory entries and rules survived a command the UI described
+                # as deleting all stored memory - which mattered more once the
+                # memory layer started refusing credentials, because entries
+                # written before that policy existed still held them.
+                wipe = getattr(self._agent, "wipe_user_data", None)
+                if not callable(wipe):
+                    self._console.print("[yellow]This build cannot wipe stored data.[/]")
+                    return False
+                removed = wipe()
+                parts = [f"{label} {count}" for label, count in removed.items() if count]
+                detail = f" ({', '.join(parts)})" if parts else " - nothing was stored"
+                self._console.print(f"[green]Memory, rules and conversation cleared{detail}.[/]")
             return False
         if cmd in (":projects", ":project"):
             memory = getattr(self._agent, "_project_memory", None)
@@ -232,7 +241,7 @@ class TerminalUI:
                     ":memory    show recent conversation",
                     ":prefs     show stored preferences",
                     ":projects  discover workspace projects",
-                    ":wipe      delete all stored memory",
+                    ":wipe      delete stored memory, rules and conversation",
                     ":mission   show status of the active coding session",
                     ":gitdiff   show uncommitted changes in the active project",
                     ":rules     show active restrict-only rules + conflicts",

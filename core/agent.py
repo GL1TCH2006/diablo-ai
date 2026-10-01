@@ -93,6 +93,8 @@ class Agent:
         self._executor.set_task_provider(lambda: self._tasks.task_id)
         self._verifier = Verifier()
         self._messages: list[dict] = []
+        self._restored_conversation_count = 0
+        self._restore_conversation()
         self._max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
         self._request_gate = BoundedRequestGate(self._max_concurrent_requests)
         self._request_context = RequestContext()
@@ -277,6 +279,92 @@ class Agent:
     def project_memory(self):
         return self._project_memory
 
+    #: The stores a user-facing "forget everything" must clear, in the order
+    #: they are reported back. Each is a live instance, never a path: see
+    #: :meth:`wipe_user_data`.
+    _WIPE_TARGETS = (
+        ("conversation", "_conversation"),
+        ("memory", "_memory_store"),
+        ("rules", "_rules_store"),
+        ("preferences", "_preferences"),
+    )
+
+    def wipe_user_data(self) -> dict[str, int]:
+        """Delete everything the user stored, and report what was removed.
+
+        M2.15.2. This is the authoritative implementation of the ``:wipe`` command.
+
+        Two properties matter more than the list of stores.
+
+        **The live instances are cleared, not fresh ones built from the same
+        paths.** ``MemoryStore`` and ``RuleStore`` hold their document in memory
+        and rewrite the whole file on the next save. Wiping by constructing a
+        second ``MemoryStore(memory.json)``, deleting through it, and leaving the
+        Agent's own instance untouched would empty the file for a moment and then
+        have the Agent flush its stale copy straight back over it. The only safe
+        target is the object the Agent is actually using.
+
+        **In-memory state is cleared too.** ``self._messages`` is the live
+        conversation the prompt is built from. Emptying ``conversation.json``
+        while leaving ``_messages`` intact would keep showing the user their
+        "deleted" history on the next turn and re-append it to the file.
+
+        Rules are cleared through the same live store the permission ladder reads,
+        so a rule cannot survive the wipe by being re-read from a cache.
+
+        Settings, workspace files, the knowledge graph and Git history are not
+        user memory and are deliberately untouched.
+
+        Returns per-store counts so the caller can report honestly rather than
+        claiming a wipe it did not perform.
+        """
+        removed: dict[str, int] = {}
+
+        for label, attr in self._WIPE_TARGETS:
+            store = getattr(self, attr, None)
+            if store is None:
+                removed[label] = 0
+                continue
+            try:
+                removed[label] = self._count_store(store)
+            except Exception as exc:  # noqa: BLE001 - one store must not block the rest
+                log.warning("wipe: could not count %s: %s", label, exc)
+                removed[label] = 0
+            try:
+                store.clear()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("wipe: could not clear %s: %s", label, exc)
+                removed[label] = 0
+
+        # The live prompt state. Without this the deleted conversation keeps
+        # appearing in the next turn and is written back to disk.
+        self._messages = []
+        return removed
+
+    @staticmethod
+    def _count_store(store: object) -> int:
+        """How many records a store holds, best effort.
+
+        Counts are for reporting only. A store that cannot report a count is
+        still cleared; refusing to wipe because the count was unreadable would
+        leave the user's data behind, which is the opposite of what was asked.
+        """
+        # `list` (memory, rules) and `all` (preferences) take no arguments.
+        for attribute in ("list", "all"):
+            reader = getattr(store, attribute, None)
+            if callable(reader):
+                value = reader()
+                if isinstance(value, (list, tuple, dict)):
+                    return len(value)
+        # `recent(n)` takes a turn count; the store is already capped at
+        # max_turns * 2 entries, so a generous n returns everything it holds.
+        reader = getattr(store, "recent", None)
+        if callable(reader):
+            value = reader(10_000)
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        return 0
+
     def task_history_context(self, limit: int = 5) -> str:
         if self._project is None or self._project_memory is None:
             return ""
@@ -384,6 +472,11 @@ class Agent:
             # tests substitute partial task doubles for this object.
             "verification_ledger": _ledger_snapshot(tasks),
             "recovery_attempts": int(getattr(tasks, "recovery_attempts", 0) or 0),
+            # M2.15.2: durable recovery exhaustion. Persisted here, in the
+            # existing lifecycle projection, rather than in a new store.
+            "recovery_exhausted": bool(getattr(tasks, "recovery_exhausted", False)),
+            "recovery_termination": str(getattr(tasks, "recovery_termination", "") or ""),
+            "escalations_used": int(getattr(self, "_escalations_used", 0) or 0),
             "partial": bool(getattr(tasks, "partial", False)),
             "failure_reason": getattr(tasks, "failure_reason", ""),
             "run_id": getattr(tasks, "run_id", ""),
@@ -442,6 +535,115 @@ class Agent:
             if "already exists" not in str(exc):
                 log.warning("could not create task record: %s", exc)
 
+    def _restore_recovery_state(self, record) -> bool:
+        """Restore durable recovery budgets and exhaustion onto the live task.
+
+        M2.15.2.
+
+        ``TaskManager.begin_task`` resets ``recovery_attempts`` to zero for a new
+        task. That is correct for genuinely new work and wrong for a task that
+        survived a restart with its recovery budget already spent: the counters
+        were written to ``TaskRecord.metadata["lifecycle"]`` but nothing ever read
+        them back, so a restarted process started the same failing task from a
+        full budget. A task that had exhausted every retry and every escalation
+        would retry again, forever, one process lifetime at a time.
+
+        Restoration is one-way and only ever *raises* the counters, never lowers
+        them. A task that recorded more attempts in this lifetime than the record
+        holds must not have its budget restored upwards; the greater count is the
+        one that was actually spent.
+
+        Exhaustion is terminal and monotonic once restored, so this cannot re-open
+        a recovery path that a previous process closed.
+        """
+        task_id = str(getattr(record, "task_id", "") or "")
+        if not task_id:
+            return False
+        tasks = self._tasks
+        if getattr(tasks, "task_id", "") != task_id:
+            # A different task is live. Recording the restored task id lets a
+            # later bind apply it rather than losing it entirely.
+            # Defensive: several tests construct an Agent via __new__ and call the
+            # reconciliation directly, so the registry may not exist yet.
+            registry = getattr(self, "_exhausted_task_ids", None)
+            if registry is None:
+                registry = self._exhausted_task_ids = {}
+            registry[task_id] = {
+                "recovery_attempts": 0,
+                "recovery_exhausted": False,
+                "recovery_termination": "",
+            }
+        lifecycle = (getattr(record, "metadata", None) or {}).get("lifecycle") or {}
+        if not isinstance(lifecycle, dict):
+            return False
+
+        persisted_attempts = int(lifecycle.get("recovery_attempts") or 0)
+        persisted_escalations = int(lifecycle.get("escalations_used") or 0)
+        persisted_exhausted = bool(lifecycle.get("recovery_exhausted"))
+
+        if getattr(tasks, "task_id", "") == task_id:
+            if persisted_attempts > int(getattr(tasks, "recovery_attempts", 0) or 0):
+                tasks.recovery_attempts = persisted_attempts
+            if persisted_escalations > int(getattr(self, "_escalations_used", 0) or 0):
+                self._escalations_used = persisted_escalations
+            if persisted_exhausted:
+                tasks.mark_recovery_exhausted(
+                    str(lifecycle.get("recovery_termination") or
+                        "recovery was already exhausted before restart"))
+
+        registry = getattr(self, "_exhausted_task_ids", None)
+        if registry is None:
+            registry = self._exhausted_task_ids = {}
+        registry[task_id] = {
+            "recovery_attempts": persisted_attempts,
+            "recovery_exhausted": persisted_exhausted,
+            "recovery_termination": str(lifecycle.get("recovery_termination") or ""),
+        }
+        if persisted_exhausted or persisted_attempts:
+            log.info(
+                "restored recovery state for task %s: attempts=%d exhausted=%s",
+                task_id, persisted_attempts, persisted_exhausted,
+            )
+        return bool(persisted_exhausted or persisted_attempts)
+
+    def _apply_restored_recovery_state(self) -> None:
+        """Apply restored recovery state to the task this turn just began.
+
+        ``TaskManager.begin_task`` zeroes ``recovery_attempts`` because new work
+        should start with a full budget. For a task that existed before the
+        restart and had already exhausted recovery, that is exactly wrong.
+
+        Only the state for the task that is actually beginning is applied, and
+        only upward: a task that was not recorded as exhausted keeps a full
+        budget, and a task that has spent more in this lifetime than was recorded
+        is never restored downwards.
+        """
+        if not self._exhausted_task_ids:
+            return
+        task_id = str(getattr(self._tasks, "task_id", "") or "")
+        restored = self._exhausted_task_ids.get(task_id)
+        if not restored:
+            return
+        self._exhausted_task_ids.pop(task_id, None)
+
+        attempts = int(restored.get("recovery_attempts") or 0)
+        if attempts > int(getattr(self._tasks, "recovery_attempts", 0) or 0):
+            self._tasks.recovery_attempts = attempts
+            log.info("task %s resumes with %d recovery attempts already spent",
+                     task_id, attempts)
+        if restored.get("recovery_exhausted"):
+            self._tasks.mark_recovery_exhausted(
+                str(restored.get("recovery_termination") or
+                    "recovery was exhausted before restart"))
+            self._emit_lifecycle(
+                "recovery_exhausted_restored",
+                task_id=task_id,
+                reason=self._tasks.recovery_termination,
+            )
+            log.warning(
+                "task %s resumes already exhausted; recovery will not be retried",
+                task_id)
+
     def _classify_interrupted_steps(self, record) -> list[str]:
         """Flag steps left RUNNING by a process death.
 
@@ -461,6 +663,76 @@ class Agent:
                 flagged.append(step.step_id)
         return flagged
 
+    def _restore_conversation(self) -> int:
+        """Rehydrate the live message history from the persisted conversation.
+
+        M2.15.2.
+
+        ``ConversationStore`` persisted and reloaded conversation correctly, and
+        the ``:memory`` command displayed it correctly - but nothing ever moved it
+        into ``self._messages``, which is the list the prompt is built from. So
+        the data survived the restart and the model still could not see any of
+        it. That is the narrower form of conversation amnesia this fixes; the
+        store itself was never the problem.
+
+        Restored entries go into the *existing* message architecture as ordinary
+        role-tagged turns. They are not concatenated into the system prompt,
+        because a restored user turn is user input and belongs in the user role:
+        promoting it to a system instruction would let prior conversation forge
+        directives, which is exactly the boundary the memory trust rules exist to
+        hold.
+
+        Filtering, in order:
+
+        * only ``user`` and ``assistant`` roles - anything else in the file is not
+          a conversation turn and must not become one;
+        * non-empty string content, so a corrupt or half-written entry cannot
+          inject an empty turn;
+        * the same ``max_conversation_turns`` cap the prompt already applies, so
+          restoration cannot exceed the context limit that governs a live session.
+
+        Memory and rules are *not* involved. They have their own sanitised
+        reference sections and their own trust rules; folding them in here would
+        duplicate them into the turn history and route them around sanitisation.
+        """
+        store = getattr(self, "_conversation", None)
+        if store is None:
+            return 0
+        if self._messages:
+            # Already live in this process: the authoritative history is the one
+            # already in flight, and restoring would duplicate every turn.
+            return 0
+
+        reader = getattr(store, "recent", None)
+        if not callable(reader):
+            return 0
+        try:
+            max_turns = max(1, int(getattr(self._settings, "max_conversation_turns", 20)))
+            raw = reader(max_turns)
+        except Exception as exc:  # noqa: BLE001 - amnesia must not stop startup
+            log.warning("could not restore conversation: %s", exc)
+            return 0
+
+        restored: list[dict] = []
+        for entry in raw if isinstance(raw, (list, tuple)) else []:
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = entry.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            restored.append({"role": role, "content": content})
+            if len(restored) >= max_turns * 2:
+                break
+
+        if restored:
+            self._messages = restored
+            log.info("restored %d conversation turns after restart", len(restored))
+        self._restored_conversation_count = len(restored)
+        return len(restored)
+
     def _reconcile_interrupted_tasks(self) -> None:
         store = getattr(self, "_task_store", None)
         tracker = getattr(self, "_change_tracker", None)
@@ -468,6 +740,12 @@ class Agent:
             return
         records = {record.task_id: record for record in store.list_all()}
         for record in records.values():
+            # M2.15.2: restore durable recovery exhaustion before anything can
+            # decide to retry. Done first, and for *every* record rather than only
+            # the interrupted ones, because a task whose recovery was already
+            # spent must never be handed a fresh budget - including one that is
+            # about to be marked failed anyway.
+            self._restore_recovery_state(record)
             if record.status not in ("pending", "active"):
                 continue
             session = tracker.load_task(store.sessions_dir, record.task_id)
@@ -1558,6 +1836,7 @@ class Agent:
             attempt=int(getattr(plan_step, "attempts", 0) or 0),
             recovery_attempts=int(getattr(self._tasks, "recovery_attempts", 0) or 0),
             escalations_used=int(self._escalations_used),
+            recovery_exhausted=bool(getattr(self._tasks, "recovery_exhausted", False)),
             verification_state=state,
             verification_evidence=evidence,
             cancelled=bool(getattr(outcome, "cancelled", False)),
@@ -1590,6 +1869,14 @@ class Agent:
             # marks verification as not-ok, which is the router's existing input
             # for escalating.
             self._router_verify_ok = False
+        if decision.action is RecoveryAction.ABORT:
+            # M2.15.2: an ABORT ends recovery for this task terminally. Marking it
+            # here - rather than inferring it later from the counters - is what
+            # makes the exhaustion durable. Without this, a restart would rebuild
+            # the counters from zero and the same failing task would be handed a
+            # fresh retry budget.
+            self._tasks.mark_recovery_exhausted(decision.reason)
+            self._sync_task_metadata()
         self._emit_lifecycle(
             "recovery_decided",
             phase=phase or "unspecified",
@@ -1864,7 +2151,13 @@ class Agent:
         self._emit_lifecycle("task_started", status="created", goal=user_input)
         for recovered_task_id in list(getattr(self, "_recovered_task_ids", [])):
             self._emit_lifecycle("task_recovered", recovered_task_id=recovered_task_id, status="failed")
+        #: M2.15.2. Recovery state restored from durable task records at startup, keyed
+        #: by task id, applied to whichever task the next turn begins. Not global
+        #: mutable recovery policy - it is the per-task durable state that
+        #: ``begin_task`` would otherwise reset to zero.
+        self._exhausted_task_ids: dict[str, dict] = {}
         self._recovered_task_ids = []
+        self._apply_restored_recovery_state()
         reply = ""
         try:
             self._create_run_record()
