@@ -680,6 +680,133 @@ could only move verification to `FAILED`, so nothing was ever promoted to
 
 ---
 
+## M2.14 Phase 10A - Terminal verdict invariant
+
+### The contradiction this resolves
+
+Two live tests in `tests/test_recovery_p10_real_model.py` asserted opposite
+things about the same situation, and both could not be right:
+
+* `..._unverified_task_is_labelled_unverified_not_complete_as_verified`
+  (line 333) treated `COMPLETED` + non-`PASSED` as **permitted and honest**;
+* `..._unrepairable_project_stays_bounded_and_honest` (line 619) required
+  verification to be `PASSED` whenever the task was `COMPLETED`.
+
+The second was passing only because its `if state == "completed"` guard never
+fired for the model class it was written against, so **it was validating
+nothing**. A qwen3:14b run reached `COMPLETED` on an unrepairable project, the
+guard fired, and the stale assumption surfaced as a failure.
+
+### The invariant, as ratified
+
+```
+TaskState       answers: did the request terminate, and how?
+VerificationState answers: was the result independently checked?
+
+COMPLETED asserts the first fact and never the second.
+```
+
+These are two independent facts and the architecture keeps them apart on
+purpose. **A task can and does enter `COMPLETED` with a non-`PASSED` verdict.**
+That is an honest outcome, not a false one. What is forbidden is the *opposite*
+disagreement.
+
+Allowed terminal pairs:
+
+| `TaskState` | `VerificationState` | meaning |
+|---|---|---|
+| `COMPLETED` | `PASSED` | verified completion |
+| `COMPLETED` | `UNVERIFIED` | finished, never independently checked |
+| `COMPLETED` | `NOT_REQUIRED` | finished, nothing executed to verify |
+| `COMPLETED` | `NOT_RUN` | finished before any verification phase; transient, closed by `synchronize_verification()` |
+| `FAILED` | `FAILED` | the ordinary failure |
+| `FAILED` | `UNVERIFIED` / `NOT_REQUIRED` / `NOT_RUN` | failed without an adjudicated verdict |
+| `CANCELLED` | any | cancellation dominates; the verdict is invalidated and never load-bearing |
+
+Forbidden, each for a safety reason rather than tidiness:
+
+* **`COMPLETED` + `FAILED`** - reports a failure as a finished request. Already
+  unreachable by construction, because `Agent._record_verification` transitions
+  the task to `FAILED` on a `FAILED` verdict. Now also refused at the state
+  machine, so a future writer cannot undo it.
+* **`FAILED` + `PASSED`** - a passing verdict surviving an execution failure.
+  This is the false pass the whole architecture exists to prevent.
+
+### Answers to the questions the decision had to settle
+
+1. **Can a task enter `COMPLETED` without successful verification?** Yes. That
+   is the case where no independent verifier existed.
+2. **Verification unavailable?** `UNVERIFIED` when steps executed, because work
+   was attempted and not checked. `NOT_REQUIRED` when nothing executed, because
+   there is nothing to verify. Both are existing states; no new one was added.
+3. **Execution succeeded but verification failed?** `FAILED` verdict, and the
+   task is `FAILED`. Never `COMPLETED`.
+4. **Inherently unverifiable operation?** `NOT_REQUIRED`, carried in the ledger
+   with `subject_kind=TASK`, `method_kind=EXECUTION_OUTCOME` and a detail
+   saying why. Not a silent omission: the ledger always contains an entry
+   explaining the final verdict.
+5. **What the ledger contains?** At least one entry per terminal task whose
+   `state` equals the authoritative `TaskManager.verification`. A `PASSED`
+   entry additionally carries non-empty observed evidence, or
+   `VerificationLedger.append` refuses it.
+6. **What durable TaskStore state contains?** `TaskRecord.status` (the task
+   lifecycle), `metadata["lifecycle"]["state"]`, `["verification"]` and the
+   bounded `["verification_ledger"]` projection. Both the live task and a
+   reloaded record are checked by the same `terminal_invariant_violation`, so a
+   restart cannot present a pair the live path would have refused. A persisted
+   `PASSED` that no longer satisfies the invariant is downgraded to
+   `UNVERIFIED` on load rather than trusted.
+7. **How RecoveryPolicy reads it?** It does not, and must not. The policy is
+   step-scoped: it reads `FailureObservation.verification_state` only to decide
+   `RERUN_VERIFY`, and only when the verdict is `FAILED` *with* evidence.
+   `UNVERIFIED` is not mistaken for `FAILED`. Task terminality is not a
+   recovery input, so no recovery decision can be driven by wording.
+8. **How should a future `Agent.resume()` read it?** Through
+   `terminal_verdict(state, verification)`, never by inferring from
+   `status == "completed"`. A reloaded `COMPLETED` + `UNVERIFIED` means the work
+   was never checked, so it must never be resumed as though it were done.
+   `Agent.resume()` does not exist yet; this is a DEFERRED item with its rule
+   now fixed.
+
+### Single authority
+
+`core/task_manager.py` is the only place the rule is written down:
+
+* `terminal_verdict(state, verification) -> TerminalVerdict` - the structured
+  classification. Pure and total, and tolerant of raw strings so a reloaded
+  record is classified exactly as a live task is.
+* `terminal_invariant_violation(state, verification) -> str` - `""` when
+  admissible, else the reason. Reported rather than raised, so a corrupt
+  persisted record cannot abort a task load.
+* `TaskManager.terminal_violation()` / `assert_terminal_invariant()` -
+  post-hoc forms, for a task built by other means rather than driven through
+  `transition`.
+* `TaskManager.transition()` refuses a terminal edge that would violate the
+  invariant, so the forbidden pair cannot exist even transiently.
+* `TaskManager.synchronize_verification()` settles a terminal `NOT_RUN`
+  explicitly instead of leaving it implicit. Idempotent.
+* `TaskManager.task_succeeded()` is unchanged in signature and behaviour: it is
+  now the projection of `terminal_verdict(...).succeeded`.
+
+`TerminalVerdict` adds no task state and no verification state. It exists so no
+caller has to re-derive the conjunction itself, which is precisely how the two
+tests came to disagree.
+
+### Reporting success
+
+```
+True   COMPLETED and the ledger adjudicated PASSED with observed evidence
+False  FAILED state, or an adjudicated FAILED verdict
+None   finished (or cancelled) with no adjudicated verdict
+```
+
+`None` means *no verdict was reached*. It is not `False` and is never reported
+as either. This is the semantics Phase 9's handover already described as settled
+design and that the 14B run contradicted; it is now enforced rather than
+asserted in two places.
+
+---
+
 ## Verification
 
 * S1 invariants: `tests/test_cross_layer_contracts.py`
@@ -688,6 +815,7 @@ could only move verification to `FAILED`, so nothing was ever promoted to
 * P3 Phase 3 recovery: `tests/test_p3_recovery.py`
 * Post-P3 composition audit: `tests/test_p3_composition_audit.py`
 * Step-status structured-signal contract: `tests/test_step_status_contract.py`
+* Terminal verdict invariant (Phase 10A): `tests/test_terminal_state_invariant.py`
 * Pre-existing boundary coverage, unchanged:
   `tests/test_capability_provenance.py` (identity/provenance),
   `tests/test_capability_context_contract.py` (context propagation),

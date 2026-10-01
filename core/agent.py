@@ -1702,6 +1702,24 @@ class Agent:
             )
             self._begin_verification()
             self._record_verification(result)
+        # M2.14 Phase 10A: settle any terminal NOT_RUN explicitly rather than
+        # leaving it implicit, then assert the terminal verdict invariant once,
+        # here, where the terminal state is actually decided. COMPLETED with a
+        # non-PASSED verdict is legitimate and is NOT forced to FAILED; the
+        # invariant forbids the opposite disagreement only.
+        tasks.synchronize_verification()
+        violation = tasks.terminal_violation()
+        if violation:
+            # Fail closed and loudly. Reaching here means a writer produced a
+            # terminal pair the architecture forbids, which must never be
+            # persisted as-is.
+            log.error("terminal verdict invariant violated for task %s: %s",
+                      tasks.task_id, violation)
+            tasks.failure_reason = violation
+            tasks.set_verification(
+                VerificationState.FAILED,
+                f"Terminal state inconsistency: {violation}",
+            )
         if status == "cancelled":
             self._transition(TaskState.CANCELLED)
         elif status == "failed":

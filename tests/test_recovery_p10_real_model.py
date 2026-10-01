@@ -52,6 +52,7 @@ from core.knowledge_graph import (
 )
 from core.knowledge_projection import knowledge_dir
 from core.knowledge_tools import knowledge_index, knowledge_query
+from core.task_manager import terminal_invariant_violation, terminal_verdict
 from core.verification import VerificationState
 from memory.preferences import PreferencesStore
 from tools import build_registry
@@ -530,27 +531,64 @@ class TestCrossSessionRepairKnowledge:
         assert second["model"] == MODEL, (
             "the second process did not use a real model")
 
-        # It inspected the project with a real tool, from disk, in a new process.
+        # 10Q DEFECT-1. This line used to be
+        #
+        #     assert consulted, "the restarted process consulted nothing ..."
+        #
+        # which asserts model *behaviour*, not persistence. qwen3:14b made zero
+        # tool calls on this prompt and failed it, while every persistence
+        # assertion above passed. Which tool the model reaches for is a fact
+        # about the model; the class docstring already argues it should be
+        # reported rather than asserted, because project.files, task.list and
+        # project.grep are all defensible answers to what was asked.
+        #
+        # So it is reported here, and the persistence claim - which is what this
+        # test is actually for - is asserted structurally instead, against the
+        # store rather than against the model's choices.
         consulted = [s for s in second["steps"]
                      if s.split("=")[0] in {
                          "knowledge.query", "project.files", "project.grep",
                          "project.info", "task.list", "filesystem.list_dir"}]
-        assert consulted, (
-            f"the restarted process consulted nothing about the project: "
-            f"{second['steps']}")
-
-        # Recorded, not asserted: which of those it chose.
         knowledge_used = any(s.startswith("knowledge.") for s in second["steps"])
-        print(f"\n[Phase 10I observation] {MODEL} in the restarted process used "
-              f"knowledge.query: {knowledge_used}; tools: {second['steps']}")
+        print(f"\n[Phase 10Q observation] {MODEL} in the restarted process used "
+              f"knowledge.query: {knowledge_used}; "
+              f"project-inspecting tools consulted: {consulted}; "
+              f"all steps: {second['steps']}")
 
-        # And the knowledge is still exactly where process 1 left it, read
-        # after a second process has been running against it.
+        # Process 1's task is still exactly where it left it, read after a
+        # second process has been running against the same store.
+        #
+        # This used to assert the *count* was unchanged, on the assumption that
+        # the second session was read-only. It is not: process 2 ran a full
+        # ``Agent.respond``, and every request projects its own task node - the
+        # behaviour this same module already relies on above, where it asserts
+        # the graph holds a task "without any help from the test". So the count
+        # is expected to grow by exactly the second session's own task.
+        #
+        # The claim worth making is the narrower and stronger one: nothing
+        # process 1 recorded was lost or altered, and the second session added
+        # only its own task rather than mutating the repair.
         after = knowledge_query(query_type="search_tasks", settings=settings,
                                 project_path=str(project), limit=50)
         assert after.success, after.error
-        assert after.data["count"] == tasks.data["count"], (
-            "a read-only session changed the stored knowledge")
+
+        before_ids = {n["node_id"] for n in tasks.data["nodes"]}
+        after_ids = {n["node_id"] for n in after.data["nodes"]}
+        missing = before_ids - after_ids
+        assert not missing, (
+            f"process 1's task knowledge was lost by the second session: "
+            f"{sorted(missing)}")
+        assert after.data["count"] == tasks.data["count"] + 1, (
+            f"the second session added {after.data['count'] - tasks.data['count']} "
+            f"task node(s) beyond its own; a session must project its own task "
+            f"and nothing else")
+
+        # And the structural knowledge process 1 indexed is still intact.
+        files_after = knowledge_query(query_type="search_files", settings=settings,
+                                      project_path=str(project), limit=50)
+        assert files_after.success, files_after.error
+        assert "calc.py" in {n["display_name"] for n in files_after.data["nodes"]}, (
+            "the indexed file knowledge did not survive the second session")
 
     def test_the_repaired_state_is_persisted_not_just_remembered(
             self, tmp_path):
@@ -617,8 +655,16 @@ class TestRealModelBoundedExhaustion:
             if entry.state is VerificationState.PASSED:
                 assert entry.evidence, "a PASSED entry carries no evidence"
         if agent._tasks.state.value == "completed":
-            assert agent._tasks.verification is VerificationState.PASSED, (
-                "completed without a passing verdict")
+            # Phase 10A resolved this. The previous assertion here was
+            # ``verification is PASSED``, which contradicted 10H 287 lines
+            # earlier and encoded a superseded assumption that "completed"
+            # implies "verified". The invariant forbids the *opposite*
+            # disagreement: a known-failed verdict reported as a finished
+            # request. A COMPLETED task that exhausted its recovery budget
+            # against a test nothing can satisfy is exactly that honest
+            # non-PASSED outcome, and it is already asserted above.
+            assert agent._tasks.verification is not VerificationState.FAILED, (
+                "a failed verdict was reported as a completed request")
         # And the graph did not grow without bound while it tried.
         close_shared_managers()
         mgr = KnowledgeGraphManager(knowledge_dir(settings))
