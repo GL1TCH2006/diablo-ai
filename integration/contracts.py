@@ -905,7 +905,19 @@ class WindowsCapabilityAdapter(_LayerAdapter):
     #: Operations that change machine state. Declared here so the bridge can
     #: escalate exactly these to an explicit confirmation, which is what stops a
     #: model escalating from a query to a process-control primitive.
-    _MUTATING = frozenset({"terminate"})
+    #:
+    #: M2.16 added the four window lifecycle verbs. They are mutating because they
+    #: change what the user sees on their screen - a minimize is not a read, and
+    #: classifying it SAFE on the grounds that it is "just a ShowWindow call"
+    #: would be exactly the name-based reasoning this declaration exists to
+    #: replace.
+    _MUTATING = frozenset({
+        "terminate",
+        "window_focus",
+        "window_minimize",
+        "window_restore",
+        "window_close",
+    })
 
     def _operations_for_layer(self) -> tuple[str, ...]:
         operations = getattr(self.layer, "operations", None)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +102,189 @@ def dispatch_params(capability: str, operation: str, params: dict) -> dict:
     else:
         params.pop("context", None)
     return params
+
+
+# ═══════════════════════════════════════════════════ M2.16 window verification
+#
+# Verification for the window layer follows one rule: a native call returning
+# without error is not evidence that anything happened. `ShowWindow` returns
+# before the window has moved, `SetForegroundWindow` can be refused by Windows
+# while reporting success, and `PostMessage(WM_CLOSE)` only queues a message -
+# the receiving application decides when, or whether, to close. Each verifier
+# therefore checks the specific observable property its verb was asked to change,
+# and a `PASSED` requires that property to hold in the state the layer re-read
+# *after* the call.
+
+
+def _window_evidence(bridge: "CapabilityBridge", common: dict, data: dict,
+                     window: dict | None, extra: dict | None = None) -> dict:
+    payload = {
+        **common,
+        "window_key": data.get("window_key"),
+        "hwnd": data.get("hwnd") or (window or {}).get("hwnd"),
+        "pid": (window or {}).get("pid"),
+        "identity_created_at": (window or {}).get("identity_created_at"),
+        "class_name": (window or {}).get("class_name"),
+        "requested": data.get("requested") is True,
+        "confirmed": data.get("confirmed") is True,
+    }
+    if extra:
+        payload.update(extra)
+    return bridge._json_safe(payload)
+
+
+def _window_read_verification(self: "CapabilityBridge", common: dict,
+                              data: dict, operation: str) -> VerificationResult:
+    """Structural validity of a window read.
+
+    A window row is only well-formed if it carries a *usable identity*: a positive
+    handle, a class name, and - critically - a process creation time. Without the
+    creation time the row cannot be verified before it is acted on, so treating it
+    as valid would hand the model a window reference that is unsafe to quote back.
+    """
+    rows = data.get("windows")
+    if operation == "get_window":
+        rows = [data] if data.get("hwnd") is not None else []
+    if not isinstance(rows, list):
+        rows = []
+
+    def _usable(row: object) -> bool:
+        if not isinstance(row, dict):
+            return False
+        try:
+            if int(row.get("hwnd") or 0) <= 0:
+                return False
+            if int(row.get("pid") or -1) < 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return bool(row.get("identity_created_at")) and bool(row.get("class_name"))
+
+    well_formed = all(_usable(row) for row in rows) and bool(rows)
+    evidence = self._json_safe({
+        **common,
+        "count": data.get("count", len(rows)),
+        "returned": len(rows),
+        "anchored": sum(1 for row in rows if isinstance(row, dict)
+                        and row.get("anchored")),
+        "well_formed": well_formed,
+    })
+    return VerificationResult(
+        VerificationState.PASSED if well_formed else VerificationState.UNVERIFIED,
+        "Window metadata was structurally valid and every window carried a "
+        "process-anchored identity."
+        if well_formed else
+        "No well-formed, process-anchored window metadata was returned.",
+        "tool_observation",
+        evidence,
+    )
+
+
+def _verify_window_focus(self: "CapabilityBridge", common: dict,
+                         data: dict) -> VerificationResult:
+    """Focus passes only when the window is actually the foreground window.
+
+    Windows may refuse activation for a process that is not already foreground.
+    That refusal is not a failure of the request - the user is in another
+    application - so it is reported as not-confirmed with the observed foreground
+    window named, rather than as a pass and not as an error.
+    """
+    window = data.get("window") if isinstance(data.get("window"), dict) else {}
+    foreground = window.get("foreground") is True
+    evidence = _window_evidence(self, common, data, window,
+                                {"foreground_observed": foreground})
+    if not data.get("requested"):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The focus request was refused by Windows; no activation occurred.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED if foreground else VerificationState.FAILED,
+        "The target window became the foreground window."
+        if foreground else
+        "Activation was requested but the target window is not the foreground "
+        "window. Windows commonly refuses activation while the user is "
+        "interacting with another application.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_window_minimize(self: "CapabilityBridge", common: dict,
+                            data: dict) -> VerificationResult:
+    """Minimize passes only when the re-read window reports minimized."""
+    window = data.get("window") if isinstance(data.get("window"), dict) else {}
+    minimized = window.get("minimized") is True
+    evidence = _window_evidence(self, common, data, window,
+                                {"minimized_observed": minimized})
+    return VerificationResult(
+        VerificationState.PASSED if minimized else VerificationState.FAILED,
+        "The target window is minimized."
+        if minimized else
+        "The minimize was requested but the window is not minimized.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_window_restore(self: "CapabilityBridge", common: dict,
+                            data: dict) -> VerificationResult:
+    """Restore passes only when the window is no longer minimized and visible."""
+    window = data.get("window") if isinstance(data.get("window"), dict) else {}
+    visible = window.get("visible") is True
+    not_minimized = window.get("minimized") is False
+    evidence = _window_evidence(self, common, data, window, {
+        "visible_observed": visible, "minimized_observed": not_minimized,
+    })
+    return VerificationResult(
+        VerificationState.PASSED if (visible and not_minimized)
+        else VerificationState.FAILED,
+        "The target window is visible and not minimized."
+        if (visible and not_minimized) else
+        "The restore was requested but the window is still minimized or hidden.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_window_close(self: "CapabilityBridge", common: dict,
+                         data: dict) -> VerificationResult:
+    """Close passes only when the window is gone.
+
+    ``PostMessage(WM_CLOSE)`` merely queues a message. An application can defer
+    it, prompt the user, or ignore it, and the handle can survive while the window
+    is no longer visible - which is not closure. So this checks disappearance,
+    not visibility.
+    """
+    confirmed = data.get("confirmed") is True
+    requested = data.get("requested") is True
+    window = data.get("window") if isinstance(data.get("window"), dict) else None
+    evidence = _window_evidence(self, common, data, window, {"window_present": window is not None})
+    if not requested:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "No close message was posted; nothing to verify.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED if confirmed else VerificationState.FAILED,
+        "The window was destroyed."
+        if confirmed else
+        "A close request was posted but the window still exists. The "
+        "application may have deferred or refused the close.",
+        "capability_execution", evidence,
+    )
+
+
+_WindowLifecycleVerifier = Callable[["CapabilityBridge", dict, dict], VerificationResult]
+
+#: Dispatch table, so the verifier for a verb is chosen by declared membership
+#: rather than by an ``if`` chain that could drift from
+#: :data:`_MUTATING_OPERATIONS`.
+_WINDOW_LIFECYCLE_VERIFIERS: dict[str, _WindowLifecycleVerifier] = {
+    "window_focus": _verify_window_focus,
+    "window_minimize": _verify_window_minimize,
+    "window_restore": _verify_window_restore,
+    "window_close": _verify_window_close,
+}
 
 
 class CapabilityBridge:
@@ -467,6 +650,18 @@ class CapabilityBridge:
                 "tool_observation",
                 evidence,
             )
+
+        # M2.16 window reads: structural validity of the returned rows.
+        if operation in ("list_windows", "get_window"):
+            return _window_read_verification(self, common, data, operation)
+
+        # M2.16 window lifecycle mutations. Verification is of *observed state*,
+        # never of an API return code: `ShowWindow` returns before the window has
+        # moved, and `SetForegroundWindow` can be refused outright while still
+        # reporting success. Each verb therefore checks the specific property it
+        # was asked to change.
+        if operation in _WINDOW_LIFECYCLE_VERIFIERS:
+            return _WINDOW_LIFECYCLE_VERIFIERS[operation](self, common, data)
 
         # list / get / find: structural validity of the returned rows.
         rows = data.get("processes")

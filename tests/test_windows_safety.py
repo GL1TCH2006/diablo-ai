@@ -58,13 +58,32 @@ def layer():
 
 
 class TestTheOperationSurfaceIsClosed:
-    def test_the_operations_are_exactly_the_five_documented_ones(self):
-        assert WINDOWS_OPERATIONS == ("list", "get", "find", "system_info", "terminate")
+    def test_the_operations_are_exactly_the_documented_ones(self):
+        # M2.16 took the surface from five to eleven. Enumerated rather than
+        # counted, because the property under test is that the set is known and
+        # deliberate, not that it has some length.
+        assert WINDOWS_OPERATIONS == (
+            "list", "get", "find", "system_info",
+            "list_windows", "get_window",
+            "terminate",
+            "window_focus", "window_minimize", "window_restore", "window_close",
+        )
 
-    def test_terminate_is_the_only_mutating_operation(self):
-        assert _MUTATING_OPERATIONS == frozenset({"terminate"}), (
-            "an operation joined the mutating set; it needs a test and a "
-            "permission level like terminate has")
+    def test_every_mutation_is_declared(self):
+        """Nothing joins the mutating set without a test and a permission level.
+
+        The M2.15 wording was "terminate is the only one", which was true then
+        and is not now. The property it guarded is still worth guarding, over all
+        five.
+        """
+        assert _MUTATING_OPERATIONS == frozenset({
+            "terminate", "window_focus", "window_minimize",
+            "window_restore", "window_close",
+        }), (
+            "the mutating set changed; a new mutation needs a test and a "
+            "permission level like the others have")
+        assert _MUTATING_OPERATIONS <= set(WINDOWS_OPERATIONS), (
+            "an operation is declared mutating but is not on the surface")
 
     def test_an_unlisted_operation_is_refused(self):
         """A closed surface: PowerShell could express anything, so the surface
@@ -380,8 +399,19 @@ class TestThePermissionBoundaryIsDeclared:
             assert self._adapter().is_mutating(operation) is False, (
                 f"{operation} was declared mutating; it only reads")
 
-    def test_the_mutating_set_is_exactly_terminate(self):
-        assert self._adapter().mutating_operations == ("terminate",)
+    def test_the_mutating_set_matches_the_layer_declaration(self):
+        """The adapter and the layer must not drift apart.
+
+        Two declarations of one fact is one too many, and a silent drift would
+        mean a mutation classified SAFE at the bridge.
+        """
+        from core.windows.capabilities import _MUTATING_OPERATIONS as layer_set
+
+        assert set(self._adapter().mutating_operations) == set(layer_set)
+        assert self._adapter().mutating_operations == (
+            "terminate", "window_close", "window_focus", "window_minimize",
+            "window_restore",
+        )
 
     def test_an_unknown_operation_is_not_mutating(self):
         assert self._adapter().is_mutating("delete") is False

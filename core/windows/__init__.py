@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from .capabilities import (
     MAX_PROCESS_RESULTS,
+    MAX_WINDOW_RESULTS,
+    WINDOW_RESULT_LIMIT,
     WINDOWS_OPERATIONS,
     WindowsCapabilityLayer,
     build_windows_capability,
@@ -49,6 +51,9 @@ from .errors import (
     WindowsProcessGoneError,
     WindowsProcessNotFoundError,
     WindowsProtectedProcessError,
+    WindowsWindowGoneError,
+    WindowsWindowIdentityMismatchError,
+    WindowsWindowNotFoundError,
     register_with_contract_layer,
     windows_error_status_table,
 )
@@ -62,6 +67,8 @@ from .models import (
 )
 from .processes import ProcessLayer
 from .system import SystemLayer, read_memory, read_system_info, system_available
+from .window_models import WindowIdentity, WindowInfo
+from .windows import WINDOW_LIFECYCLE_OPERATIONS, WindowLayer, windows_available
 
 #: Register the Windows error vocabulary with the cross-layer contract at import.
 #: Done from this side (core) on purpose: the contract module must not import
@@ -70,16 +77,23 @@ register_with_contract_layer()
 
 __all__ = [
     "WINDOWS_OPERATIONS",
+    "WINDOW_LIFECYCLE_OPERATIONS",
     "MAX_PROCESS_RESULTS",
+    "MAX_WINDOW_RESULTS",
+    "WINDOW_RESULT_LIMIT",
     "WindowsCapabilityLayer",
     "build_windows_capability",
     "ProcessLayer",
     "SystemLayer",
+    "WindowLayer",
+    "windows_available",
     "ProcessInfo",
     "TerminationResult",
     "SystemInfo",
     "MemoryInfo",
     "CpuInfo",
+    "WindowInfo",
+    "WindowIdentity",
     "process_identity",
     "read_memory",
     "read_system_info",
@@ -93,5 +107,8 @@ __all__ = [
     "WindowsCancelledError",
     "WindowsInvalidRequestError",
     "WindowsOperationFailedError",
+    "WindowsWindowNotFoundError",
+    "WindowsWindowGoneError",
+    "WindowsWindowIdentityMismatchError",
     "windows_error_status_table",
 ]

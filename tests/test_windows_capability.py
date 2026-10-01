@@ -243,7 +243,15 @@ class _StubLayer:
 
 class TestCapabilitySurface:
     def test_the_operation_set_is_closed(self):
-        assert WINDOWS_OPERATIONS == ("list", "get", "find", "system_info", "terminate")
+        # M2.16 extended the surface from five to eleven. Enumerated explicitly
+        # rather than counted: the point of this test is that the set is known and
+        # deliberate, so a future addition has to be a conscious edit here.
+        assert WINDOWS_OPERATIONS == (
+            "list", "get", "find", "system_info",
+            "list_windows", "get_window",
+            "terminate",
+            "window_focus", "window_minimize", "window_restore", "window_close",
+        )
 
     def test_the_adapter_advertises_what_the_layer_offers(self):
         adapter = WindowsCapabilityAdapter(_StubLayer(("list", "get")))
@@ -258,11 +266,28 @@ class TestCapabilitySurface:
         assert capabilities["operations"] == []
 
     def test_terminate_is_the_only_mutating_operation(self):
+        """M2.16 renamed for what it now asserts: every mutation is declared.
+
+        The original intent was that nothing could join the mutating set without a
+        permission level and a test. That intent is stronger now that there are
+        five mutating operations rather than one, so it is asserted over all of
+        them: each is declared, each is SENSITIVE, and no read is.
+        """
+        from config.permissions import PermissionLevel
+
         adapter = WindowsCapabilityAdapter(_StubLayer())
         assert adapter.is_mutating("terminate") is True
-        for op in ("list", "get", "find", "system_info"):
-            assert adapter.is_mutating(op) is False
-        assert adapter.mutating_operations == ("terminate",)
+        for op in ("window_focus", "window_minimize", "window_restore",
+                    "window_close"):
+            assert adapter.is_mutating(op) is True, f"{op} was not declared mutating"
+        for op in ("list", "get", "find", "system_info", "list_windows",
+                   "get_window"):
+            assert adapter.is_mutating(op) is False, f"{op} was declared mutating"
+        assert adapter.mutating_operations == (
+            "terminate", "window_close", "window_focus", "window_minimize",
+            "window_restore",
+        )
+        _ = PermissionLevel
 
     def test_unsupported_operation_is_refused_before_any_native_call(self):
         from integration.contracts import CapabilityRequest

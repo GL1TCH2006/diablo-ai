@@ -53,6 +53,9 @@ __all__ = [
     "WindowsInvalidRequestError",
     "WindowsOperationFailedError",
     "WindowsProtectedProcessError",
+    "WindowsWindowGoneError",
+    "WindowsWindowIdentityMismatchError",
+    "WindowsWindowNotFoundError",
     "windows_error_status_table",
 ]
 
@@ -136,6 +139,45 @@ class WindowsCancelledError(WindowsError):
     message = "The Windows operation was cancelled."
 
 
+class WindowsWindowNotFoundError(WindowsError):
+    """No window matches the supplied identity.
+
+    M2.16. Distinct from a destroyed window: the identity simply names nothing
+    that exists now. It is a caller error in the sense that the reference is
+    stale, and it is reported separately so the model can be told "that window is
+    gone" rather than "something went wrong".
+    """
+
+    code = "window_not_found"
+    message = "No window matches the supplied window identity."
+
+
+class WindowsWindowGoneError(WindowsError):
+    """The window existed but was destroyed before the operation completed.
+
+    M2.16. The race that makes desktop automation dangerous: enumeration returns
+    a window, and by the time the action is dispatched the user has closed it.
+    Reported as its own outcome rather than silently succeeding.
+    """
+
+    code = "window_gone"
+    message = "The window was destroyed before the operation completed."
+
+
+class WindowsWindowIdentityMismatchError(WindowsError):
+    """The handle now refers to a different window than the one requested.
+
+    M2.16. This is the handle-reuse outcome, and the single most important refusal
+    in the desktop layer: the caller asked to act on one window and the handle has
+    since been recycled to an unrelated one. Acting anyway would mean closing or
+    focusing something the user never named.
+    """
+
+    code = "window_identity_mismatch"
+    message = ("The window handle now refers to a different window than the one "
+               "requested.")
+
+
 class WindowsInvalidRequestError(WindowsError):
     """Caller-attributable bad input."""
 
@@ -173,6 +215,14 @@ windows_error_status_table: dict[str, str] = {
     # without inventing a new CapabilityStatus the ratified vocabulary does not
     # have.
     WindowsProcessGoneError.code: "failure",
+    # M2.16 window outcomes. A stale identity is a caller error (the reference
+    # named nothing that exists), a destroyed window and a recycled handle are
+    # real races, and all three are reported as failures with their own stable
+    # codes so a "that window is gone" is never flattened into "something went
+    # wrong".
+    WindowsWindowNotFoundError.code: "invalid_request",
+    WindowsWindowGoneError.code: "failure",
+    WindowsWindowIdentityMismatchError.code: "invalid_request",
     WindowsOperationFailedError.code: "failure",
     WindowsError.code: "failure",
 }

@@ -63,21 +63,53 @@ from .errors import (
 )
 from .processes import ProcessLayer
 from .system import SystemLayer, system_available
+from .window_models import WindowIdentity
+from .windows import WindowLayer, windows_available
 
 log = get_logger("windows.capabilities")
 
-__all__ = ["WindowsCapabilityLayer", "WINDOWS_OPERATIONS", "build_windows_capability"]
+__all__ = ["WindowsCapabilityLayer", "WINDOWS_OPERATIONS", "build_windows_capability",
+           "MAX_WINDOW_RESULTS", "WINDOW_RESULT_LIMIT"]
 
 #: The complete, closed set of operations the model may request. Anything not in
 #: here is refused by the adapter before any native call is attempted.
-WINDOWS_OPERATIONS = ("list", "get", "find", "system_info", "terminate")
+#:
+#: M2.16 added the ``window_*`` reads and the four lifecycle verbs. The lifecycle
+#: verbs change what the user sees and are therefore in
+#: :data:`_MUTATING_OPERATIONS`, which is what the bridge reads to escalate them
+#: to an explicit confirmation.
+WINDOWS_OPERATIONS = (
+    # process and system queries (M2.15)
+    "list", "get", "find", "system_info",
+    # window queries (M2.16)
+    "list_windows", "get_window",
+    # mutations (M2.15 process, M2.16 window)
+    "terminate",
+    "window_focus", "window_minimize", "window_restore", "window_close",
+)
 
 #: Operations that change machine state. Everything else is a query.
-_MUTATING_OPERATIONS = frozenset({"terminate"})
+#:
+#: This set is the single authority for mutation classification. The bridge reads
+#: it through the adapter's ``is_mutating``; nothing anywhere else decides
+#: mutation from an operation's name.
+_MUTATING_OPERATIONS = frozenset({
+    "terminate",
+    "window_focus",
+    "window_minimize",
+    "window_restore",
+    "window_close",
+})
 
 #: Upper bound on returned processes, so one call cannot flood the context.
 MAX_PROCESS_RESULTS = 200
 DEFAULT_RESULT_LIMIT = 50
+
+#: Same reasoning for windows. A desktop carries hundreds of helper windows, so
+#: an unbounded enumeration would push a very large list into a model context for
+#: no benefit.
+MAX_WINDOW_RESULTS = 200
+WINDOW_RESULT_LIMIT = 50
 
 
 class WindowsCapabilityLayer:
@@ -87,9 +119,14 @@ class WindowsCapabilityLayer:
 
     def __init__(self, *, process_layer: ProcessLayer | None = None,
                  system_layer: SystemLayer | None = None,
+                 window_layer: WindowLayer | None = None,
                  default_timeout: float = 5.0) -> None:
         self._processes = process_layer or ProcessLayer(default_timeout=default_timeout)
         self._system = system_layer or SystemLayer()
+        # M2.16. Optional so the process/system half still works on a host with
+        # no window APIs at all; the window operations refuse with a typed
+        # layer-unavailable error rather than the whole capability disappearing.
+        self._windows = window_layer
         self._lock = threading.RLock()
         self._correlation = threading.local()
         self._closed = False
@@ -105,13 +142,23 @@ class WindowsCapabilityLayer:
 
         Not a static claim: the native backend is probed, so a machine without
         pywin32 reports ``available: False`` rather than advertising operations
-        that cannot run.
+        that would raise.
+
+        M2.16: window support is reported separately from process support, because
+        they can differ - a host can have the process APIs without the window
+        ones. The operation list reflects that: an unavailable sub-layer's
+        operations are withheld rather than advertised and then refused.
         """
         native = system_available()
+        window_native = windows_available()
+        operations = list(WINDOWS_OPERATIONS) if native else []
+        if native and not window_native:
+            operations = [op for op in operations if not op.startswith("window_")]
         return {
             "available": native,
-            "operations": list(WINDOWS_OPERATIONS) if native else [],
+            "operations": operations,
             "mutating_operations": sorted(_MUTATING_OPERATIONS),
+            "window_available": window_native,
             "backend": "native",
             "detail": ("native Windows APIs via pywin32"
                        if native else "pywin32 is not installed"),
@@ -125,7 +172,7 @@ class WindowsCapabilityLayer:
             return
         self._closed = True
         with self._lock:
-            for layer in (self._processes, self._system):
+            for layer in (self._processes, self._system, self._windows):
                 closer = getattr(layer, "close", None)
                 if callable(closer):
                     try:
@@ -287,6 +334,119 @@ class WindowsCapabilityLayer:
         payload = result.to_dict()
         payload["trusted_request_id"] = self.trusted_request_id()
         return payload
+
+    # ------------------------------------------------------- M2.16 windows
+
+    def _window_layer(self) -> WindowLayer:
+        """The window layer, or a typed refusal that it is unavailable here.
+
+        Separate from ``_guard`` so a host without the window APIs loses only the
+        window operations rather than the whole Windows capability.
+        """
+        layer = getattr(self, "_windows", None)
+        if layer is None:
+            layer = self._windows = WindowLayer(process_layer=self._processes)
+        if not windows_available():
+            raise WindowsNotFoundError(
+                "Native window APIs are unavailable on this host.")
+        return layer
+
+    def list_windows(self, limit: int = WINDOW_RESULT_LIMIT,
+                     visible_only: bool = False,
+                     include_untitled: bool = True,
+                     pid: Any = None,
+                     title_contains: str = "",
+                     **_ignored: Any) -> dict:
+        """Enumerate top-level windows, optionally filtered.
+
+        M2.16. Read-only. Every row carries a :class:`WindowIdentity`, which is
+        what a later lifecycle call has to quote back.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the window query.",
+                diagnostics={"cancellation_terminated": False})
+        cap = self._bounded_limit(limit, MAX_WINDOW_RESULTS)
+        try:
+            found = self._window_layer().enumerate_windows(
+                visible_only=bool(visible_only),
+                include_untitled=bool(include_untitled),
+                pid=self._window_layer()._coerce_pid(pid),
+                title_contains=str(title_contains or ""),
+                cancelled=self._cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        rows = [w.to_dict() for w in found[:cap]]
+        payload = {
+            "windows": rows,
+            "count": len(rows),
+            "total_found": len(found),
+            "truncated": len(found) > len(rows),
+            "trusted_request_id": self.trusted_request_id(),
+        }
+        return payload
+
+    def get_window(self, window: Any = None, **_ignored: Any) -> dict:
+        """Re-read one window and prove it is the one the identity names.
+
+        M2.16. This is the verification primitive every lifecycle verb relies on.
+        It raises rather than returning a mismatched window, so a caller cannot
+        act on a recycled handle by skipping the check.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the window query.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            info = self._window_layer().get_window(window, cancelled=self._cancelled)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        payload = dict(info.to_dict())
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
+
+    def _window_mutation(self, method: str, window: Any, **kwargs: Any) -> dict:
+        """Shared shape for the four lifecycle verbs.
+
+        Preflight cancellation, then the caller's own verify-then-act-then-re-read
+        sequence, which is where the identity check lives. The cancellation token
+        reaches the poll loops inside those methods through ``self._cancelled``.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the window operation.",
+                diagnostics={"cancellation_terminated": False})
+        layer = self._window_layer()
+        try:
+            payload = getattr(layer, method)(window, cancelled=self._cancelled,
+                                            **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
+
+    def window_focus(self, window: Any = None, **_ignored: Any) -> dict:
+        """Bring a window to the foreground. Mutating."""
+        return self._window_mutation("focus_window", window)
+
+    def window_minimize(self, window: Any = None, **_ignored: Any) -> dict:
+        """Minimize a window. Mutating."""
+        return self._window_mutation("minimize_window", window)
+
+    def window_restore(self, window: Any = None, **_ignored: Any) -> dict:
+        """Restore a window. Mutating."""
+        return self._window_mutation("restore_window", window)
+
+    def window_close(self, window: Any = None, **_ignored: Any) -> dict:
+        """Close a window and confirm it went away. Mutating."""
+        return self._window_mutation("close_window", window)
 
     # ---------------------------------------------------------------- utils
 
