@@ -347,11 +347,27 @@ class TestRealLifecycleVerbs:
 
     def test_a_refused_activation_is_reported_rather_than_raised(self, layer,
                                                                 app_window):
-        """Windows returning FALSE is a normal outcome, not an error."""
+        """Windows refusing activation is a normal outcome, not an error.
+
+        It refuses in two ways - a FALSE return, or an exception carrying no
+        winerror while the foreground lock is held - and both must be *reported*.
+        Turning the second into a hard error would make routine desktop behaviour
+        look like an infrastructure failure.
+        """
         result = layer.focus_window(app_window.identity)
         assert result["requested"] is True
         assert result["activated"] in (True, False)
         assert isinstance(result["confirmed"], bool)
+
+        # ``confirmed`` tracks the *observed* foreground state, which is allowed to
+        # disagree with Windows' own return: BringWindowToTop may have activated
+        # the window even where SetForegroundWindow declined. The observation is
+        # authoritative, so that disagreement is correct rather than a bug.
+        if result.get("refused"):
+            assert result["confirmed"] is False, (
+                "an activation Windows refused was reported as confirmed")
+        assert result["confirmed"] == result["foreground"], (
+            "the two focus signals disagree about what was observed")
         _restore_foreground(layer)
 
     def test_close_is_observed_as_gone(self, layer, app_window):

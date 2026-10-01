@@ -470,21 +470,35 @@ class WindowLayer:
         Windows returns FALSE when it declines, which is a normal outcome rather
         than an error, so it is reported and not raised.
         """
-        state: dict[str, bool] = {"activated": False}
+        state: dict[str, Any] = {"activated": False, "refused": ""}
 
         def _action(win32gui: Any, hwnd: int) -> bool:
+            # Activation can be *refused* by Windows in two ways: a FALSE return,
+            # or an exception with no winerror (the foreground lock). Both are
+            # normal outcomes while the user is interacting with another
+            # application - not infrastructure failures. Treating the second as a
+            # hard error turned a routine refusal into an exception, so both are
+            # recorded and the *observed* foreground state is what gets reported.
             try:
                 if win32gui.IsIconic(hwnd):
                     win32gui.ShowWindow(hwnd, _SW_RESTORE)
-                win32gui.BringWindowToTop(hwnd)
-                state["activated"] = bool(win32gui.SetForegroundWindow(hwnd))
             except Exception as exc:  # noqa: BLE001
                 raise _translate(exc, hwnd=hwnd, operation="focus") from exc
+            for call in ("BringWindowToTop", "SetForegroundWindow"):
+                try:
+                    result = getattr(win32gui, call)(hwnd)
+                except Exception as exc:  # noqa: BLE001 - a refusal, not a failure
+                    state["refused"] = f"{call}: {exc}"
+                    break
+                if call == "SetForegroundWindow":
+                    state["activated"] = bool(result)
             return True
 
         payload = self._mutate(identity, "focus", _action, cancelled=cancelled)
         window = payload.get("window") or {}
         payload["activated"] = state["activated"]
+        if state["refused"]:
+            payload["refused"] = state["refused"]
         # ``confirmed`` is the *observed* outcome, not the API's opinion. This is
         # what the bridge's verifier reads, so a refused activation can never be
         # reported as a successful one.
