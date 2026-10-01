@@ -22,6 +22,11 @@ from .errors import BlenderVisionError
 #: lazily-safe: `blender` is a leaf package with no dependency on `integration`.
 from blender.operations import OPERATION_NAMES as BLENDER_OPERATION_NAMES
 
+#: The operations the shipped deterministic Vision backend implements. Used as
+#: the advertised floor when a layer offers no discovery hook, so the model is
+#: never shown an operation no available backend can service (M2.14.1).
+VISION_FALLBACK_OPERATIONS = ("compare", "describe", "inspect_render")
+
 #: Stable error code -> capability status.
 #:
 #: Exact code matching only. Infrastructure outcomes (missing executable, denied
@@ -614,6 +619,37 @@ class CapabilityRegistry:
         )
 
 
+def register_status_codes(mapping: dict[str, str | CapabilityStatus]) -> int:
+    """Extend the exact-match error-code -> status table.
+
+    M2.15. A capability layer that lives *outside* this package - the native
+    Windows layer is S1 core, and ``test_contract_module_has_no_s1_core_dependency``
+    correctly forbids this module from importing it - registers its own codes
+    here, at construction time, so the dependency runs core -> integration and
+    never the other way round.
+
+    Only string codes and :class:`CapabilityStatus` values are accepted, and an
+    unknown status is refused. A caller cannot widen the vocabulary by accident.
+
+    Returns the number of codes registered.
+    """
+    added = 0
+    for code, status in (mapping or {}).items():
+        if not isinstance(code, str) or not code:
+            raise ValueError(f"status codes must be non-empty strings, got {code!r}")
+        if isinstance(status, CapabilityStatus):
+            value = status
+        else:
+            try:
+                value = CapabilityStatus(str(status))
+            except ValueError as exc:
+                raise ValueError(
+                    f"unknown CapabilityStatus {status!r} for code {code!r}") from exc
+        _STATUS_BY_ERROR_CODE[code] = value
+        added += 1
+    return added
+
+
 class _LayerAdapter:
     name = "layer"
     _operations: tuple[str, ...] = ()
@@ -638,10 +674,15 @@ class _LayerAdapter:
                     details = {"available": False, "error": str(exc)}
             else:
                 details = {"available": True}
-        return {"name": self.name, "operations": list(self._operations), **details}
+        return {"name": self.name, "operations": list(self._operations_for_layer()), **details}
+
+    def _operations_for_layer(self) -> tuple[str, ...]:
+        """Operations this adapter advertises. Overridden where the truth is
+        discovered from the layer rather than fixed by the protocol."""
+        return self._operations
 
     def can_execute(self, operation: str) -> bool:
-        return operation in self._operations
+        return operation in self._operations_for_layer()
 
     def _dispatch(self, operation: str, params: dict) -> Any:
         method = getattr(self.layer, operation)
@@ -779,10 +820,110 @@ class BlenderCapabilityAdapter(_LayerAdapter):
 
 class VisionCapabilityAdapter(_LayerAdapter):
     name = "vision"
+
+    #: The protocol ceiling: every operation the Vision contract defines. This
+    #: is the upper bound, not the answer - three of these cannot be serviced by
+    #: any shipped backend, and advertising them is what M2.14.1 removed.
     _operations = (
-        "validate_image", "inspect", "inspect_render", "describe", "detect_objects", "compare",
-        "extract_text", "analyze_ui",
+        "validate_image", "inspect", "inspect_render", "describe", "detect_objects",
+        "compare", "extract_text", "analyze_ui",
     )
+
+    #: Operations the layer serves itself, with no backend involved.
+    #: ``validate_image`` reads the file header and ``inspect`` runs the
+    #: deterministic inspector directly, so both work on a machine with no
+    #: backend at all. They must not be filtered away by backend discovery.
+    _LAYER_NATIVE = ("validate_image", "inspect")
+
+    def _operations_for_layer(self) -> tuple[str, ...]:
+        """Advertise exactly what the bound layer can actually do right now.
+
+        M2.14.1. The advertised list used to be the fixed protocol tuple of eight
+        names. Three of them - ``detect_objects``, ``extract_text`` and
+        ``analyze_ui`` - have no shipped backend, so every call raised: the model
+        was offered tools that could only fail.
+
+        Having a method is not sufficient to advertise it. The layer defines all
+        eight, because the protocol requires it to, and those three dispatch
+        straight to ``_run``, which then finds no backend and raises. So an
+        operation is advertised only when
+
+        * the layer genuinely implements it, **and**
+        * it is layer-native, or a registered backend currently supports it.
+
+        Backend support is read from the layer itself rather than restated here,
+        so registering a new backend needs no change to this file.
+        """
+        native = [op for op in self._LAYER_NATIVE
+                  if callable(getattr(self.layer, op, None))]
+
+        served = [
+            op for op in self._operations
+            if op not in native
+            and callable(getattr(self.layer, op, None))
+            and self._layer_supports(op)
+        ]
+
+        merged = list(dict.fromkeys(native + served))
+        return tuple(merged) if merged else VISION_FALLBACK_OPERATIONS
+
+    def _layer_supports(self, operation: str) -> bool:
+        """Ask the layer whether a registered backend can serve ``operation``."""
+        supported = getattr(self.layer, "is_operation_supported", None)
+        if callable(supported):
+            try:
+                return bool(supported(operation))
+            except Exception:  # noqa: BLE001 - discovery is isolated
+                return False
+        detector = getattr(self.layer, "detect_capabilities", None)
+        if callable(detector):
+            try:
+                details = detector() or {}
+            except Exception:  # noqa: BLE001 - discovery is isolated
+                return False
+            reported = details.get("supported_operations")
+            if isinstance(reported, (list, tuple)):
+                return operation in {str(op) for op in reported}
+        return False
+
+
+class WindowsCapabilityAdapter(_LayerAdapter):
+    """Adapter for the M2.15 native Windows systems layer.
+
+    Sits beside the Blender and Vision adapters and uses the same
+    :meth:`_LayerAdapter.execute`, so the trusted ``request_id``, the cancellation
+    token and the status vocabulary all arrive by the existing path. Nothing here
+    re-implements any of it.
+
+    The operation list is discovered from the layer rather than restated, so a
+    machine without pywin32 advertises no operations instead of advertising ones
+    that would raise.
+    """
+
+    name = "windows"
+
+    #: Operations that change machine state. Declared here so the bridge can
+    #: escalate exactly these to an explicit confirmation, which is what stops a
+    #: model escalating from a query to a process-control primitive.
+    _MUTATING = frozenset({"terminate"})
+
+    def _operations_for_layer(self) -> tuple[str, ...]:
+        operations = getattr(self.layer, "operations", None)
+        if callable(operations):
+            try:
+                found = operations()
+            except Exception:  # noqa: BLE001 - discovery is isolated
+                found = None
+            if isinstance(found, (list, tuple)) and found:
+                return tuple(str(op) for op in found)
+        return ()
+
+    def is_mutating(self, operation: str) -> bool:
+        return operation in self._MUTATING
+
+    @property
+    def mutating_operations(self) -> tuple[str, ...]:
+        return tuple(sorted(self._MUTATING))
 
 
 class BlenderVisionCapabilityAdapter(_LayerAdapter):

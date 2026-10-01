@@ -221,6 +221,31 @@ class _Blender:
 
 
 class _Vision:
+    """A double for the Vision layer that models the real one's discovery.
+
+    ``VisionCapabilityLayer`` answers ``is_operation_supported`` by asking its
+    registered backends, and M2.14.1 made the adapter depend on that answer: an
+    operation is advertised only if the layer implements it *and* a backend
+    serves it. A double with no such method therefore advertises nothing
+    backend-routed, which is not how the real layer behaves.
+
+    The three operations with no shipped backend (``detect_objects``,
+    ``extract_text``, ``analyze_ui``) are deliberately absent here, so this
+    double reports the same five the production layer does.
+    """
+
+    _BACKEND_OPERATIONS = ("inspect_render", "describe", "compare")
+
+    def is_operation_supported(self, operation):
+        return operation in self._BACKEND_OPERATIONS
+
+    def detect_capabilities(self):
+        return {
+            "vision_available": True,
+            "available_backends": ["test"],
+            "supported_operations": list(self._BACKEND_OPERATIONS),
+        }
+
     def inspect_render(self, image_path, context=None):
         return {"path": str(image_path), "valid": True, "checks": {"dimensions": True}}
 
@@ -325,13 +350,19 @@ def test_production_capability_runtime_registers_s28_adapter(tmp_settings):
     bus = EventBus()
     runtime = build_capability_runtime(tmp_settings, bus)
     try:
-        capability_registry, integration, blender, workflow = runtime
+        # M2.15 added the native Windows layer to the production runtime, so the
+        # factory returns a fifth element. The other four keep their order.
+        capability_registry, integration, blender, workflow, windows = runtime
         adapter = capability_registry.get("blender_vision_workflow")
         assert isinstance(adapter, BlenderVisionWorkflowCapabilityAdapter)
         assert adapter.can_execute("render_and_verify")
         assert adapter.workflow is workflow
         assert workflow.integration is integration
         assert blender is not None
+        assert capability_registry.get("windows") is not None, (
+            "the M2.15 Windows capability must be registered in production")
+        if windows is not None:
+            assert windows.detect_capabilities()["available"] is True
         tools = build_registry(tmp_settings, capability_registry, bus)
         capability_tool = tools.get("capability.execute")
         assert capability_tool is not None

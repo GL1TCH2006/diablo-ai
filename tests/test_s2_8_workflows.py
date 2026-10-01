@@ -609,7 +609,7 @@ def _production_same_task_scenario(tmp_path, cancel_label):
         allowed_roots=[tmp_path],
     )
     bus = EventBus()
-    capability_registry, integration, blender, workflow = build_capability_runtime(settings, bus)
+    capability_registry, integration, blender, workflow, windows = build_capability_runtime(settings, bus)
     fake = BlockingWorkflowIntegration()
     workflow._integration = fake
     try:

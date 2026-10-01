@@ -228,6 +228,16 @@ def compare_images(path_a: str | Path, path_b: str | Path, threshold: float = 0.
 
     Returns structured difference metrics without ML.
     Requires Pillow + numpy.
+
+    ``diff_ratio`` is the fraction of **pixels** whose maximum per-channel
+    deviation exceeds ``threshold``, so it is always in ``[0.0, 1.0]``.
+
+    The previous implementation counted array *elements* above the threshold and
+    divided by the pixel count. For an RGB image that made the numerator up to
+    three times the denominator, so ``diff_ratio`` ranged to 3.0 while callers
+    gated on ``diff_ratio <= threshold`` with a default of 0.01 - a threshold
+    that was unreachable for any non-identical image. The metric is now defined
+    per pixel, which is what a caller comparing two renders means.
     """
     try:
         from PIL import Image  # type: ignore
@@ -265,10 +275,14 @@ def compare_images(path_a: str | Path, path_b: str | Path, threshold: float = 0.
             mean_diff = float(diff.mean())
             rmse = float(np.sqrt((diff**2).mean()))
 
-            # Pixel difference count above threshold
-            diff_pixels = np.sum(diff > threshold)
-            total_pixels = diff.size // arr_a.shape[2] if arr_a.ndim == 3 else diff.size
-            diff_ratio = float(diff_pixels / total_pixels)
+            # Collapse channels first, so one pixel counts once however many
+            # channels it has. This is what makes the ratio dimensionless.
+            per_pixel = diff.max(axis=2) if diff.ndim == 3 else diff
+            diff_pixels = int(np.sum(per_pixel > threshold))
+            total_pixels = int(per_pixel.size)
+            diff_ratio = float(diff_pixels / total_pixels) if total_pixels else 0.0
+            if diff_ratio > 1.0:  # unreachable by construction; asserted by test
+                diff_ratio = 1.0
 
             return to_json_safe({
                 "success": True,
@@ -276,9 +290,12 @@ def compare_images(path_a: str | Path, path_b: str | Path, threshold: float = 0.
                 "max_pixel_diff": round(max_diff, 4),
                 "mean_pixel_diff": round(mean_diff, 4),
                 "rmse": round(rmse, 4),
-                "pixels_above_threshold": int(diff_pixels),
+                "channels": int(arr_a.shape[2]) if arr_a.ndim == 3 else 1,
+                "pixels_above_threshold": diff_pixels,
+                "total_pixels": total_pixels,
                 "diff_ratio": round(diff_ratio, 4),
                 "threshold": threshold,
+                "similar": diff_ratio <= threshold,
                 "dimensions": list(img_a.size),
             })
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""S2.3 Blender–Vision integration foundation."""
+"""S2.3 Blenderâ€“Vision integration foundation."""
 
 from .capabilities import BlenderVisionIntegration, create_blender_vision_integration
 from .errors import (
@@ -25,8 +25,9 @@ from .contracts import (
     CapabilityResult,
     CapabilityStatus,
     CoreEventBusPublisher,
-    MockCapability,
+MockCapability,
     VisionCapabilityAdapter,
+    WindowsCapabilityAdapter,
 )
 from .protocol import (
     BlenderLayerProtocol,
@@ -76,6 +77,7 @@ __all__ = [
     "CoreEventBusPublisher",
     "BlenderCapabilityAdapter",
     "VisionCapabilityAdapter",
+    "WindowsCapabilityAdapter",
     "BlenderVisionCapabilityAdapter",
     "MockCapability",
     "BlenderVisionWorkflow",
@@ -94,3 +96,4 @@ __all__ = [
     "create_blender_vision_workflow",
     "create_scene_workflow",
 ]
+

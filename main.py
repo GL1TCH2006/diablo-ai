@@ -13,7 +13,7 @@ def build_confirmer_from(ui):
     return ui.confirmer
 
 
-def close_capability_runtime(workflow, integration, blender) -> None:
+def close_capability_runtime(workflow, integration, blender, windows=None) -> None:
     try:
         if workflow is not None:
             workflow.close()
@@ -22,8 +22,11 @@ def close_capability_runtime(workflow, integration, blender) -> None:
             if integration is not None:
                 integration.close()
         finally:
-            if blender is not None:
-                blender.close()
+            try:
+                if blender is not None:
+                    blender.close()
+            finally:
+                close_windows(windows)
 
 
 def build_capability_runtime(settings, events):
@@ -36,12 +39,14 @@ def build_capability_runtime(settings, events):
         BlenderVisionWorkflowCapabilityAdapter,
         CapabilityRegistry,
         VisionCapabilityAdapter,
+        WindowsCapabilityAdapter,
     )
     from vision.capabilities import VisionCapabilityLayer
 
     blender = None
     integration = None
     workflow = None
+    windows = None
     try:
         blender = BlenderCapabilityLayer(work_dir=settings.data_dir / "blender")
         vision = VisionCapabilityLayer()
@@ -52,10 +57,36 @@ def build_capability_runtime(settings, events):
         capability_registry.register(BlenderCapabilityAdapter(blender))
         capability_registry.register(VisionCapabilityAdapter(vision))
         capability_registry.register(BlenderVisionWorkflowCapabilityAdapter(workflow))
-        return capability_registry, integration, blender, workflow
+        # M2.15: the native Windows systems layer. Registered last and guarded,
+        # because a host without pywin32 must still get every other capability
+        # rather than losing the whole runtime.
+        try:
+            from core.windows.capabilities import build_windows_capability
+
+            windows = build_windows_capability()
+            if windows.detect_capabilities().get("available"):
+                capability_registry.register(WindowsCapabilityAdapter(windows))
+            else:
+                close_windows(windows)
+                windows = None
+        except Exception as exc:  # noqa: BLE001 - Windows is optional on this host
+            log.warning("native Windows capability unavailable: %s", exc)
+            close_windows(windows)
+            windows = None
+        return capability_registry, integration, blender, workflow, windows
     except Exception:
+        close_windows(windows)
         close_capability_runtime(workflow, integration, blender)
         raise
+
+
+def close_windows(windows) -> None:
+    if windows is None:
+        return
+    try:
+        windows.close()
+    except Exception:  # pragma: no cover - shutdown is best effort
+        pass
 
 
 def main() -> int:
@@ -65,6 +96,9 @@ def main() -> int:
     parser.add_argument("--host", default="", help="Ollama host (overrides OLLAMA_HOST).")
     parser.add_argument("--demo", action="store_true", help="Run the non-interactive Phase 1 verification sequence.")
     parser.add_argument("--demo-phase2", action="store_true", help="Run the non-interactive Phase 2 verification sequence.")
+    parser.add_argument("--companion", action="store_true",
+                        help="Launch the floating companion UI instead of the console UI (M2.14.1). "
+                             "Falls back to the console UI with a message if Tk is unavailable.")
     parser.add_argument("--log-level", default="", help="DEBUG/INFO/WARNING/ERROR")
     args = parser.parse_args()
 
@@ -99,6 +133,7 @@ def main() -> int:
     capability_blender = None
     capability_integration = None
     capability_workflow = None
+    capability_windows = None
     capability_registry = None
     try:
         (
@@ -106,6 +141,7 @@ def main() -> int:
             capability_integration,
             capability_blender,
             capability_workflow,
+            capability_windows,
         ) = build_capability_runtime(settings, bus)
     except Exception as exc:
         log.warning("S2 capability runtime unavailable: %s", exc)
@@ -113,6 +149,7 @@ def main() -> int:
         capability_integration = None
         capability_blender = None
         capability_workflow = None
+        capability_windows = None
 
     registry = build_registry(
         settings,
@@ -165,7 +202,7 @@ def main() -> int:
         )
 
     def close_capabilities():
-        close_capability_runtime(capability_workflow, capability_integration, capability_blender)
+        close_capability_runtime(capability_workflow, capability_integration, capability_blender, capability_windows)
 
     if args.demo:
         try:
@@ -183,6 +220,36 @@ def main() -> int:
 
     agent = make_agent(None)
     project_label = f"{active_project.name} @ {active_project.path}" if active_project else "(none)"
+
+    # M2.14.1: the floating companion now has a product launch path. It is
+    # chosen with --companion, and it falls back to the console UI with an
+    # explicit message rather than starting a process with no interface.
+    if args.companion:
+        from ui.launch import CompanionUnavailable, run_companion_for_agent
+
+        def confirm(tool, description):
+            print(f"[confirm required] {tool}: {description}")
+            try:
+                return input("allow? [y/N] ").strip().lower().startswith("y")
+            except EOFError:
+                return False
+
+        agent.set_confirmer(confirm)
+        try:
+            status = run_companion_for_agent(agent, bus)
+        except CompanionUnavailable as exc:
+            log.warning("companion UI unavailable (%s); falling back to console UI", exc)
+            print(f"[companion unavailable: {exc.reason}] {exc}")
+        else:
+            # Only the success path closes here. A ``finally`` would also close on
+            # the failure path, and the console fallback below would then start
+            # against a torn-down capability runtime - a closed Blender
+            # connection and a released Windows layer - with no error to explain
+            # why every later call fails.
+            close_capabilities()
+            return status
+        # Fall through to the console UI, which still needs a live runtime.
+
     ui = TerminalUI(
         agent=agent,
         bus=bus,
