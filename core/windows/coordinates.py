@@ -39,7 +39,164 @@ from .errors import (
 )
 from .window_models import WindowIdentity
 
-__all__ = ["ScreenPoint", "WindowPoint", "ResolvedPoint", "VirtualScreen"]
+__all__ = [
+    "ScreenPoint", "WindowPoint", "ResolvedPoint", "VirtualScreen",
+    "Rect", "Size", "Point", "require_anchored",
+]
+
+
+# ══════════════════════════════════════════════════════════ geometry
+
+
+@dataclass(frozen=True)
+class Size:
+    """A width and a height, in pixels of one named coordinate space.
+
+    Carries no origin. A size on its own says nothing about *where* it is, which
+    is the same reason :class:`Rect` keeps an explicit origin rather than storing
+    a size and a position separately.
+    """
+
+    width: int
+    height: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {"width": int(self.width), "height": int(self.height)}
+
+
+@dataclass(frozen=True)
+class Point:
+    """An ``(x, y)`` in one named coordinate space."""
+
+    x: int
+    y: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {"x": int(self.x), "y": int(self.y)}
+
+
+@dataclass(frozen=True)
+class Rect:
+    """An axis-aligned rectangle with **exclusive** right and bottom edges.
+
+    This is the Win32 convention (``GetWindowRect``, ``GetMonitorInfo``,
+    ``SM_CXVIRTUALSCREEN``) and getting it wrong is an off-by-one that silently
+    admits a coordinate one pixel outside the region. So it is stated once, here,
+    and every containment test in this codebase agrees:
+
+        width  = right - left
+        height = bottom - top
+        valid: left <= x < right  and  top <= y < bottom
+
+    A 100x100 rectangle therefore contains ``(99, 99)`` and **not** ``(100, 100)``.
+
+    ``is_empty`` is kept separate from ``is_valid`` because Windows can report
+    geometry that is genuinely impossible - a zero or negative extent on a
+    display, or a rectangle whose corners arrive inverted. Those are reported
+    rather than normalised into something plausible: silently "fixing" native
+    state would make a broken configuration look like a working one.
+    """
+
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return int(self.right) - int(self.left)
+
+    @property
+    def height(self) -> int:
+        return int(self.bottom) - int(self.top)
+
+    @property
+    def size(self) -> Size:
+        return Size(width=self.width, height=self.height)
+
+    @property
+    def origin(self) -> Point:
+        return Point(x=int(self.left), y=int(self.top))
+
+    @property
+    def is_empty(self) -> bool:
+        """A rectangle covering no pixels at all."""
+        return self.width <= 0 or self.height <= 0
+
+    @property
+    def is_valid(self) -> bool:
+        """A rectangle covering at least one pixel, with ordered corners."""
+        return (int(self.right) >= int(self.left)
+                and int(self.bottom) >= int(self.top))
+
+    def contains(self, x: int, y: int) -> bool:
+        """Whether a point in the same space lies inside. Exclusive far edges."""
+        return (int(self.left) <= int(x) < int(self.right)
+                and int(self.top) <= int(y) < int(self.bottom))
+
+    def contains_point(self, point: Point) -> bool:
+        return self.contains(point.x, point.y)
+
+    def intersection(self, other: "Rect") -> "Rect | None":
+        """The overlapping region, or ``None`` when they do not overlap.
+
+        Returns ``None`` rather than a zero-size rectangle so that "these do not
+        overlap" cannot be mistaken for "they overlap at exactly one pixel".
+        """
+        left = max(int(self.left), int(other.left))
+        top = max(int(self.top), int(other.top))
+        right = min(int(self.right), int(other.right))
+        bottom = min(int(self.bottom), int(other.bottom))
+        if right <= left or bottom <= top:
+            return None
+        return Rect(left=left, top=top, right=right, bottom=bottom)
+
+    def offset(self, dx: int, dy: int) -> "Rect":
+        """The same rectangle translated within its own coordinate space.
+
+        Named rather than done with a helper elsewhere so that translating a
+        *monitor-relative* rectangle into *screen* coordinates is a visible,
+        greppable conversion and not an arithmetic trick performed inline.
+        """
+        return Rect(left=int(self.left) + int(dx), top=int(self.top) + int(dy),
+                    right=int(self.right) + int(dx),
+                    bottom=int(self.bottom) + int(dy))
+
+    def translated_from(self, origin: "Rect | Point | tuple[int, int]") -> "Rect":
+        """This rectangle re-expressed relative to another rectangle's origin.
+
+        The inverse of :meth:`offset`, and the only sanctioned way to turn
+        monitor-relative geometry into screen geometry. Going through one named
+        function is what stops a relative coordinate being *reused* as an absolute
+        one - the provenance laundering M2.16.2 exists to prevent.
+        """
+        if isinstance(origin, Rect):
+            dx, dy = int(origin.left), int(origin.top)
+        elif isinstance(origin, Point):
+            dx, dy = int(origin.x), int(origin.y)
+        else:
+            dx, dy = int(origin[0]), int(origin[1])
+        return self.offset(-dx, -dy)
+
+    def to_dict(self) -> dict[str, int]:
+        return {"left": int(self.left), "top": int(self.top),
+                "right": int(self.right), "bottom": int(self.bottom),
+                "width": self.width, "height": self.height}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "Rect | None":
+        """Rebuild from the dict form, or ``None`` when it is unusable.
+
+        ``None`` rather than a defaulted rectangle: guessing geometry would put a
+        fabricated region into a capture request.
+        """
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(left=int(data["left"]), top=int(data["top"]),
+                       right=int(data["right"]), bottom=int(data["bottom"]))
+        except (KeyError, TypeError, ValueError):
+            return None
 
 
 @dataclass(frozen=True)
@@ -71,6 +228,18 @@ class VirtualScreen:
         # addressable pixel is ``left + width - 1``; accepting ``left + width``
         # would admit a position Windows clamps back to the edge.
         return (self.left <= x < self.right) and (self.top <= y < self.bottom)
+
+    @property
+    def rect(self) -> Rect:
+        """The same region as a :class:`Rect`, with the same exclusive edges."""
+        return Rect(left=int(self.left), top=int(self.top),
+                    right=int(self.left) + int(self.width),
+                    bottom=int(self.top) + int(self.height))
+
+    @classmethod
+    def from_rect(cls, rect: Rect) -> "VirtualScreen":
+        return cls(left=int(rect.left), top=int(rect.top),
+                   width=int(rect.width), height=int(rect.height))
 
     def to_dict(self) -> dict[str, int]:
         return {"left": self.left, "top": self.top,

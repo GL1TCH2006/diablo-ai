@@ -256,6 +256,8 @@ class TestCapabilitySurface:
             "mouse_move", "mouse_left_click", "mouse_right_click",
             "mouse_double_click",
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
+            "list_displays", "primary_display", "virtual_desktop", "get_display",
+            "point_to_display", "capture_screen",
         )
 
     def test_the_adapter_advertises_what_the_layer_offers(self):
@@ -298,7 +300,7 @@ class TestCapabilitySurface:
             "terminate", "window_close", "window_focus", "window_minimize",
             "window_restore", "mouse_move", "mouse_left_click",
             "mouse_right_click", "mouse_double_click", "key_press",
-            "key_release", "key_tap", "hotkey", "type_text",
+            "key_release", "key_tap", "hotkey", "type_text", "capture_screen",
         })), "the adapter's mutating tuple is not the declared set, sorted"
         _ = PermissionLevel
 

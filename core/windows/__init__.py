@@ -19,10 +19,21 @@ Layout
 
 Scope
 -----
-M2.15 provides **process and system** capability only. Window enumeration, focus,
-screen capture, mouse, keyboard and UI Automation are deliberately absent and
-belong to M2.16; they need a window-ownership model this layer does not yet have.
+M2.15 provided **process and system** capability only. M2.16 added the rest of
+desktop control in four packages, each resting on the one before:
+
+* **M2.16.1** window enumeration, identity and focus;
+* **M2.16.2** target-aware coordinates and pointer input;
+* **M2.16.3** keyboard input;
+* **M2.16.4** display topology and **bounded, explicit** screen capture.
+
+UI Automation, OCR, vision and the autonomous desktop workflows that would build
+on them are deliberately still absent - they belong to M2.16.5 and later.
 ``Agent.resume()`` and cross-restart autonomy are M2.17 and likewise absent.
+
+Screen capture in particular is not surveillance: it requires an explicit target,
+runs only when asked, writes nothing to disk, and hands back metadata rather than
+pixels to anything above the native boundary. See :mod:`core.windows.capture`.
 
 Why it replaces a PowerShell backend rather than sitting beside it
 -----------------------------------------------------------------
@@ -72,6 +83,16 @@ from .coordinates import (
     WindowPoint,
     require_anchored,
 )
+from .capture import CaptureLayer, CaptureTarget, ScreenCapture
+from .displays import (
+    DisplayIdentity,
+    DisplayInfo,
+    DisplayLayer,
+    DisplayNotFoundError,
+    DisplayTarget,
+    displays_available,
+    read_virtual_desktop,
+)
 from .input import CURSOR_TOLERANCE, InputDispatchResult, InputLayer, Keys
 from .processes import ProcessLayer
 from .system import SystemLayer, read_memory, read_system_info, system_available
@@ -103,6 +124,19 @@ __all__ = [
     "ResolvedPoint",
     "VirtualScreen",
     "require_anchored",
+    "Rect",
+    "Size",
+    "Point",
+    "DisplayIdentity",
+    "DisplayInfo",
+    "DisplayLayer",
+    "DisplayTarget",
+    "DisplayNotFoundError",
+    "CaptureLayer",
+    "CaptureTarget",
+    "ScreenCapture",
+    "displays_available",
+    "read_virtual_desktop",
     "windows_available",
     "ProcessInfo",
     "TerminationResult",

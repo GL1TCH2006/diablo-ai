@@ -73,6 +73,9 @@ class TestTheOperationSurfaceIsClosed:
             "mouse_double_click",
             # M2.16.3 keyboard.
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
+            # M2.16.4 display topology and bounded capture.
+            "list_displays", "primary_display", "virtual_desktop", "get_display",
+            "point_to_display", "capture_screen",
         )
 
     def test_every_mutation_is_declared(self):
@@ -88,6 +91,7 @@ class TestTheOperationSurfaceIsClosed:
             "mouse_move", "mouse_left_click", "mouse_right_click",
             "mouse_double_click",
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
+            "capture_screen",
         }), (
             "the mutating set changed; a new mutation needs a test and a "
             "permission level like the others have")
@@ -97,10 +101,29 @@ class TestTheOperationSurfaceIsClosed:
     def test_reading_the_pointer_and_the_foreground_is_not_a_mutation(self):
         """Both only read OS state. Nothing about them needs permission beyond
         the read itself, and classifying them as mutating would make asking where
-        the pointer is a privileged act."""
-        for operation in ("get_cursor_pos", "get_foreground_window"):
+        the pointer is a privileged act.
+
+        The five M2.16.4 display queries are reads too and belong here: knowing
+        what displays exist is not itself privacy-sensitive. Only ``capture_screen``
+        is, and it is asserted separately.
+        """
+        for operation in ("get_cursor_pos", "get_foreground_window",
+                          "list_displays", "primary_display", "virtual_desktop",
+                          "get_display", "point_to_display"):
             assert operation not in _MUTATING_OPERATIONS, (
                 f"{operation} was declared mutating; it only reads")
+
+    def test_a_screen_capture_is_declared_mutating(self):
+        """The one M2.16.4 operation that is privacy-sensitive.
+
+        Screen capture is the first operation in M2.16 that can expose something
+        the user did not intend to show. It is classified mutating so that it
+        reaches the bridge already escalated; leaving it unclassified would put a
+        screenshot at SAFE.
+        """
+        assert "capture_screen" in _MUTATING_OPERATIONS, (
+            "capture_screen was not declared mutating; a screenshot must never "
+            "be reachable at SAFE")
 
     def test_an_unlisted_operation_is_refused(self):
         """A closed surface: PowerShell could express anything, so the surface
@@ -414,7 +437,9 @@ class TestThePermissionBoundaryIsDeclared:
     def test_queries_are_not_declared_mutating(self):
         for operation in ("list", "get", "find", "system_info",
                           "list_windows", "get_window",
-                          "get_cursor_pos", "get_foreground_window"):
+                          "get_cursor_pos", "get_foreground_window",
+                          "list_displays", "primary_display", "virtual_desktop",
+                          "get_display", "point_to_display"):
             assert self._adapter().is_mutating(operation) is False, (
                 f"{operation} was declared mutating; it only reads")
 

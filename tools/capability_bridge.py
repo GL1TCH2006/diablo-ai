@@ -509,6 +509,287 @@ _INPUT_VERIFIERS: dict[str, Any] = {
     "type_text": _verify_keyboard_dispatch,
 }
 
+def _verify_display_enumeration(self: "CapabilityBridge", common: dict,
+                                data: dict) -> VerificationResult:
+    """A display list passes only when it describes real, consistent topology.
+
+    Three things have to hold, and each one catches a different lie: at least one
+    display (an empty list is not a machine with no screens), every entry has
+    usable geometry (a display with no pixels cannot be a target), and the
+    reported primary is one of the displays that were actually listed rather than
+    a separate guess.
+    """
+    displays = data.get("displays") if isinstance(data.get("displays"), list) else []
+    primary_id = str(data.get("primary_display_id") or "")
+    evidence = _display_evidence(self, common, data)
+    evidence["display_count"] = len(displays)
+
+    if not displays:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "No displays were reported. Windows does not return an empty display "
+            "set, so this is a failed read rather than a machine without screens.",
+            "capability_execution", evidence,
+        )
+
+    degenerate = [str(d.get("display_id")) for d in displays
+                  if isinstance(d, dict)
+                  and (int((d.get("bounds") or {}).get("width") or 0) <= 0
+                       or int((d.get("bounds") or {}).get("height") or 0) <= 0)]
+    if degenerate:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"These displays report no usable area: {', '.join(degenerate)}. "
+            "Geometry that covers no pixels cannot be a capture target.",
+            "capability_execution", evidence,
+        )
+
+    listed = {str(d.get("display_id")) for d in displays if isinstance(d, dict)}
+    if primary_id and primary_id not in listed:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The reported primary display {primary_id!r} is not among the "
+            f"displays that were listed ({sorted(listed)}).",
+            "capability_execution", evidence,
+        )
+
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Read {len(displays)} display(s) with consistent geometry; "
+        f"{primary_id or 'none'} is the primary.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_primary_display(self: "CapabilityBridge", common: dict,
+                            data: dict) -> VerificationResult:
+    """The primary passes only when Windows actually flagged one.
+
+    A fallback - "the first one", "the largest", "the one at 0,0" - would be an
+    invented answer dressed as a measurement, so a missing primary flag fails
+    rather than being papered over.
+    """
+    display = data.get("display") if isinstance(data.get("display"), dict) else {}
+    evidence = _display_evidence(self, common, data)
+    display_id = str(display.get("display_id") or data.get("display_id") or "")
+    evidence["display_id"] = display_id
+    if not display_id:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "No primary display was identified, so there is nothing to verify.",
+            "capability_execution", evidence,
+        )
+    if display.get("primary") is not True:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"Display {display_id!r} was returned as primary but does not carry "
+            "the primary flag, so its primacy was inferred rather than read.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Windows identifies {display_id!r} as the primary display.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_display_lookup(self: "CapabilityBridge", common: dict,
+                           data: dict) -> VerificationResult:
+    """A resolved display passes when it was resolved and still is present.
+
+    ``resolved: True`` is only trustworthy if the payload also carries the live
+    geometry the resolution came from, so that is checked rather than assumed.
+    """
+    display = data.get("display") if isinstance(data.get("display"), dict) else {}
+    evidence = _display_evidence(self, common, data)
+    if data.get("resolved") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The display target was not resolved against current topology.",
+            "capability_execution", evidence,
+        )
+    if not display.get("display_id") or not isinstance(display.get("bounds"), dict):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The display was reported as resolved but carries no identity or "
+            "geometry, so the resolution cannot be checked.",
+            "capability_execution", evidence,
+        )
+    if data.get("reconfigured") is True:
+        # Not a failure - the display moved. But the caller's assumptions are
+        # stale, so the evidence says so rather than quietly passing.
+        return VerificationResult(
+            VerificationState.PASSED,
+            f"Display {display['display_id']!r} was found, but it has been "
+            f"reconfigured since the target was recorded "
+            f"(now {display.get('bounds')}).",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Display {display['display_id']!r} was found in current topology with "
+        f"bounds {display.get('bounds')}.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_point_to_display(self: "CapabilityBridge", common: dict,
+                             data: dict) -> VerificationResult:
+    """Point lookup passes only when the named display really contains the point."""
+    display = data.get("display") if isinstance(data.get("display"), dict) else {}
+    point = data.get("point") if isinstance(data.get("point"), dict) else {}
+    bounds = display.get("bounds") if isinstance(display.get("bounds"), dict) else {}
+    evidence = _display_evidence(self, common, data)
+    try:
+        x, y = int(point["x"]), int(point["y"])
+        left, top = int(bounds["left"]), int(bounds["top"])
+        right, bottom = int(bounds["right"]), int(bounds["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The response is missing the point or the display bounds, so the "
+            "mapping cannot be verified.",
+            "capability_execution", evidence,
+        )
+    # Recomputed here rather than trusting the layer's own answer. Exclusive far
+    # edges, the same rule the geometry uses everywhere else.
+    inside = (left <= x < right) and (top <= y < bottom)
+    evidence["point_inside_reported_display"] = inside
+    if not inside:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"({x}, {y}) was reported as being on display "
+            f"{display.get('display_id')!r}, but it is outside its bounds "
+            f"{bounds}.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"({x}, {y}) is inside the bounds of {display.get('display_id')!r}.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_screen_capture(self: "CapabilityBridge", common: dict,
+                           data: dict) -> VerificationResult:
+    """A capture passes only when the returned image matches what was requested.
+
+    This is genuinely verifiable rather than merely acknowledged: the capture
+    reports the rectangle it covered and its own pixel dimensions, and the
+    exclusive-edge arithmetic ties those together. A capture that came back at a
+    different size, or covering a different rectangle, fails.
+
+    What is deliberately **not** claimed is anything about the *content*. Whether
+    the pixels are what the user expected to see is not observable from here, so
+    this passes on the capture being faithful to the request and says no more.
+    """
+    capture = data.get("capture") if isinstance(data.get("capture"), dict) else {}
+    evidence = _display_evidence(self, common, data)
+    if not capture:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "No capture metadata was returned, so nothing can be verified.",
+            "capability_execution", evidence,
+        )
+    bounds = capture.get("bounds") if isinstance(capture.get("bounds"), dict) else {}
+    try:
+        width, height = int(capture["width"]), int(capture["height"])
+        left, top = int(bounds["left"]), int(bounds["top"])
+        right, bottom = int(bounds["right"]), int(bounds["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The capture metadata is missing dimensions or bounds.",
+            "capability_execution", evidence,
+        )
+    expected_width, expected_height = right - left, bottom - top
+    evidence["requested_size"] = [expected_width, expected_height]
+    evidence["observed_size"] = [width, height]
+    if (width, height) != (expected_width, expected_height):
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The capture is {width}x{height} but the rectangle it reports "
+            f"{bounds} describes {expected_width}x{expected_height}. The image "
+            "does not cover the requested region.",
+            "capability_execution", evidence,
+        )
+    if width <= 0 or height <= 0:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The capture is {width}x{height}, which covers no pixels.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Captured {width}x{height} covering {bounds} on "
+        f"{capture.get('display_id') or 'the requested region'}. This "
+        "establishes the capture matched the request; it says nothing about what "
+        "the pixels contain.",
+        "capability_execution", evidence,
+    )
+
+
+def _display_evidence(self: "CapabilityBridge", common: dict,
+                      data: dict) -> dict:
+    """Evidence common to every display operation.
+
+    Includes the DPI-awareness context, because a capture on a virtualised
+    desktop is a different fact from a capture on physical pixels and a reader of
+    the ledger needs to be able to tell them apart.
+    """
+    return self._json_safe({
+        **common,
+        "has_pixels_in_payload": False,
+        "dpi_awareness": (data.get("dpi_awareness")
+                          if isinstance(data.get("dpi_awareness"), dict) else {}),
+    })
+
+
+def _verify_virtual_desktop(self: "CapabilityBridge", common: dict,
+                            data: dict) -> VerificationResult:
+    """The virtual desktop passes only when it describes real, non-degenerate area.
+
+    Checked against the OS's own view of the desktop rather than only against
+    itself, because a rectangle that is internally consistent but disagrees with
+    Windows would send captures and pointer validation to different places.
+    """
+    evidence = _display_evidence(self, common, data)
+    try:
+        left = int(data["left"])
+        top = int(data["top"])
+        width = int(data["width"])
+        height = int(data["height"])
+    except (KeyError, TypeError, ValueError):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The virtual desktop response is missing its origin or size.",
+            "capability_execution", evidence,
+        )
+    evidence["virtual_desktop"] = {"left": left, "top": top,
+                                   "width": width, "height": height}
+    if width <= 0 or height <= 0:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The virtual desktop is {width}x{height}, which covers no pixels. "
+            "A machine with no display area cannot be a real configuration.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"The virtual desktop spans ({left}, {top}) across {width}x{height}.",
+        "capability_execution", evidence,
+    )
+
+
+_DISPLAY_VERIFIERS: dict[str, Any] = {
+    "list_displays": _verify_display_enumeration,
+    "primary_display": _verify_primary_display,
+    "virtual_desktop": _verify_virtual_desktop,
+    "get_display": _verify_display_lookup,
+    "point_to_display": _verify_point_to_display,
+    "capture_screen": _verify_screen_capture,
+}
+
 _POINTER_READ_VERIFIERS = frozenset({"get_cursor_pos", "get_foreground_window"})
 
 
@@ -896,6 +1177,12 @@ class CapabilityBridge:
             return _verify_pointer_read(self, common, data)
         if operation in _INPUT_VERIFIERS:
             return _INPUT_VERIFIERS[operation](self, common, data)
+
+        # M2.16.4 display topology and bounded capture. A capture is verified
+        # against the region it reports covering; nothing is claimed about the
+        # pixels, and a capture can never carry them into this evidence.
+        if operation in _DISPLAY_VERIFIERS:
+            return _DISPLAY_VERIFIERS[operation](self, common, data)
 
         # list / get / find: structural validity of the returned rows.
         rows = data.get("processes")

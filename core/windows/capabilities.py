@@ -62,7 +62,13 @@ from .errors import (
     WindowsNotFoundError,
     WindowsWindowIdentityMismatchError,
 )
-from .coordinates import require_anchored
+from .coordinates import VirtualScreen, require_anchored
+from .capture import CaptureLayer
+from .displays import (
+    DisplayInfo,
+    DisplayLayer,
+    displays_available,
+)
 from .processes import ProcessLayer
 from .system import SystemLayer, system_available
 from .window_models import WindowIdentity
@@ -95,7 +101,20 @@ WINDOWS_OPERATIONS = (
     "mouse_move", "mouse_left_click", "mouse_right_click", "mouse_double_click",
     # keyboard mutations (M2.16.3)
     "key_press", "key_release", "key_tap", "hotkey", "type_text",
+    # display queries (M2.16.4)
+    "list_displays", "primary_display", "virtual_desktop", "get_display",
+    "point_to_display",
+    # capture (M2.16.4). One operation, and the only mutating one in this block.
+    "capture_screen",
 )
+
+#: Operations that need the display layer. Withheld on a host that cannot read
+#: display topology, since offering them would advertise operations that can only
+#: refuse.
+_DISPLAY_OPERATIONS = frozenset({
+    "list_displays", "primary_display", "virtual_desktop", "get_display",
+    "point_to_display", "capture_screen",
+})
 
 #: Operations that change machine state. Everything else is a query.
 #:
@@ -123,6 +142,11 @@ _MUTATING_OPERATIONS = frozenset({
     "key_tap",
     "hotkey",
     "type_text",
+    # M2.16.4. ``capture_screen`` is declared mutating because that is this
+    # codebase's term for "requires elevated permission", and capturing the screen
+    # is the first operation in M2.16 that can expose something the user did not
+    # intend to show. The five display queries above it are reads and stay SAFE.
+    "capture_screen",
 })
 
 #: Input operations that cannot work without the window layer, because each one
@@ -133,6 +157,11 @@ _MUTATING_OPERATIONS = frozenset({
 _WINDOW_DEPENDENT_INPUT_OPERATIONS = frozenset({
     "mouse_move", "mouse_left_click", "mouse_right_click", "mouse_double_click",
     "key_press", "key_release", "key_tap", "hotkey", "type_text",
+    # M2.16.4: screen capture is classified mutating because that is this
+    # codebase's term for "requires elevated permission", and capturing the screen
+    # is the first operation in M2.16 that can expose something the user did not
+    # intend to show. Every other display operation is a read and stays SAFE.
+    "capture_screen",
 })
 
 #: Upper bound on returned processes, so one call cannot flood the context.
@@ -157,6 +186,7 @@ class WindowsCapabilityLayer:
                  default_timeout: float = 5.0) -> None:
         self._processes = process_layer or ProcessLayer(default_timeout=default_timeout)
         self._system = system_layer or SystemLayer()
+        self._default_timeout = float(default_timeout)
         # M2.16. Optional so the process/system half still works on a host with
         # no window APIs at all; the window operations refuse with a typed
         # layer-unavailable error rather than the whole capability disappearing.
@@ -185,6 +215,7 @@ class WindowsCapabilityLayer:
         """
         native = system_available()
         window_native = windows_available()
+        display_native = displays_available()
         operations = list(WINDOWS_OPERATIONS) if native else []
         if native and not window_native:
             # Both halves depend on the window layer, not just the ones named
@@ -196,11 +227,14 @@ class WindowsCapabilityLayer:
             operations = [op for op in operations
                           if not op.startswith("window_")
                           and op not in _WINDOW_DEPENDENT_INPUT_OPERATIONS]
+        if native and not display_native:
+            operations = [op for op in operations if op not in _DISPLAY_OPERATIONS]
         return {
             "available": native,
             "operations": operations,
             "mutating_operations": sorted(_MUTATING_OPERATIONS),
             "window_available": window_native,
+            "display_available": display_native,
             "backend": "native",
             "detail": ("native Windows APIs via pywin32"
                        if native else "pywin32 is not installed"),
@@ -214,8 +248,13 @@ class WindowsCapabilityLayer:
             return
         self._closed = True
         with self._lock:
+            # Display before capture: the capture layer holds a reference to the
+            # display layer and is closed first so it is not left pointing at a
+            # closed dependency.
             for layer in (self._processes, self._system, self._windows,
-                           getattr(self, "_input", None)):
+                           getattr(self, "_capture", None),
+                           getattr(self, "_input", None),
+                           getattr(self, "_displays", None)):
                 closer = getattr(layer, "close", None)
                 if callable(closer):
                     try:
@@ -700,6 +739,168 @@ class WindowsCapabilityLayer:
                   **_ignored: Any) -> dict:
         """Type text into a verified target. Mutating."""
         return self._keyboard("write_text", target, window, text=text)
+
+    # ------------------------- M2.16.4 display topology and bounded capture
+
+    def _display_layer(self) -> DisplayLayer:
+        """The native display layer, built lazily like the others.
+
+        Separate from the window layer on purpose. Windows does have per-window
+        DPI, but a *display*'s identity is not a process, so it cannot be anchored
+        the way an M2.16.1 window identity is. Keeping the two layers separate
+        stops that difference being blurred - a display is identified by device
+        name and re-read from live topology, not by a handle it can be pinned to.
+        """
+        layer = getattr(self, "_displays", None)
+        if layer is None:
+            layer = self._displays = DisplayLayer(
+                default_timeout=self._default_timeout)
+        return layer
+
+    def _capture_layer(self) -> CaptureLayer:
+        """The native capture layer, sharing the display layer's topology read.
+
+        Shared on purpose: a capture has to agree with what enumeration reported,
+        and two independently-read topologies could disagree between the two calls
+        of a single request.
+        """
+        layer = getattr(self, "_capture", None)
+        if layer is None:
+            layer = self._capture = CaptureLayer(self._display_layer())
+        return layer
+
+    def _display_read(self, method: str, **kwargs: Any) -> dict:
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the display query.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            payload = getattr(self._display_layer(), method)(
+                cancelled=self._cancelled, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        if isinstance(payload, (DisplayInfo, VirtualScreen)):
+            payload = payload.to_dict()
+        result = dict(payload)
+        result["trusted_request_id"] = self.trusted_request_id()
+        return result
+
+    def list_displays(self, **_ignored: Any) -> dict:
+        """Every connected display, with bounds, work area, scale and DPI. Read-only."""
+        self._guard()
+        displays = self._display_layer().list_displays(cancelled=self._cancelled)
+        try:
+            primary = next(d for d in displays if d.primary)
+            primary_id = primary.display_id
+        except StopIteration:
+            primary_id = ""
+        return {
+            "displays": [d.to_dict() for d in displays],
+            "display_ids": [d.display_id for d in displays],
+            "primary_display_id": primary_id,
+            "count": len(displays),
+            "dpi_awareness": self._display_layer().dpi_awareness(),
+            "trusted_request_id": self.trusted_request_id(),
+        }
+
+    def primary_display(self, **_ignored: Any) -> dict:
+        """The display Windows reports as primary. Read-only.
+
+        Taken from the primary flag rather than from ordering, position or size.
+        """
+        payload = self._display_read("primary_display")
+        return {"display": payload, "display_id": payload.get("display_id", ""),
+                "trusted_request_id": self.trusted_request_id()}
+
+    def virtual_desktop(self, **_ignored: Any) -> dict:
+        """The bounding rectangle of every connected display. Read-only.
+
+        The union of the display rectangles, which is not necessarily
+        ``SM_CXVIRTUALSCREEN``: that metric spans any gap between monitors, and a
+        capture has to be able to name the pixels that exist.
+        """
+        return self._display_read("virtual_desktop")
+
+    def get_display(self, display: Any = None, target: Any = None,
+                    **_ignored: Any) -> dict:
+        """Resolve one display by id against live topology. Read-only.
+
+        Accepts either a bare device name or ``{"display_id": ...}``. A display
+        that is no longer connected is refused by name; it is never quietly
+        replaced with the primary one.
+        """
+        wanted = display if display is not None else target
+        if wanted is None:
+            raise WindowsInvalidRequestError(
+                "get_display requires a display_id.")
+        payload = self._display_read("resolve_target", target=wanted)
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
+
+    def point_to_display(self, x: Any = None, y: Any = None,
+                         **_ignored: Any) -> dict:
+        """Which display contains a virtual-desktop point. Read-only.
+
+        Refuses when the point is outside every display or in a gap between them.
+        Answering with the nearest display would send the caller to a screen the
+        point is not on.
+        """
+        if x is None or y is None:
+            raise WindowsInvalidRequestError(
+                "point_to_display requires both x and y.")
+        try:
+            ix, iy = int(x), int(y)
+        except (TypeError, ValueError) as exc:
+            raise WindowsInvalidRequestError(
+                "point_to_display requires integer x and y.") from exc
+        info = self._display_layer().display_at(ix, iy, cancelled=self._cancelled)
+        return {
+            "display": info.to_dict(),
+            "display_id": info.display_id,
+            "point": {"x": ix, "y": iy},
+            "relative": {"x": ix - info.bounds.left, "y": iy - info.bounds.top},
+            "trusted_request_id": self.trusted_request_id(),
+        }
+
+    def capture_screen(self, target: Any = None, **_ignored: Any) -> dict:
+        """Capture one explicit, bounded region. Mutating.
+
+        Classified mutating because that is this codebase's term for "requires
+        elevated permission", and a screen capture is the first M2.16 operation
+        that can expose something the user did not intend to show. Leaving it
+        unclassified would put a privacy-sensitive read at SAFE, which is exactly
+        the failure the mutating declaration exists to prevent.
+
+        The target is mandatory. There is no default meaning "the whole desktop",
+        and no way to request a capture by omitting the target.
+
+        The payload carries **metadata only**. The pixels stay in the
+        :class:`~core.windows.capture.ScreenCapture` object, which an in-process
+        caller can hold, and never enter a result that gets logged, cached or sent
+        to a model. Handing screen contents to a model is a later milestone's
+        decision to make explicitly, not a side effect of taking a picture.
+        """
+        if target is None:
+            raise WindowsInvalidRequestError(
+                "capture_screen requires an explicit target: a display_id, or "
+                "{mode: 'rect', left, top, right, bottom}, or "
+                "{mode: 'virtual_desktop'}. An untargeted capture is refused.")
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the capture.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            capture = self._capture_layer().capture(target,
+                                                    cancelled=self._cancelled)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        payload = {"capture": capture.metadata()}
+        payload["trusted_request_id"] = self.trusted_request_id()
+        return payload
 
     # ---------------------------------------------------------------- utils
 

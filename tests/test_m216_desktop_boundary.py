@@ -112,6 +112,7 @@ class TestMutationIsClassifiedByDeclaration:
             "mouse_move", "mouse_left_click", "mouse_right_click",
             "mouse_double_click",
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
+            "capture_screen",
         })
 
         keywords = tuple(w.lower() for w in bridge_module._MUTATING_WORDS)

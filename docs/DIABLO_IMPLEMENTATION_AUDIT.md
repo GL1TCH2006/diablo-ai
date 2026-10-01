@@ -2,7 +2,8 @@
 
 M2.14.1 hardening, M2.15 Native Windows Process/System Foundation, M2.15.2
 Trust, Interruption and Durability, and M2.16 Desktop Control — M2.16.1 window
-identity, M2.16.2 pointer and mouse, M2.16.3 keyboard.
+identity, M2.16.2 pointer and mouse, M2.16.3 keyboard, M2.16.4 screen and display
+foundation.
 
 Baseline: `ef7c49a` (M2.14 Phase 10 freeze). Phase 10 history is unchanged; no
 commit was rewritten, rebased or amended.
@@ -18,17 +19,23 @@ Source audit: `docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt` (31 sections,
 
 | Check | Result |
 |---|---|
-| Full suite, deterministic | **2895 passed, 120 skipped** |
-| Full suite, real-Windows gates (`DIABLO_REAL_WINDOWS_TESTS=1`) | **2972 passed, 43 skipped** |
+| Full suite, deterministic | **2996 passed, 175 skipped** |
+| Full suite, real-Windows gates (`DIABLO_REAL_WINDOWS_TESTS=1`) | **3127 passed, 44 skipped** |
+| Real display/capture module (`tests/test_m2164_display_real.py`) | **54 passed, 1 skipped**, three consecutive runs |
+| M2.16.4 deterministic module | **100 passed** |
 | Real input module, `tests/test_m2162_input_real.py` | **30 passed**, three consecutive runs |
 | Real window + input modules together | **56 passed** |
 | `python -m compileall` | clean |
 | `pip check` | no broken requirements |
 
-M2.16.1 baseline was 2702 passed / 90 skipped deterministic. The suite grew by 193
-tests and no test was weakened to reach green. No Blender gate was rerun: M2.16
-touches neither the Blender scene path nor the shared executor, so a rerun would
-have measured nothing new.
+M2.16.2/.3 baseline was 2895 passed / 120 skipped deterministic. The suite grew by
+101 tests and no test was weakened to reach green. No Blender gate was rerun:
+M2.16 touches neither the Blender scene path nor the shared executor, so a rerun
+would have measured nothing new.
+
+The one environment-dependent skip is recorded in §7.9: this session's screen
+surface does not present window content, so the pixel assertion against a
+test-owned window is skipped with that reason rather than weakened.
 
 ### Earlier milestones
 
@@ -367,15 +374,16 @@ read back — within a 1px tolerance, since Windows clamps to the desktop edge.
 
 ### 7.5 Operations added
 
-Twenty-two total, fourteen mutating. Pointer and keyboard verbs are all declared
-mutating, so all eleven reach the bridge already escalated to SENSITIVE. Reads
-(`get_cursor_pos`, `get_foreground_window`) are not.
+Twenty-two total through M2.16.3; M2.16.4 brings it to **twenty-eight, fifteen
+mutating**. Pointer and keyboard verbs are all declared mutating, so all nine
+reach the bridge already escalated to SENSITIVE; the reads are not.
 
 A host without the window APIs does not advertise the input verbs. Each one
 resolves and re-verifies a target through `WindowLayer`, so offering them where
 that is impossible would advertise operations that can only refuse. `get_cursor_pos`
 is the exception: it reads the pointer and the virtual screen, and needs no window
-APIs.
+APIs. The M2.16.4 display operations are withheld on a host that cannot enumerate
+displays, for the same reason.
 
 ### 7.6 Real-window testing
 
@@ -402,7 +410,151 @@ because a venv `python.exe` re-executes and the window belongs to a grandchild �
 terminating only the direct child leaves it alive. Verified: zero probe windows
 and no probe processes survive a run.
 
-### 7.7 Three assertions that were wrong, not the code
+### 7.7 M2.16.4 — display topology, `core/windows/displays.py`
+
+Enumerate through `EnumDisplayMonitors` + `GetMonitorInfoW`. **No `HMONITOR`
+crosses the boundary**: the handle exists only for the duration of the enumeration
+callback, and every value is copied out inside it. An `HMONITOR` is an address
+Windows recycles, exactly the reason M2.16.1 refused to treat an `HWND` as an
+identity.
+
+**Display identity is the device name** (`\\.\DISPLAY1`), not a handle. There is no
+second anchor available: a window can be pinned to a process creation time, a
+monitor belongs to no process, so the device name is the whole identity. That is
+why a target is re-resolved against live topology rather than trusted from
+remembered bounds — and why a *reconfigured* display is reported as such instead of
+silently presenting new bounds.
+
+**The primary display comes from `MONITORINFOF_PRIMARY`** and never from ordering,
+position or size. A primary that is not leftmost or not largest is completely
+normal, and inferring it from geometry is how a machine with the primary on the
+right gets the wrong answer. No primary reported, or two, is a structured failure.
+
+#### Coordinates, and the two virtual desktops
+
+`Rect` and `Size` live in `core/windows/coordinates.py` next to the existing
+`VirtualScreen`, because they are the same subject. **Right and bottom are
+exclusive**, so `width = right - left` and the last valid pixel is
+`left + width - 1`. That is the off-by-one M2.16.2 already fixed for window bounds,
+now stated once and obeyed by every containment test in the codebase.
+
+Two things are deliberately *not* conflated, and this cost real thought:
+
+- **Screen coordinates ≠ window-relative coordinates.** A `WindowPoint` resolved
+  against a window is not a monitor point. Translating between spaces goes through
+  the named `Rect.translated_from` / `Rect.offset` rather than arithmetic done
+  somewhere convenient, because the M2.16.2 lesson is that provenance must not be
+  laundered.
+- **There are two legitimate "virtual desktop" rectangles.**
+  `SM_CXVIRTUALSCREEN` spans any *gap* between monitors, because it describes where
+  the pointer may be clamped. The union of the display rectangles covers only
+  pixels that exist. So `core/windows/input.py` keeps using the system metric for
+  pointer validation and `displays.py` uses the union for capture and topology.
+  Unifying them would have meant either rejecting pointer positions Windows will
+  accept, or letting a capture cover a gap with no pixels in it. `assert_consistent`
+  logs if the two disagree with no gap to explain it.
+
+#### DPI, and the trap in it
+
+**`GetDpiForMonitor` does not always answer the question it appears to.** In a
+DPI-*unaware* process Windows virtualises the desktop and reports an effective DPI
+of 96 — on this machine that call returns exactly 96 while the panel is 2560×1600
+running at 150%, and the monitor reports 1707×1067. All three are consistent: the
+process is seeing a virtualised desktop.
+
+Reporting that 96 as a measurement would be fabricating a number. So:
+
+- `scale_percent` comes from `GetScaleFactorForMonitor`, which is truthful in every
+  awareness mode, and is reported;
+- `dpi_x` / `dpi_y` are reported **only when the process is actually per-monitor
+  aware**, and are otherwise `None` with `dpi_virtualized` set to say why;
+- `dpi_awareness()` publishes the context, so a reader can always tell which kind of
+  number they are looking at.
+
+**This layer reports DPI awareness; it never sets it.** Changing process DPI
+awareness would alter how every other window call in the codebase is virtualised,
+which is a far larger decision than a display foundation should take alone. A test
+asserts no `SetProcessDpiAwareness*` call exists in the module.
+
+### 7.8 M2.16.4 — bounded capture, `core/windows/capture.py`
+
+`BitBlt` from the screen device context into a top-down 32-bit DIB section.
+Negative `biHeight` requests a top-down DIB, so the image needs no vertical flip —
+a positive value would yield an upside-down capture that still looks like plausible
+image data, so the orientation is tested directly.
+
+**Why not Desktop Duplication, Windows Graphics Capture, or `PrintWindow`:**
+
+- *Desktop Duplication* is faster and is what a high-framerate capture wants, but it
+  needs DXGI, a device and a lifecycle — a video-pipeline decision, not a
+  foundation one.
+- *Windows Graphics Capture* is the modern answer, but it is per-window,
+  asynchronous and needs a package. It is the right choice for M2.16.5 when a
+  specific *window's* contents are what is wanted.
+- *`PrintWindow` is avoided entirely.* For many windows it returns a blank or stale
+  image while reporting success, which is precisely the fake success this codebase
+  refuses to produce.
+
+Every GDI object is released in a `finally`, in reverse acquisition order — the DIB
+must be deselected from the memory DC before it is deleted, the memory DC before
+the screen DC is released. Getting that order wrong leaks a GDI object per capture
+rather than failing loudly, so it is tested on success, on `BitBlt` refusal, on
+mid-flight cancellation and on an exception raised between allocation and return.
+
+#### What makes this capture and not surveillance
+
+Screen capture is the first M2.16 operation that can expose something the user did
+not intend to show, so the boundaries are explicit rather than incidental:
+
+- **An explicit target is required.** No `capture()` with no argument, and no
+  default meaning "the whole desktop". A caller names a display, or names a
+  rectangle, or names the virtual desktop *as the virtual desktop*. There is no way
+  to ask for a capture by not specifying one, because unspecified is exactly how an
+  unbounded capture happens.
+- **Nothing is persisted.** No file, no log, no memory store, no upload.
+  `ScreenCapture.to_dict()` omits the image and the object excludes it from
+  `__repr__`, so anything that gets logged or cached carries dimensions only.
+- **Nothing runs by itself.** No timer, thread or poller; a capture happens when a
+  caller asks. Asserted by an AST import scan, not a substring search.
+- **The capability payload carries metadata only.** The pixels stay in the
+  `ScreenCapture` object for an in-process caller. Handing screen contents to a
+  model is a later milestone's decision to make explicitly.
+- **`capture_screen` is classified mutating**, which in this codebase means SENSITIVE
+  at the bridge. Screen capture is the only M2.16.4 operation that is; the five
+  display queries are reads and stay SAFE.
+
+#### Verification
+
+A capture is genuinely verifiable: it reports the rectangle it covered and its own
+pixel dimensions, and the exclusive-edge arithmetic ties those together, so a
+capture at the wrong size **fails**. What is deliberately *not* claimed is anything
+about the content — whether the pixels are what the user expected to see is not
+observable from here, and the verifier's own text says so.
+
+### 7.9 M2.16.4 — what this machine revealed
+
+Testing capture here produced a finding worth recording rather than working around.
+A test-owned Tk window filled with `#3366CC`:
+
+- `PrintWindow` returns `(51, 102, 204)` — exactly the colour it was given;
+- a screen `BitBlt` of the same rectangle returns `(38, 42, 49)`;
+- DWM composition reports enabled;
+- the capture is **byte-identical to Pillow's `ImageGrab`** for the same rectangle.
+
+So the window paints correctly, the capture is faithful, and this session's screen
+surface simply does not present window content. The pixel-content assertion is
+therefore skipped with that explanation rather than weakened or deleted, and the
+capture is validated against `ImageGrab` — an independent implementation of the same
+idea, which is stronger evidence than comparing the output with itself.
+
+`tests/test_m2164_display_real.py` asserts the whole screen is never captured as an
+oracle, never written to disk, and that teardown leaves no window or process behind
+(asserted, not attempted). It also caught a real leak during development: a venv
+`python.exe` re-executes, so the window's owning process is a grandchild that
+`Popen.terminate()` misses. Two processes per run were leaking until the fixture
+resolved the owning pid from the window handle and terminated it too.
+
+### 7.10 Three assertions that were wrong, not the code
 
 Found while testing, and worth recording because in each case the *test* encoded
 the weaker behaviour:
@@ -435,35 +587,72 @@ returning `None` is what makes a click both count once and focus.
    not rerun for M2.16; they need Ollama and ~50 minutes. Last verified at
    Phase 10. **Deferred, not claimed.**
 4. **Packaged application launch** still costs a PowerShell process (§3.3).
+5. **Window-pixel capture on this machine.** M2.16.4's capture is correct and
+   validated against an independent implementation, but *this session* does not
+   present window content into the screen device context (§7.9), so the one
+   pixel-level assertion is environment-skipped. On a session that does, it runs.
 
 Nothing here is claimed complete that is not.
 
 ---
 
-## 9. Recommended next task
+## 9. Roadmap position
 
-**M2.16.4 — screen capture, then UI Automation.**
+| Milestone | Status |
+|---|---|
+| M2.16.1 Window Foundation | **COMPLETE** |
+| M2.16.2 Pointer Foundation | **COMPLETE** |
+| M2.16.3 Keyboard Foundation | **COMPLETE** |
+| M2.16.4 Screen / Display Foundation | **COMPLETE** |
+| M2.16.5 UIA + Visual Targeting | not started |
+| M2.16.6 Integrated Desktop Workflows | not started |
+| M2.16.UI Edge Companion | not started |
+| M2.17 Persistent Autonomy | not started |
+| M2.18 Vision Foundation | not started |
+| Voice / STT / VAD | not started |
 
-M2.16 now has the model the rest of desktop control depends on: a target is a
-verified window identity rather than a coordinate, every input is permission-gated
-and cancellable, and the one effect that can be observed is the only one ever
-reported as verified. Capture is the natural next step because it is read-only and
-introduces no new mutation surface — and because it is what makes UIA and vision
-targeting possible at all.
+OCR, vision, a VLM, UI Automation, the accessibility tree, visual element
+targeting, continuous screenshot polling, screen recording and cloud image
+analysis are all **absent and deliberately so**. `tools/local_vlm.py` and the
+`capabilities.py` "analyze UI elements in a screenshot" entry point are
+pre-existing placeholders from before M2.16; M2.16.4 did not wire, activate or
+test them, and nothing in the new code path reaches them.
 
-Two boundaries that M2.16.4 must respect, both established above:
+---
 
-- A capture result must be anchored the same way input is. A screenshot of the
-  whole screen is a `ScreenPoint` with no target, so anything derived from it needs
-  a target before it can be acted on.
-- **UI Automation is a separate package.** It would be a new capability with its
-  own mutating set, not more verbs on this one.
+## 10. Recommended next task
+
+**M2.16.5 — UI Automation and visual targeting, on the foundation M2.16 now
+provides.**
+
+M2.16 is complete as a foundation: a target is a verified identity rather than a
+coordinate, input is permission-gated and cancellable, display topology and
+geometry are trustworthy, and capture is bounded and explicit. What it deliberately
+does *not* have is a way to name a *thing* on screen — which is exactly the gap
+UIA fills.
+
+Boundaries M2.16.5 must respect, all established above:
+
+- **UIA is a separate capability with its own mutating set**, not more verbs on
+  `windows`. Invoking a control is a mutation of someone else's application.
+- **Targeting is identity-based, like everything else in M2.16.** A control is
+  named by its automation identity and re-resolved immediately before acting on
+  it. A coordinate derived from a screenshot must be resolved back through a
+  verified target before it is dispatched — the same rule M2.16.2 established for
+  a bare `ScreenPoint`, and the reason `require_anchored` exists.
+- **A screenshot is not yet a model input.** M2.16.4 deliberately keeps pixels out
+  of every payload. M2.18 Vision Foundation is where image data is handed to a
+  model, and it must make that decision explicitly rather than inherit it.
+- **Windows Graphics Capture is the better tool for a specific window's contents**
+  (§7.8), including DWM-captured windows that a screen `BitBlt` misses. This
+  machine is a concrete example of what a screen-level capture cannot see.
 
 Alongside that, the deferred real-model suites (`test_knowledge_p9_real_model.py`,
 `test_recovery_p10_real_model.py`, `DIABLO_P9_TIMEOUT=300`, ~50 min, needs Ollama)
-remain unrerun since Phase 10. M2.16 does not touch the agent turn path or
-recovery, so this is not urgent — but it is now four milestones stale, and no
-fresh real-model validation is claimed for M2.14.1, M2.15, M2.15.2 or M2.16.
+remain unrerun since Phase 10. M2.16 does not touch the agent turn path or recovery
+— it adds a native capability and touches no existing execution path — so this is
+not urgent. But it is now four milestones stale, and no fresh real-model validation
+is claimed for M2.14.1, M2.15, M2.15.2 or M2.16.
 
-Still deliberately out of scope for M2.16: autonomous workflows that chain input
-without a caller in the loop.
+Still deliberately out of scope: autonomous workflows that chain input without a
+caller in the loop.

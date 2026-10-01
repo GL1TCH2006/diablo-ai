@@ -926,6 +926,11 @@ class WindowsCapabilityAdapter(_LayerAdapter):
         "key_tap",
         "hotkey",
         "type_text",
+        # M2.16.4. ``capture_screen`` is declared here for the same reason the
+        # pointer and keyboard verbs are: it exposes something the user did not
+        # necessarily intend to show, and must arrive at the bridge already
+        # escalated. The five display queries are reads and deliberately absent.
+        "capture_screen",
     })
 
     def _operations_for_layer(self) -> tuple[str, ...]:
