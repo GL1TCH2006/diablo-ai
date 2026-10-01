@@ -58,9 +58,33 @@ class Executor:
         self._before_execute = before_execute
         self._state_listener = state_listener
         self._event_context = event_context
+        self._task_provider = None
+
+    def set_task_provider(self, provider=None) -> None:
+        """Register a callable returning the authoritative task id.
+
+        Set by the Agent. Optional: with no provider, ``task``-scoped rules never
+        match, which is the safe direction - they cannot widen to global.
+        """
+        self._task_provider = provider
 
     def set_confirmer(self, confirmer=None) -> None:
         self._confirmer = confirmer
+
+    def _task_id(self) -> str:
+        """The authoritative task id for the call about to be evaluated.
+
+        Supplied by the Agent via :meth:`set_task_provider`, so permission
+        evaluation can match a ``task``-scoped rule without the task id ever
+        travelling in tool arguments.
+        """
+        provider = self._task_provider
+        if provider is None:
+            return ""
+        try:
+            return str(provider() or "")
+        except Exception:  # noqa: BLE001 - a task-id probe must never block a call
+            return ""
 
     _RESULT_TAIL = 600
 
@@ -153,7 +177,11 @@ class Executor:
             return outcome
 
         try:
-            decision = self._permissions.evaluate(tool, args, spec.level, spec.level_for)
+            # The task id comes from the executor's own authoritative source, not
+            # from ``args``, so a task-scoped rule is matched against the real
+            # task and the model cannot steer which task it is judged under.
+            decision = self._permissions.evaluate(
+                tool, args, spec.level, spec.level_for, self._task_id())
         except Exception as exc:
             outcome.status = "error"
             outcome.reason = f"Permission evaluation failed: {exc}"

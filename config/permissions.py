@@ -234,11 +234,11 @@ class PermissionManager:
         self.rule_engine = None
         self.last_decision = None
 
-    def _finalize(self, decision, tool_name: str, args: dict) -> Decision:
+    def _finalize(self, decision, tool_name: str, args: dict, task_id: str = "") -> Decision:
         self.last_decision = (tool_name, decision)
         engine = getattr(self, "rule_engine", None)
         if engine is not None:
-            decision, _ = engine.apply(decision, tool_name, args)
+            decision, _ = engine.apply(decision, tool_name, args, task_id)
             self.last_decision = (tool_name, decision)
         return decision
 
@@ -260,35 +260,40 @@ class PermissionManager:
             rule = self.persistent_deny.get(tool_name)
         return rule
 
-    def evaluate(self, tool_name: str, args: dict, declared: PermissionLevel, level_for=None) -> Decision:
+    def evaluate(self, tool_name: str, args: dict, declared: PermissionLevel, level_for=None,
+                 task_id: str = "") -> Decision:
+        # ``task_id`` is passed by the Executor from the authoritative
+        # TaskManager, never from tool arguments, so a task-scoped rule is
+        # matched against the real task and cannot be steered by the model.
+        f = lambda d: self._finalize(d, tool_name, args, task_id)  # noqa: E731
         if tool_name.startswith("terminal"):
             command = str(args.get("command", ""))
             reason = destructive_command_reason(command, self._settings.terminal_blocklist)
             if reason or tool_name in self._session_blocked:
                 detail = f" ({reason})" if reason else ""
-                return self._finalize(Decision(PermissionLevel.BLOCKED, False, False, f"Blocked by destructive-command policy{detail}."), tool_name, args)
+                return f(Decision(PermissionLevel.BLOCKED, False, False, f"Blocked by destructive-command policy{detail}."))
             if self._pref_rule(tool_name) == "deny":
-                return self._finalize(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."), tool_name, args)
+                return f(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."))
             if is_auto_allowed(command, self._settings.terminal_auto_allow):
-                return self._finalize(Decision(PermissionLevel.NORMAL, True, False), tool_name, args)
-            return self._finalize(Decision(PermissionLevel.SENSITIVE, False, True, "Shell command requires confirmation."), tool_name, args)
+                return f(Decision(PermissionLevel.NORMAL, True, False))
+            return f(Decision(PermissionLevel.SENSITIVE, False, True, "Shell command requires confirmation."))
 
         level = level_for(args) if level_for else declared
         if level == PermissionLevel.BLOCKED or tool_name in self._session_blocked:
-            return self._finalize(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by configuration."), tool_name, args)
+            return f(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by configuration."))
         if tool_name == "capability.execute" and level == PermissionLevel.SENSITIVE:
             if self._pref_rule(tool_name) == "deny":
-                return self._finalize(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."), tool_name, args)
-            return self._finalize(Decision(PermissionLevel.SENSITIVE, False, True, "Sensitive capability operation requires explicit confirmation."), tool_name, args)
+                return f(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."))
+            return f(Decision(PermissionLevel.SENSITIVE, False, True, "Sensitive capability operation requires explicit confirmation."))
         if self._pref_rule(tool_name) == "deny":
-            return self._finalize(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."), tool_name, args)
+            return f(Decision(PermissionLevel.BLOCKED, False, False, "Blocked by user preference."))
         if self._pref_rule(tool_name) == "allow":
-            return self._finalize(Decision(level, True, False, "Allowed by user preference."), tool_name, args)
+            return f(Decision(level, True, False, "Allowed by user preference."))
         if level == PermissionLevel.SAFE:
-            return self._finalize(Decision(level, True, False), tool_name, args)
+            return f(Decision(level, True, False))
         if level == PermissionLevel.NORMAL:
-            return self._finalize(Decision(level, True, False), tool_name, args)
-        return self._finalize(Decision(level, False, True, "Requires confirmation."), tool_name, args)
+            return f(Decision(level, True, False))
+        return f(Decision(level, False, True, "Requires confirmation."))
 
 
 def path_is_within(path: Path, roots: list[Path]) -> bool:

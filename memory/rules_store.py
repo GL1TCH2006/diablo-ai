@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -8,9 +7,18 @@ from pathlib import Path
 
 from core.logging_setup import get_logger
 
+from .storage import load_json, save_json
+
 log = get_logger("rules_store")
 
 SCOPES = ("global", "project", "tool", "task")
+
+#: The scope a rule applies when nothing narrower was given. Deliberately
+#: ``global``, because that is the honest answer for a rule that names no
+#: narrower scope - and it is a restriction, so applying it broadly can only
+#: ever narrow authority. What must never happen is a rule declared ``tool`` or
+#: ``task`` quietly behaving as ``global``; see :meth:`Rule.matches`.
+DEFAULT_SCOPE = "global"
 
 
 @dataclass
@@ -30,13 +38,53 @@ class Rule:
     updated_at: str = ""
     extra: dict = field(default_factory=dict)
 
-    def matches(self, tool_name: str, args: dict, project: str = "") -> bool:
-        if self.scope == "project" and (not project or self.extra.get("project") not in (None, "", project)):
-            return False
+    def matches(self, tool_name: str, args: dict, project: str = "",
+                task_id: str = "") -> bool:
+        """Whether this rule applies to one call.
+
+        Scope is now enforced, not merely recorded:
+
+        ``project``
+            Only when the rule's project matches, or the rule names none.
+        ``tool``
+            Only when the rule's ``if_tool`` matches the call's tool. A tool
+            rule that names no tool is refused rather than treated as global,
+            because the whole point of the scope is to narrow it.
+        ``task``
+            Only when the rule's ``extra["task_id"]`` matches this call's task.
+            A task rule with no task id is refused for the same reason.
+
+        The previous behaviour let both of those fall through to "matches
+        everything", so a rule the user believed was scoped to one tool
+        silently applied to all of them. Narrowing a rule can only reduce what
+        it blocks, but it was reporting a restriction it was not applying, so
+        the fix is to make the scope real.
+        """
+        scope = str(self.scope or DEFAULT_SCOPE)
+
+        if scope == "project":
+            want = self.extra.get("project")
+            if want not in (None, "") and want != project:
+                return False
+
+        if scope == "tool":
+            want_tool = str(self.if_tool or "").strip()
+            if not want_tool:
+                # A tool rule that names no tool cannot be a tool rule.
+                return False
+            if not _tool_names_match(want_tool, tool_name):
+                return False
+
+        if scope == "task":
+            want_task = str(self.extra.get("task_id") or "").strip()
+            if not want_task:
+                return False
+            if not task_id or want_task != str(task_id):
+                return False
+
         if self.if_tool:
-            if tool_name != self.if_tool and not tool_name.startswith(self.if_tool + ".") and not self.if_tool.startswith(tool_name + "."):
-                if not (tool_name.startswith(self.if_tool) or self.if_tool.startswith(tool_name)):
-                    return False
+            if not _tool_names_match(str(self.if_tool), tool_name):
+                return False
         if self.if_content:
             import json as _json
             try:
@@ -78,13 +126,20 @@ class RuleStore:
         if not self._file.is_file():
             self._mtime = 0
             return
-        try:
-            data = json.loads(self._file.read_text(encoding="utf-8"))
-            self._mtime = self._file.stat().st_mtime_ns
-        except (ValueError, OSError) as exc:
-            log.warning("rules store unreadable (%s)", exc)
+        data = load_json(self._file, default=None)
+        if not isinstance(data, dict):
+            log.warning("rules store unreadable, keeping no rules")
             return
-        self._rules = [Rule.from_dict(r) for r in data.get("rules", [])]
+        try:
+            self._mtime = self._file.stat().st_mtime_ns
+        except OSError:
+            self._mtime = 0
+        raw_rules = data.get("rules")
+        self._rules = [
+            Rule.from_dict(r)
+            for r in (raw_rules if isinstance(raw_rules, list) else [])
+            if isinstance(r, dict)
+        ]
 
     def _sync(self) -> None:
         """Reload rules if another process/instance changed the file since our last read."""
@@ -100,28 +155,44 @@ class RuleStore:
             self._load()
 
     def _save(self) -> None:
-        try:
-            self._file.write_text(json.dumps({"rules": [r.as_dict() for r in self._rules]},
-                                             ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as exc:
-            log.warning("could not save rules store: %s", exc)
+        """Persist atomically.
+
+        Raises on failure. Swallowing it here let ``create`` return a rule that
+        was never written, so the caller believed a restriction was in force
+        when no restart would ever load it.
+        """
+        save_json(self._file, {"rules": [r.as_dict() for r in self._rules]})
 
     def create(self, name: str, action: str = "block", description: str = "", scope: str = "global",
                priority: int = 50, if_tool: str = "", if_content: str = "", reason: str = "",
-               project: str = "", source: str = "user") -> Rule:
+               project: str = "", source: str = "user", task_id: str = "") -> Rule:
         if not name or not name.strip():
             raise ValueError("empty rule name")
         if action not in ("block", "confirm"):
             raise ValueError("action must be 'block' or 'confirm'")
+        scope = _normalise_scope(scope)
         if scope not in SCOPES:
             raise ValueError(f"scope must be one of {', '.join(SCOPES)}")
+        if scope == "tool" and not str(if_tool or "").strip():
+            # Rejected rather than silently downgraded to global. A user who
+            # asked for a tool-scoped rule and omitted the tool has made a
+            # mistake; widening it to everything is the one interpretation that
+            # cannot be what they meant.
+            raise ValueError("scope 'tool' requires if_tool to name the tool")
+        if scope == "task" and not str(task_id or "").strip():
+            raise ValueError("scope 'task' requires task_id")
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        extra: dict = {}
+        if project:
+            extra["project"] = project
+        if scope == "task" and task_id:
+            extra["task_id"] = str(task_id)
         rule = Rule(
             id=uuid.uuid4().hex[:12], name=_clean(name, 120), action=action,
             description=_clean(description, 1000), scope=scope, priority=max(1, min(100, int(priority))),
             if_tool=_clean(if_tool, 120), if_content=_clean(if_content, 500),
             reason=_clean(reason, 500), source=source, created_at=stamp, updated_at=stamp,
-            extra={"project": project} if project else {},
+            extra=extra,
         )
         conflicts = self.detect_conflict(rule)
         if conflicts:
@@ -138,17 +209,67 @@ class RuleStore:
         self._sync()
         return [r for r in self._rules if include_disabled or r.enabled]
 
-    def active(self, project: str = "") -> list[Rule]:
+    def active(self, project: str = "", task_id: str = "") -> list[Rule]:
+        """Enabled rules, filtered by the scopes this call can be judged under.
+
+        A ``task`` rule is only offered when its task matches, and a ``project``
+        rule only when its project matches. Filtering here as well as in
+        :meth:`Rule.matches` keeps the rendered prompt honest: the model is only
+        shown rules that actually apply to the call it is making.
+        """
         self._sync()
-        return [r for r in self._rules if r.enabled and (r.scope != "project" or r.extra.get("project") == project)]
+        out: list[Rule] = []
+        for rule in self._rules:
+            if not rule.enabled:
+                continue
+            if rule.scope == "project":
+                want = rule.extra.get("project")
+                if want not in (None, "") and want != project:
+                    continue
+            if rule.scope == "task":
+                want_task = str(rule.extra.get("task_id") or "")
+                if not want_task or not task_id or want_task != str(task_id):
+                    continue
+            if rule.scope == "tool" and not str(rule.if_tool or "").strip():
+                continue
+            out.append(rule)
+        return out
 
     def update(self, rule_id: str, **changes) -> Rule | None:
         rule = self.get(rule_id)
         if rule is None:
             return None
+        # ``enabled`` is deliberately not settable here. Toggling a restriction
+        # off is a widening, and it goes through ``enable`` (and the
+        # explicit_confirmation on ``rules.enable``) so it can never be an
+        # unconfirmed side effect of editing some other field.
+        mutable = {"name", "description", "scope", "priority", "action",
+                   "if_tool", "if_content", "reason", "source"}
         for key, value in changes.items():
-            if hasattr(rule, key) and key not in ("id", "created_at"):
+            if key in mutable:
                 setattr(rule, key, value)
+        new_scope = _normalise_scope(str(rule.scope or DEFAULT_SCOPE))
+        if new_scope not in SCOPES:
+            raise ValueError(f"scope must be one of {', '.join(SCOPES)}")
+        if new_scope == "tool" and not str(rule.if_tool or "").strip():
+            raise ValueError("scope 'tool' requires if_tool to name the tool")
+        if new_scope == "task" and not str(rule.extra.get("task_id") or "").strip():
+            raise ValueError("scope 'task' requires task_id")
+        rule.scope = new_scope
+        rule.updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._save()
+        return rule
+
+    def bind_task(self, rule_id: str, task_id: str) -> Rule | None:
+        """Attach a task id to a task-scoped rule that does not have one yet.
+
+        Kept separate from :meth:`update` so the tool layer cannot reach it by
+        accident through the field whitelist.
+        """
+        rule = self.get(rule_id)
+        if rule is None:
+            return None
+        rule.extra = {**(rule.extra or {}), "task_id": str(task_id)}
         rule.updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self._save()
         return rule
@@ -175,19 +296,29 @@ class RuleStore:
         self._save()
 
     def detect_conflict(self, candidate: Rule) -> str:
-        """Conflict: same trigger (scope+tool+content) but opposite action enforced by a higher-priority rule."""
-        for rule in self.active():
-            if rule.id == candidate.id:
+        """Conflict: same trigger but opposite action, enforced by a higher-priority rule.
+
+        Every rule is considered, not only those active under some other
+        project. Previously this called ``active()`` with no project, which
+        silently excluded every project-scoped rule from conflict detection.
+        """
+        for rule in self._rules:
+            if not rule.enabled or rule.id == candidate.id:
                 continue
-            if rule.if_tool != candidate.if_tool and not _overlap_tool(rule.if_tool, candidate.if_tool):
-                continue
-            if (rule.if_content or "").lower() != (candidate.if_content or "").lower():
+            if rule.scope != candidate.scope:
                 continue
             if rule.extra.get("project") != candidate.extra.get("project"):
                 continue
+            if rule.extra.get("task_id") != candidate.extra.get("task_id"):
+                continue
+            if not _tool_names_match(rule.if_tool or "", candidate.if_tool or "", prefix_only=True):
+                continue
+            if (rule.if_content or "").lower() != (candidate.if_content or "").lower():
+                continue
             if rule.action != candidate.action:
                 if rule.priority > candidate.priority:
-                    return f"conflict: rule '{candidate.name}' would be overridden by higher-priority rule '{rule.name}' ({rule.action})."
+                    return (f"conflict: rule '{candidate.name}' would be overridden by "
+                            f"higher-priority rule '{rule.name}' ({rule.action}).")
                 return ""  # candidate wins (higher/equal priority), fully deterministic
             return ""  # same action, harmless overlap
         return ""
@@ -200,20 +331,24 @@ class RuleStore:
                 issues.append(f"{rule.id}: {issue}")
         return "\n".join(issues)[:2000]
 
-    def render_active(self, project: str = "", limit: int = 0) -> str:
-        rules = self.active(project)
+    def render_active(self, project: str = "", limit: int = 0, task_id: str = "") -> str:
+        rules = self.active(project, task_id)
         if limit:
             rules = rules[:limit]
         if not rules:
             return ""
         lines = ["#ACTIVE RULES (RESTRICT-ONLY; must be obeyed; never overridden for convenience)"]
         for rule in sorted(rules, key=lambda r: (-_rank(r.priority), r.name)):
-            head = f"- [{rule.action.upper()}] {rule.name} (priority {rule.priority})"
+            head = f"- [{rule.action.upper()}] {rule.name} (priority {rule.priority}, scope {rule.scope})"
             extra = []
             if rule.if_tool:
                 extra.append(f"tool←{rule.if_tool}")
             if rule.if_content:
                 extra.append(f"content←{rule.if_content}")
+            if rule.scope == "task":
+                extra.append(f"task←{rule.extra.get('task_id', '')}")
+            if rule.scope == "project":
+                extra.append(f"project←{rule.extra.get('project', '')}")
             if extra:
                 head += " | " + ", ".join(extra)
             lines.append(head)
@@ -222,10 +357,33 @@ class RuleStore:
         return "\n".join(lines)
 
 
-def _overlap_tool(a: str, b: str) -> bool:
-    if not a or not b:
+def _normalise_scope(scope: str) -> str:
+    """Accept only a known scope, case- and space-insensitively.
+
+    An unrecognised scope resolves to the default rather than to anything that
+    widens the rule, and :func:`RuleStore.create` then rejects it outright.
+    """
+    value = str(scope or "").strip().lower().replace("-", "_")
+    aliases = {"": DEFAULT_SCOPE, "all": "global", "any": "global"}
+    return aliases.get(value, value)
+
+
+def _tool_names_match(want: str, got: str, prefix_only: bool = False) -> bool:
+    """Whether a rule's tool pattern covers the called tool.
+
+    Matching is by exact name, or by dotted-prefix, so ``git`` covers
+    ``git.push`` and ``git.push`` covers ``git``. An empty pattern matches
+    everything, which is what a ``global`` rule with no tool means.
+    """
+    want = str(want or "").strip().lower()
+    got = str(got or "").strip().lower()
+    if not want or not got:
         return True
-    return a == b or a.startswith(b) or b.startswith(a)
+    if want == got:
+        return True
+    if prefix_only:
+        return want.startswith(got + ".") or got.startswith(want + ".")
+    return want.startswith(got + ".") or got.startswith(want + ".")
 
 
 def _rank(priority: int) -> int:

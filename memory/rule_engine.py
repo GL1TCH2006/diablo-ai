@@ -26,18 +26,19 @@ class RuleEngine:
     def set_project(self, project: str) -> None:
         self._project = project
 
-    def apply(self, decision: Decision, tool_name: str, args: dict) -> tuple[Decision, list[str]]:
+    def apply(self, decision: Decision, tool_name: str, args: dict,
+              task_id: str = "") -> tuple[Decision, list[str]]:
         applied: list[str] = []
         if self._store is None or decision is None:
             return decision, applied
         if decision.blocked:
             return decision, applied  # never unblock
-        rules = self._store.active(self._project)
+        rules = self._store.active(self._project, task_id)
         if not rules:
             self.last_applied = applied
             return decision, applied
 
-        matched = [r for r in rules if r.matches(tool_name, args or {}, self._project)]
+        matched = [r for r in rules if r.matches(tool_name, args or {}, self._project, task_id)]
         if not matched:
             self.last_applied = applied
             return decision, applied

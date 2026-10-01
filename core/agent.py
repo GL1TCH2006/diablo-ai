@@ -87,6 +87,10 @@ class Agent:
             state_listener=self._executor_state_listener,
             event_context=self._event_payload,
         )
+        # M2.14.1: the Executor needs the authoritative task id so a
+        # task-scoped rule can be matched. Sourced from TaskManager, never from
+        # tool arguments.
+        self._executor.set_task_provider(lambda: self._tasks.task_id)
         self._verifier = Verifier()
         self._messages: list[dict] = []
         self._max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
@@ -521,7 +525,16 @@ class Agent:
 
     def rules_summary(self) -> str:
         project = self._project.name if self._project else self._rules_engine.project
-        return self._rules_store.render_active(project=project, limit=self._settings.rules_max_active_in_prompt) or "(no active rules)"
+        # M2.14.1: task-scoped rules must be filtered by the *current* task here
+        # too, not only at enforcement time. Rendering every task rule regardless
+        # of which task is running tells the model a rule applies that the
+        # permission ladder is in fact ignoring, so the two disagree in the
+        # prompt the model reasons over.
+        task_id = self._tasks.task_id
+        return self._rules_store.render_active(
+            project=project, task_id=task_id,
+            limit=self._settings.rules_max_active_in_prompt,
+        ) or "(no active rules)"
 
     def rules_and_conflicts(self) -> str:
         text = self.rules_summary()
@@ -1188,8 +1201,12 @@ class Agent:
     def _reference_sections(self) -> str:
         extra = []
         try:
+            # Same task filtering as rules_summary(): the prompt and the
+            # permission ladder must agree about which rules are in force.
             rules_text = self._rules_store.render_active(
-                project=self._project.name if self._project else "", limit=self._settings.rules_max_active_in_prompt)
+                project=self._project.name if self._project else "",
+                task_id=self._tasks.task_id,
+                limit=self._settings.rules_max_active_in_prompt)
             if rules_text:
                 extra.append(rules_text)
         except Exception as exc:  # pragma: no cover - defensive

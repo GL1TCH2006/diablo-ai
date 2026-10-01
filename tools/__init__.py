@@ -1007,15 +1007,30 @@ def _knowledge_tools(settings: Settings) -> list[ToolSpec]:
     ]
 
 
+def _memory_write_level_for(tool_name: str, settings: Settings):
+    """Build the ``level_for`` hook for one memory tool.
+
+    ``ToolSpec.level_for`` is called as ``level_for(args)`` and receives only the
+    argument dict - not the tool's own name. The write policy is keyed by tool,
+    so the name has to be bound here by the factory rather than read from inside
+    the hook. Getting this wrong makes every memory write report ``SAFE``.
+    """
+    def _level_for(_args: dict) -> PermissionLevel:
+        return memory_tool.memory_write_level(tool_name, settings)
+
+    return _level_for
+
+
 def _memory_tools(settings: Settings) -> list[ToolSpec]:
     m = memory_tool
     return [
         ToolSpec(
             name="memory.remember",
-            description="Explicitly store a fact in long-term memory. Diablo never does this implicitly. Category: facts, preferences, tasks, notes, projects.",
+            description="Explicitly store a fact in long-term memory. Diablo never does this implicitly. Category: facts, preferences, tasks, notes, projects. Credential-like content is refused; memory is written to disk in plain text and must not hold secrets.",
             parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "category": {"type": "string"}, "note": {"type": "string"}}, "required": ["key", "value"]},
             required=["key", "value"],
             level=PermissionLevel.NORMAL,
+            level_for=_memory_write_level_for("memory.remember", settings),
             fn=lambda **kw: m.memory_remember(kw["key"], kw["value"], kw.get("category", "notes"), kw.get("note", ""), settings),
             describe=lambda args: f"Remember: {args.get('key')}",
         ),
@@ -1039,16 +1054,17 @@ def _memory_tools(settings: Settings) -> list[ToolSpec]:
         ),
         ToolSpec(
             name="memory.update",
-            description="Update the value of an existing memory entry.",
+            description="Update the value of an existing memory entry. Credential-like content is refused.",
             parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]},
             required=["key", "value"],
             level=PermissionLevel.NORMAL,
+            level_for=_memory_write_level_for("memory.update", settings),
             fn=lambda **kw: m.memory_update(kw["key"], kw["value"], settings),
             describe=lambda args: f"Update memory: {args.get('key')}",
         ),
         ToolSpec(
             name="memory.delete",
-            description="Delete one memory entry by key.",
+            description="Delete one memory entry by key. Always allowed, including when memory writes are disabled.",
             parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
             required=["key"],
             level=PermissionLevel.NORMAL,
@@ -1071,6 +1087,14 @@ def _memory_tools(settings: Settings) -> list[ToolSpec]:
             fn=lambda **kw: m.memory_categories(settings),
             describe=lambda args: "List memory categories",
         ),
+        ToolSpec(
+            name="memory.policy",
+            description="Report the effective memory write policy (explicit, confirm, or off).",
+            parameters={"type": "object", "properties": {}, "required": []},
+            level=PermissionLevel.SAFE,
+            fn=lambda **kw: m.memory_policy_status(settings),
+            describe=lambda args: "Show memory write policy",
+        ),
     ]
 
 
@@ -1079,15 +1103,15 @@ def _rules_tools(settings: Settings) -> list[ToolSpec]:
     return [
         ToolSpec(
             name="rules.create",
-            description="Create a restrict-only rule (block or confirm) matched by tool name and/or content. Rules can only restrict, never broaden permissions.",
+            description="Create a restrict-only rule (block or confirm) matched by tool name and/or content. Rules can only restrict, never broaden permissions. scope='tool' requires if_tool; scope='task' requires task_id. An under-specified scope is refused rather than widened to global.",
             parameters={
                 "type": "object",
-                "properties": {"name": {"type": "string"}, "action": {"type": "string", "enum": ["block", "confirm"]}, "description": {"type": "string"}, "scope": {"type": "string", "enum": ["global", "project", "tool", "task"]}, "priority": {"type": "integer"}, "if_tool": {"type": "string"}, "if_content": {"type": "string"}, "reason": {"type": "string"}, "project": {"type": "string"}},
+                "properties": {"name": {"type": "string"}, "action": {"type": "string", "enum": ["block", "confirm"]}, "description": {"type": "string"}, "scope": {"type": "string", "enum": ["global", "project", "tool", "task"]}, "priority": {"type": "integer"}, "if_tool": {"type": "string"}, "if_content": {"type": "string"}, "reason": {"type": "string"}, "project": {"type": "string"}, "task_id": {"type": "string"}},
                 "required": ["name"],
             },
             required=["name"],
             level=PermissionLevel.NORMAL,
-            fn=lambda **kw: r.rules_create(kw["name"], kw.get("action", "block"), kw.get("description", ""), kw.get("scope", "global"), int(kw.get("priority", 50)), kw.get("if_tool", ""), kw.get("if_content", ""), kw.get("reason", ""), kw.get("project", ""), settings),
+            fn=lambda **kw: r.rules_create(kw["name"], kw.get("action", "block"), kw.get("description", ""), kw.get("scope", "global"), int(kw.get("priority", 50)), kw.get("if_tool", ""), kw.get("if_content", ""), kw.get("reason", ""), kw.get("project", ""), kw.get("task_id", ""), settings),
             describe=lambda args: f"Create rule: {args.get('name')}",
         ),
         ToolSpec(
