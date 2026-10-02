@@ -1039,7 +1039,7 @@ Nothing here is claimed complete that is not.
 | M2.16.4 Screen / Display Foundation | **COMPLETE** |
 | M2.16.5 UIA + Visual Targeting | **COMPLETE** (foundation; two actions unproven against a real control — §8.6) |
 | M2.16.6 Integrated Desktop Workflows | **COMPLETE** (composition only; no autonomy, no vision) |
-| M2.16.UI Edge Companion | not started |
+| M2.16.UI Edge Companion | **COMPLETE WITH LIMITATIONS** (§7d) — see `DIABLO_M2_16_UI_COMPLETE_AUDIT.txt` |
 | M2.17 Persistent Autonomy | not started |
 | M2.18 Vision Foundation | not started |
 | Voice / STT / VAD | not started |
@@ -1105,3 +1105,43 @@ status.
 
 Still deliberately out of scope: autonomous workflows that chain input without a
 caller in the loop.
+
+---
+
+## 11. M2.16.UI status and what is next
+
+M2.16.UI is complete. The authoritative, detailed record is
+`docs/DIABLO_M2_16_UI_COMPLETE_AUDIT.txt`; this section exists so the roadmap above
+is not stale.
+
+**Built:** a headless companion state machine (`ui/companion_state.py`), pure edge
+docking arithmetic (`ui/edge.py`), a redacting event-narrowing boundary
+(`ui/companion_events.py`), a borderless edge-docked Tk view
+(`ui/edge_companion.py`), launch integration over the *existing* bridge and Agent
+(`ui/launch.py`), and the CLI flags `--edge-companion / --edge / --edge-speak`.
+
+**Verified:** 3362 deterministic and 3536 real-Windows tests pass; a 32-minute
+soak ran 640 wake/task cycles at 1.2% CPU with no growth in threads, windows,
+timers or history, and a clean shutdown. Companion-related leak deltas are 0.
+
+**The boundary held.** The companion is a client. It reaches the backend only
+through the existing `AgentBridge`, submits no task id of its own to the Agent, has
+no second store, permission manager, executor or verification ledger, and imports
+no Windows capability. Verified by AST-level tests rather than by assertion in
+prose.
+
+**Real-model validation: PARTIAL, and the interesting part.** Three bounded runs
+through the production stack with `qwen3:8b`. The companion correctly showed
+`task_completed` twice and `task_cancelled` once — and the cancellation was the
+PermissionManager refusing a tool with no confirmer, which is the permission
+architecture working, not failing. In **0 of 3** runs did the model select an
+M2.16.6 `desktop.*` workflow tool; all three chose the older `applications.open`.
+
+That is the honest headline for whoever picks this up: **the desktop workflow tools
+are validated deterministically and against real Windows, and real-model *tool
+selection* for them remains unproven.** Closing that gap is now worth more than
+another milestone.
+
+**Next milestone: M2.17 Persistent Autonomy**, entered with real-model tool
+selection for M2.16.6 as its first task, since six milestones of desktop
+capability are currently unreachable by the model that has to call them.
