@@ -425,10 +425,13 @@ class EdgeCompanionApp:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Destroy>", self._on_destroy)
 
-        # Applied now rather than on the first frame: the window exists from this
-        # moment, so it must already be a tool window that does not steal focus.
-        self._window_style.apply(root, noactivate=True)
-        self._sleeping_style_applied = True
+        # The window style is deliberately *not* applied here. Tk implements
+        # ``-transparentcolor`` by setting ``WS_EX_LAYERED``, and it does so from an
+        # idle handler - which rewrites the extended style and drops
+        # ``WS_EX_NOACTIVATE``. Applying before that would be silently undone, so
+        # :meth:`_sync_window_style` applies it after every geometry commit instead.
+        # ``None`` forces the first frame to apply it.
+        self._sleeping_style_applied = None
 
     def _draw_mark(self) -> None:
         """An original geometric presence mark.
@@ -635,12 +638,28 @@ class EdgeCompanionApp:
         self._entry.configure(
             state="disabled" if asleep else "normal",
             bg=_PANEL_BG if asleep else _ENTRY_BG)
-        if asleep != self._sleeping_style_applied:
-            self._window_style.apply(self.root, noactivate=asleep)
-            self._sleeping_style_applied = asleep
 
         self._maybe_speak(snapshot)
+        # Geometry first, window style second. The order matters: Tk rewrites the
+        # extended style when it realises the transparency attribute, which happens
+        # during the geometry commit, so styling before that would be undone.
         self._apply_placement()
+        self._sync_window_style(asleep)
+
+    def _sync_window_style(self, asleep: bool) -> None:
+        """Keep ``NOACTIVATE``/``TOOLWINDOW`` in step with the sleep state.
+
+        Only writes when the desired state actually changed, so an idle companion
+        costs no extra Win32 calls. Written after geometry commits rather than
+        before, because Tk's layered-window handling overwrites the extended style.
+        """
+        if asleep == self._sleeping_style_applied:
+            return
+        self._window_style.apply(self.root, noactivate=asleep)
+        # Recorded even on failure: ``_WindowStyle`` disables itself permanently on
+        # the first failure, so retrying every frame would just repeat a call that
+        # cannot succeed on this host.
+        self._sleeping_style_applied = asleep
 
     def _render_progress(self, progress: tuple[str, ...], accent: str) -> None:
         if len(progress) == self._rendered_progress:

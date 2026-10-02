@@ -157,8 +157,16 @@ class TestWindowShape:
         assert bool(app.root.attributes("-topmost")) is True
 
     def test_window_is_not_in_the_taskbar(self, harness) -> None:
-        """WS_EX_TOOLWINDOW keeps the presence out of the taskbar and Alt-Tab."""
+        """WS_EX_TOOLWINDOW keeps the presence out of the taskbar and Alt-Tab.
+
+        A frame is pumped first on purpose: the style is applied *after* the
+        geometry commit, because Tk's layered-window handling for
+        ``-transparentcolor`` overwrites the extended style during idle
+        processing. Asserting before the first frame would be asserting the wrong
+        thing.
+        """
         app, _, _, _ = harness
+        app.pump_once()
         import ctypes
 
         try:
