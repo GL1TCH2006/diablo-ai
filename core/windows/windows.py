@@ -361,17 +361,28 @@ class WindowLayer:
 
     @staticmethod
     def _coerce_identity(identity: Any) -> WindowIdentity:
-        """Accept a :class:`WindowIdentity` or its dict form.
+        """Accept a :class:`WindowIdentity`, its dict form, or its key string.
 
         Strict, because a partially-populated identity that is accepted would
         create a window reference that cannot be verified before it is acted on.
+
+        The key string is accepted because it is this layer's *own* durable
+        identifier: it is what ``enumerate_windows`` publishes in every row, what
+        reaches logs and model context, and what M2.16.5 stores inside a UI element
+        descriptor. A form this layer emits and cannot consume is a bug waiting for a
+        caller - and the M2.16.6 workflow hit exactly that, passing a key back to
+        ``get_window`` and being refused.
         """
         if isinstance(identity, WindowIdentity):
             return identity
+        if isinstance(identity, str):
+            return WindowIdentity.from_key(identity)
         if isinstance(identity, dict):
+            if identity.get("window_key") and not identity.get("hwnd"):
+                return WindowIdentity.from_key(str(identity["window_key"]))
             return WindowIdentity.from_dict(identity)
         raise WindowsInvalidRequestError(
-            "window identity must be a WindowIdentity or its dict form.")
+            "window identity must be a WindowIdentity, its dict form, or its key.")
 
     @classmethod
     def _refuse_if_protected(cls, info: WindowInfo, operation: str) -> None:

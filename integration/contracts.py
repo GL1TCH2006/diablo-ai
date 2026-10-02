@@ -1027,6 +1027,117 @@ class BlenderVisionCapabilityAdapter(_LayerAdapter):
         return CapabilityResult.from_value(value, request, time.perf_counter())
 
 
+class DesktopWorkflowCapabilityAdapter(_LayerAdapter):
+    """M2.16.6: exposes the desktop workflow as a capability.
+
+    Deliberately thin. The orchestration lives in
+    :mod:`integration.desktop_workflow`; this adapter only translates between the
+    capability protocol and that object, so the workflow itself never has to know
+    about :class:`CapabilityResult` and the protocol never has to know about
+    desktop concepts.
+
+    Two things are worth stating because they are easy to get wrong:
+
+    **The task id is the request's, not the params'.** ``_dispatch_request``
+    passes ``task_id`` from the request. A caller that puts ``task_id`` in
+    ``params`` gets it stripped by the workflow's own sanitiser, so a model cannot
+    steer which task a desktop mutation is attributed to.
+
+    **Cancellation is checked before dispatch, not only inside.** The workflow
+    re-checks before every mutation, but a cancelled request that has not started
+    yet should not start a window search either.
+    """
+
+    name = "desktop_workflow"
+    _operations = (
+        "open_application", "find_target", "interact", "read_target",
+        "verify_window", "run_plan",
+    )
+
+    #: Which of these change the desktop. Declared rather than inferred from the
+    #: name because ``find_target`` and ``read_target`` are reads and ``interact``
+    #: is not - and the bridge asks this adapter before deciding a level, exactly
+    #: as it asks ``WindowsCapabilityAdapter.is_mutating``. Without the declaration
+    #: every desktop operation fell through to the bridge's keyword heuristic and
+    #: demanded confirmation for an ordinary observation.
+    _mutating = frozenset({"open_application", "interact", "run_plan"})
+
+    def is_mutating(self, operation: str) -> bool:
+        return str(operation) in self._mutating
+
+    def mutating_operations(self) -> tuple[str, ...]:
+        return tuple(sorted(self._mutating))
+
+    def _operations_for_layer(self) -> tuple[str, ...]:
+        """Report only what the workflow can actually do on this host.
+
+        The Windows capability has to be present. Advertising desktop workflows
+        without it would offer operations whose every step refuses.
+        """
+        probe = getattr(self.layer, "capabilities", None)
+        try:
+            report = probe() if callable(probe) else {}
+        except Exception:  # noqa: BLE001 - discovery is isolated
+            report = {}
+        if report.get("window_capability"):
+            return tuple(op for op in self._operations if op != "run_plan")
+        return ()
+
+    def execute(self, request: CapabilityRequest) -> CapabilityResult:
+        try:
+            request.check_cancelled()
+        except CapabilityCancellationError:
+            return CapabilityResult.failure(request, CapabilityStatus.CANCELLED, "request cancelled before execution")
+        except Exception as exc:
+            return CapabilityResult.failure(request, CapabilityStatus.CANCELLED, str(exc) or type(exc).__name__)
+        if not self.can_execute(request.operation):
+            return CapabilityResult.failure(request, CapabilityStatus.INVALID_REQUEST, f"unsupported operation: {request.operation}")
+        params = dict(request.params or {})
+        # A caller-supplied context is merged under the trusted request context, the
+        # same ordering ``BlenderVisionCapabilityAdapter`` uses, so provenance is
+        # layered rather than replaced.
+        embedded = params.pop("context", None)
+        if isinstance(embedded, dict):
+            params["context"] = embedded
+        try:
+            with self._scopes(request):
+                result = self.layer.execute(
+                    request.operation, params,
+                    task_id=str(request.task_id or ""),
+                    request_id=str(request.request_id or ""))
+        except CapabilityCancellationError:
+            return CapabilityResult.failure(request, CapabilityStatus.CANCELLED, "capability observed cancellation")
+        except Exception as exc:  # noqa: BLE001 - capability boundary isolation
+            return CapabilityResult.failure(request, CapabilityStatus.FAILURE, str(exc) or type(exc).__name__, code=type(exc).__name__)
+        payload = result.to_dict() if hasattr(result, "to_dict") else {}
+        if getattr(result, "cancelled", False):
+            return CapabilityResult(status=CapabilityStatus.CANCELLED, capability=request.capability, operation=request.operation, data=payload, request_id=request.request_id, task_id=request.task_id)
+        if not getattr(result, "ok", False):
+            error = dict(payload.get("evidence", {})).get("error", {}) \
+                if isinstance(payload.get("evidence"), dict) else {}
+            code = str(payload.get("error_code") or "")
+            detail = str(payload.get("error")
+                         or error.get("message") or "desktop workflow failed")
+            # Built directly rather than via ``CapabilityResult.failure`` because the
+            # failure path must still carry ``data``: the record of *what was
+            # attempted and refused* is the observability a caller needs to decide
+            # its next move, and dropping it would leave an ambiguity refusal with no
+            # candidate windows on it. The code leads the message so ``ToolResult.error``
+            # is actionable without re-parsing the payload.
+            return CapabilityResult(
+                status=CapabilityStatus.FAILURE,
+                capability=request.capability,
+                operation=request.operation,
+                data=payload,
+                error={"error": code or "desktop_workflow_failed",
+                       "message": f"{code}: {detail}" if code else detail,
+                       "code": code},
+                request_id=request.request_id,
+                task_id=request.task_id,
+            )
+        return CapabilityResult(status=CapabilityStatus.SUCCESS, capability=request.capability, operation=request.operation, data=payload, request_id=request.request_id, task_id=request.task_id)
+
+
 class MockCapability:
     """Deterministic capability for Core-boundary tests."""
 
@@ -1069,5 +1180,6 @@ __all__ = [
     "BlenderCapabilityAdapter",
     "VisionCapabilityAdapter",
     "BlenderVisionCapabilityAdapter",
+    "DesktopWorkflowCapabilityAdapter",
     "MockCapability",
 ]
