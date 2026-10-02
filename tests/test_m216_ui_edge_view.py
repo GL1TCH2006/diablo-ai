@@ -232,6 +232,9 @@ class TestInteraction:
         app.pump_once()
         app._entry.insert(0, "Open Calculator")
         assert app._on_return() == "break"
+        # Submission is handed to the worker, so the bridge records it a moment
+        # later. The view itself returned immediately, which is the point.
+        assert controller.wait_idle(2.0)
         assert bridge.submissions and bridge.submissions[0][0] == "Open Calculator"
         assert app._entry.get() == ""
         assert controller.state is CompanionState.THINKING

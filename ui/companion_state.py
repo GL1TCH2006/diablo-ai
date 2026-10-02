@@ -43,6 +43,7 @@ stopped arriving.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -266,7 +267,24 @@ class CompanionController:
     ``ui.bridge.AgentBridge`` boundary - so permissions, task identity and
     cancellation stay owned by the Agent and this controller learns about them
     only as events.
+
+    Threading
+    ---------
+    Backend submission happens on **one daemon worker thread**, never on the
+    caller's. The view calls :meth:`submit_task` from Tk's main thread, and the
+    backend call it makes - ``Agent.respond`` - runs a model and a whole tool
+    turn. Calling that inline froze the companion's UI for the length of the turn,
+    which is exactly what Part 19 forbids. The arrangement mirrors the existing
+    ``UIController``: the caller hands over a work item and returns immediately.
+
+    The worker is created lazily on first submission, is never recreated while
+    alive, and is joined in :meth:`close`, so there is at most one and there is
+    none after shutdown.
     """
+
+    #: Name of the submission thread, so a leak is identifiable rather than merely
+    #: countable.
+    WORKER_NAME = "diablo-companion-submit"
 
     #: Explicit transition table. Anything not listed here is refused, which is
     #: what stops a late or duplicated backend event from dragging a retracting
@@ -339,10 +357,80 @@ class CompanionController:
         self._state_changed_at = self._clock()
         self._closed = False
         self._unsubscribe: Callable[[], None] | None = None
+        # Backend submission queue and its single worker. See the class docstring:
+        # the view calls submit_task from Tk's main thread and must not block.
+        self._work: "queue.Queue[tuple[str, str] | None]" = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._inflight = 0
         # Deliberately *not* subscribed here. Construction must not have the side
         # effect of wiring the controller to a live backend: the caller decides when
         # the companion starts listening, which is what makes ``close()`` provably
         # unsubscribing and the whole lifecycle testable without a backend.
+
+    # ── backend submission worker ─────────────────────────────────────
+
+    def _ensure_worker(self) -> bool:
+        """Start the submission worker if it is not already running.
+
+        Idempotent: there is never more than one, which is what keeps a repeated
+        activation from producing a second set of backend turns.
+        """
+        with self._lock:
+            if self._closed:
+                return False
+            if self._worker is not None and self._worker.is_alive():
+                return True
+            self._stopping.clear()
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=self.WORKER_NAME,
+                daemon=True,
+            )
+            self._worker = worker
+        worker.start()
+        return True
+
+    def _worker_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                item = self._work.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:            # shutdown sentinel
+                self._work.task_done()
+                break
+            job_id, text = item
+            try:
+                self._submit_to_backend(text, job_id)
+            except Exception as exc:  # noqa: BLE001 - the worker must never die
+                self.fail(f"{type(exc).__name__}: {exc}")
+            finally:
+                with self._lock:
+                    self._inflight = max(0, self._inflight - 1)
+                self._work.task_done()
+
+    def wait_idle(self, timeout: float = 2.0) -> bool:
+        """Block until every submitted task has been handed to the backend.
+
+        For tests and for hosts that drive the controller without a window. The UI
+        never calls this - it polls the snapshot instead, which is what keeps the
+        UI thread free.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                busy = self._inflight > 0
+            if not busy and self._work.unfinished_tasks == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    @property
+    def worker_alive(self) -> bool:
+        with self._lock:
+            return self._worker is not None and self._worker.is_alive()
 
     # -- lifecycle ------------------------------------------------------
 
@@ -547,7 +635,13 @@ class CompanionController:
         self._emit(CompanionEventKind.TASK_ACCEPTED,
                    clean, task_id=job_id, summary=clean)
         self._transition(CompanionState.THINKING)
-        self._submit_to_backend(clean, job_id)
+        # Hand the turn to the worker rather than running it here. See the class
+        # docstring: this method is called from Tk's main thread.
+        if not self._ensure_worker():
+            raise CompanionError("companion is closed", code="companion_closed")
+        with self._lock:
+            self._inflight += 1
+        self._work.put((job_id, clean))
         return job_id
 
     def _submit_to_backend(self, text: str, job_id: str) -> None:
@@ -838,9 +932,14 @@ class CompanionController:
         then cancel through the existing bridge so the backend is not left running
         a task whose UI has gone.
 
-        Synchronous by design. The bridge's ``cancel_task`` is a request that the
-        backend answers on its own event stream, so there is nothing here worth
-        waiting on and no shutdown timeout to mis-tune.
+        Synchronous by design *within the worker*. The bridge's ``cancel_task`` is a
+        request that the backend answers on its own event stream, so there is
+        nothing here worth waiting on and no shutdown timeout to mis-tune.
+
+        Order matters: unsubscribe first so no event arrives while tearing down,
+        then cancel through the existing bridge so the backend is not left running
+        a task whose UI has gone, then stop the worker so it cannot start another
+        turn on the way out.
         """
         with self._lock:
             if self._closed:
@@ -861,9 +960,33 @@ class CompanionController:
                 self._bridge.cancel_task(task_id)
             except Exception:  # noqa: BLE001
                 pass
+        self._stop_worker(timeout=1.0)
         with self._lock:
             self._state = CompanionState.SLEEPING
             self._state_changed_at = self._clock()
+
+    def _stop_worker(self, timeout: float = 1.0) -> bool:
+        """Stop the submission worker and wait briefly for it to finish.
+
+        The sentinel plus a bounded join is what keeps Part 17's "no orphaned
+        threads" true without ever blocking shutdown indefinitely on a backend
+        call that may be mid-model-turn.
+        """
+        self._stopping.set()
+        worker = self._worker
+        if worker is None:
+            return True
+        try:
+            self._work.put_nowait(None)
+        except Exception:  # noqa: BLE001 - queue already gone
+            pass
+        if worker.is_alive():
+            worker.join(timeout=max(0.0, float(timeout)))
+        stopped = not worker.is_alive()
+        with self._lock:
+            if self._worker is worker:
+                self._worker = None
+        return stopped
 
 
 def _clamp(value: float) -> float:

@@ -115,6 +115,15 @@ class ScriptedBridge:
         self._handler(payload)
 
 
+def _settle(controller: CompanionController, timeout: float = 2.0) -> None:
+    """Wait for the submission worker to hand the turn to the backend.
+
+    Submission is asynchronous so the view never blocks; a test that wants to
+    observe what the backend received has to wait for that hand-off.
+    """
+    assert controller.wait_idle(timeout), "backend submission never settled"
+
+
 class TestDeterministicLifecycle:
     """The full Part 27 sequence, driven step by step with no timing races."""
 
@@ -134,6 +143,7 @@ class TestDeterministicLifecycle:
 
             job = controller.submit_task("Open Calculator")
             assert controller.state is CompanionState.THINKING
+            _settle(controller)
             assert bridge.submissions == [("Open Calculator", job)]
 
             bridge.emit("executing", "Working", job)
@@ -183,6 +193,7 @@ class TestDeterministicLifecycle:
             clock.advance(1.0)
             controller.tick()
             controller.submit_task("Open Calculator")
+            _settle(controller)
             seen: set[str] = set()
             for _ in range(60):
                 clock.advance(0.5)
@@ -207,6 +218,7 @@ class TestDeterministicLifecycle:
             clock.advance(1.0)
             controller.tick()
             controller.submit_task("Open Calculator")
+            _settle(controller)
             clock.advance(5.0)
             controller.tick()
             assert controller.state is CompanionState.RETURNING
@@ -352,6 +364,7 @@ class TestLaunchPath:
             # The controller is attached exactly once to the one bridge, and the
             # submitter drops the UI's own task id rather than forwarding it.
             runtime.controller.submit_task("hello")
+            _settle(runtime.controller)
             assert agent.responses == ["hello"]
         finally:
             runtime.close()

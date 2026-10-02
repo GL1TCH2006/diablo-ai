@@ -1,4 +1,4 @@
-"""M2.16.UI - deterministic tests for the edge companion's logic and geometry.
+﻿"""M2.16.UI - deterministic tests for the edge companion's logic and geometry.
 
 Everything here runs headless with no display and no Tk, which is the point: the
 companion's behaviour must be verifiable on a build machine that has no screen.
@@ -16,6 +16,8 @@ deterministic instead of flaky on a loaded CI box.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -134,12 +136,35 @@ LEFT_MONITOR = FakeDisplay(
 )
 
 
+#: Every controller built here, so a test that forgets to close one cannot leak a
+#: submission thread into the next test. Added by :func:`_make_controller`.
+_OPEN_CONTROLLERS: list[CompanionController] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_leftover_controllers():
+    """Close any controller a test left open.
+
+    Most tests close explicitly, which is the right thing and is asserted by
+    ``test_close_stops_the_worker``. This is the backstop: without it a single
+    forgotten ``close()`` leaves a live submission thread, and the *next* test that
+    counts worker threads fails for a reason that has nothing to do with itself.
+    """
+    yield
+    while _OPEN_CONTROLLERS:
+        try:
+            _OPEN_CONTROLLERS.pop().close()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
+
+
 def _make_controller(bridge: FakeBridge | None = None, clock: FakeClock | None = None,
                      **kwargs: Any) -> tuple[CompanionController, FakeBridge, FakeClock]:
     the_bridge = bridge if bridge is not None else FakeBridge()
     the_clock = clock if clock is not None else FakeClock()
     controller = CompanionController(the_bridge, clock=the_clock, **kwargs)
     controller.attach()
+    _OPEN_CONTROLLERS.append(controller)
     return controller, the_bridge, the_clock
 
 
@@ -147,6 +172,18 @@ def _drive_to_listening(controller: CompanionController, clock: FakeClock) -> No
     controller.activate()
     clock.advance(1.0)
     controller.tick()
+
+
+def _submit_and_settle(controller: CompanionController, text: str) -> str:
+    """Submit and wait for the backend worker to finish with the turn.
+
+    Submission is asynchronous by design (the view calls it from Tk's main thread),
+    so a test that wants to observe the *result* has to wait for the worker. Tests
+    that only care about the state machine do not need this.
+    """
+    job = controller.submit_task(text)
+    assert controller.wait_idle(2.0), "backend submission never settled"
+    return job
 
 
 # ═════════════════════════════════════════════════════════════ geometry
@@ -416,14 +453,14 @@ class TestTaskSubmission:
         controller, bridge, clock = _make_controller()
         controller.activate()
         assert controller.state is CompanionState.AWAKENING
-        controller.submit_task("open calculator")
+        _submit_and_settle(controller, "open calculator")
         assert bridge.submissions and controller.state is CompanionState.THINKING
 
     def test_backend_identity_is_not_forced(self) -> None:
         """The companion keeps its own handle; the Agent owns task identity."""
         controller, bridge, clock = _make_controller()
         _drive_to_listening(controller, clock)
-        controller.submit_task("open calculator")
+        _submit_and_settle(controller, "open calculator")
         text, job_id = bridge.submissions[0]
         assert text == "open calculator"
         assert job_id == controller.task_id
@@ -432,7 +469,7 @@ class TestTaskSubmission:
         bridge = FakeBridge(submit_error=RuntimeError("backend down"))
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
-        controller.submit_task("do it")
+        _submit_and_settle(controller, "do it")
         assert controller.state is CompanionState.ERROR
         assert "backend down" in controller.snapshot().terminal_message
 
@@ -441,6 +478,7 @@ class TestTaskSubmission:
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
         controller.submit_task("delete everything")
+        assert controller.wait_idle(2.0)
         assert controller.state is CompanionState.ERROR
         assert "permission denied" in controller.snapshot().terminal_message
 
@@ -448,7 +486,7 @@ class TestTaskSubmission:
         bridge = FakeBridge(submit_result={"success": False, "error": "no"})
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
-        controller.submit_task("do it")
+        _submit_and_settle(controller, "do it")
         controller.acknowledge()
         controller.activate()
         clock.advance(1.0)
@@ -707,6 +745,151 @@ class TestTiming:
         assert controller.state is CompanionState.LISTENING
 
 
+# ═════════════════════════════════════════════════════ submission threading
+
+
+class TestSubmissionThreading:
+    """Part 19: the UI thread must never block on a model or tool turn.
+
+    This is the regression cover for a real defect: submission used to call the
+    bridge inline, so the Tk main thread sat inside ``Agent.respond`` for the whole
+    turn and the companion froze.
+    """
+
+    def test_submit_returns_before_the_backend_finishes(self) -> None:
+        gate = threading.Event()
+        entered = threading.Event()
+
+        class SlowBridge(FakeBridge):
+            def submit_message(self, text: str, task_id: str = "") -> dict:
+                entered.set()
+                gate.wait(5.0)
+                return super().submit_message(text, task_id)
+
+        bridge = SlowBridge()
+        controller, _, clock = _make_controller(bridge)
+        try:
+            _drive_to_listening(controller, clock)
+            started = time.monotonic()
+            controller.submit_task("a slow task")
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.5, (
+                f"submit_task blocked the caller for {elapsed:.2f}s")
+            assert entered.wait(2.0), "the worker never reached the backend"
+            assert controller.wait_idle(0.3) is False, (
+                "wait_idle reported idle while the backend was still blocked")
+            gate.set()
+            assert controller.wait_idle(2.0)
+        finally:
+            gate.set()
+            controller.close()
+
+    def test_submission_runs_on_a_named_daemon_worker(self) -> None:
+        seen: list[str] = []
+
+        class RecordingBridge(FakeBridge):
+            def submit_message(self, text: str, task_id: str = "") -> dict:
+                seen.append(threading.current_thread().name)
+                return super().submit_message(text, task_id)
+
+        controller, _, clock = _make_controller(RecordingBridge())
+        try:
+            assert controller.worker_alive is False
+            _drive_to_listening(controller, clock)
+            _submit_and_settle(controller, "a task")
+            assert seen == [CompanionController.WORKER_NAME], seen
+            assert controller.worker_alive is True
+        finally:
+            controller.close()
+
+    def test_only_one_worker_ever_exists(self) -> None:
+        controller, _, clock = _make_controller()
+        try:
+            _drive_to_listening(controller, clock)
+            for _ in range(5):
+                controller.retract()
+                _drive_to_listening(controller, clock)
+                controller.submit_task("task")
+            assert controller.wait_idle(2.0)
+            workers = [t for t in threading.enumerate()
+                       if t.name == CompanionController.WORKER_NAME]
+            assert len(workers) == 1, f"{len(workers)} submission workers exist"
+        finally:
+            controller.close()
+
+    def test_close_stops_the_worker(self) -> None:
+        controller, _, clock = _make_controller()
+        _drive_to_listening(controller, clock)
+        controller.submit_task("task")
+        assert controller.wait_idle(2.0)
+        assert controller.worker_alive is True
+        controller.close()
+        assert controller.worker_alive is False
+        names = [t.name for t in threading.enumerate()]
+        assert CompanionController.WORKER_NAME not in names, (
+            "the submission thread outlived close()")
+
+    def test_no_worker_thread_survives_a_busy_shutdown(self) -> None:
+        gate = threading.Event()
+
+        class BlockingBridge(FakeBridge):
+            def submit_message(self, text: str, task_id: str = "") -> dict:
+                gate.wait(3.0)
+                return {"success": True}
+
+        controller, _, clock = _make_controller(BlockingBridge())
+        _drive_to_listening(controller, clock)
+        controller.submit_task("slow")
+        controller.close()
+        gate.set()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if CompanionController.WORKER_NAME not in [
+                    t.name for t in threading.enumerate()]:
+                break
+            time.sleep(0.05)
+        assert CompanionController.WORKER_NAME not in [
+            t.name for t in threading.enumerate()], (
+            "a blocked backend call left the submission thread alive")
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_a_raising_worker_is_recovered_from(self) -> None:
+        """A pathological backend must not leave the companion permanently stuck.
+
+        The worker deliberately catches ``Exception``, not ``BaseException``:
+        swallowing ``KeyboardInterrupt`` or ``SystemExit`` inside a daemon thread
+        would be worse than letting the thread end. What matters is that the
+        controller *recovers* - ``_inflight`` is decremented in a ``finally``, and
+        the next submission starts a fresh worker because the old one is dead.
+        """
+        class FlakyBridge(FakeBridge):
+            def __init__(self) -> None:
+                super().__init__()
+                self.boom = True
+
+            def submit_message(self, text: str, task_id: str = "") -> dict:
+                if self.boom:
+                    self.boom = False
+                    raise BaseException("not an Exception subclass")
+                return super().submit_message(text, task_id)
+
+        controller, _, clock = _make_controller(FlakyBridge())
+        try:
+            _drive_to_listening(controller, clock)
+            controller.submit_task("task")
+            assert controller.wait_idle(2.0), "inflight was never released"
+
+            # The next submission must work regardless of whether the worker survived.
+            controller.retract()
+            _drive_to_listening(controller, clock)
+            _submit_and_settle(controller, "second task")
+            assert controller.state is CompanionState.THINKING
+            assert controller.worker_alive is True, (
+                "the controller could not recover a worker")
+        finally:
+            controller.close()
+
+
 # ═════════════════════════════════════════════════════ single ownership
 
 
@@ -773,7 +956,7 @@ class TestBackendFailure:
         bridge = FakeBridge(submit_error=ConnectionError("backend is not running"))
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
-        controller.submit_task("do it")
+        _submit_and_settle(controller, "do it")
         assert controller.state is CompanionState.ERROR
         assert "backend is not running" in controller.snapshot().terminal_message
         controller.acknowledge()
