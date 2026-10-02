@@ -893,6 +893,14 @@ def build_registry(
                 allowed_roots=settings.allowed_roots,
             )
         )
+        # M2.16.6: the high-level desktop workflow tools. Registered after
+        # ``capability.execute`` so the primitives stay reachable - these compose
+        # them, they do not replace them. Absent on a host without the Windows
+        # layer, in which case ``build_desktop_tools`` returns nothing rather than
+        # registering tools that would fail.
+        from .desktop import build_desktop_tools
+        for spec in build_desktop_tools(capability_registry, events=capability_events):
+            registry.register(spec)
 
     log.info("registered tools: %s", ", ".join(registry.names()))
     return registry

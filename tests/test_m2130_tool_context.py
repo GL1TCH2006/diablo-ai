@@ -288,7 +288,11 @@ def test_capability_groups_only_reference_real_capabilities():
     # A group naming a capability that does not exist would silently do nothing.
     registry = _tiny_registry()
     real = {spec.capability for spec in registry.all_specs()}
-    real |= {"capability", "blender", "vision", "data", "chart"}
+    # M2.16.6 adds ``desktop``: the high-level desktop workflow tools. Like
+    # ``capability``/``blender``/``vision`` it is capability-backed, so it is absent
+    # from a registry built without a capability runtime - which is why it belongs on
+    # the known list rather than in ``real``.
+    real |= {"capability", "blender", "vision", "data", "chart", "desktop"}
     for group, caps in CAPABILITY_GROUPS.items():
         unknown = set(caps) - real
         assert not unknown, f"group {group!r} references unknown capabilities {unknown}"

@@ -1325,6 +1325,8 @@ class CapabilityBridge:
                 "capability_execution",
                 self._json_safe({"capability": capability, "operation": operation, "data": data}),
             )
+        if capability == "desktop_workflow":
+            return self._desktop_workflow_verification(result, request, data, operation)
         if capability == "blender" and operation == "render":
             path = self._result_path(result, request)
             exists = bool(path and Path(path).is_file())
@@ -1571,6 +1573,84 @@ class CapabilityBridge:
             "No well-formed process metadata was returned.",
             "tool_observation",
             evidence,
+        )
+
+    def _desktop_workflow_verification(
+        self,
+        result: CapabilityResult,
+        request: CapabilityRequest,
+        data: dict,
+        operation: str,
+    ) -> VerificationResult:
+        """Adjudicate a desktop workflow result.
+
+        The rule this exists to enforce: **"the workflow returned successfully" is
+        not "the desktop is now in the state that was asked for".** The two are
+        reported separately, so the verdict is read from the workflow's own
+        ``verification`` field and from its per-step verifications, never from
+        ``result.success``.
+
+        Three properties make the evidence worth something:
+
+        - A mutating workflow that reports ``UNVERIFIED`` stays ``UNVERIFIED``.
+          ``uia_invoke`` has no state of its own, and that limitation does not
+          disappear because the press was wrapped in a workflow.
+        - A workflow that failed is ``FAILED`` even though the capability call
+          returned successfully - the adapter maps a refused workflow to a failed
+          result, and this closes the loop rather than trusting the mapping alone.
+        - Targeting mode travels with the verdict. "Clicked by name" and "clicked
+          a pixel" are different claims and the ledger should be able to tell.
+        """
+        verdict = str(data.get("verification") or "")
+        steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        targeting = str(data.get("targeting_mode") or "NONE")
+        fallback = bool(data.get("fallback_used"))
+        evidence = self._json_safe({
+            "operation": operation,
+            "workflow_id": data.get("workflow_id"),
+            "window_key": (data.get("context") or {}).get("window_key")
+            if isinstance(data.get("context"), dict) else None,
+            "targeting_mode": targeting,
+            "fallback_used": fallback,
+            "fallback_reason": next(
+                (s.get("fallback_reason") for s in steps
+                 if isinstance(s, dict) and s.get("fallback_reason")), ""),
+            "step_count": len(steps),
+            "step_verifications": [
+                {"step_id": s.get("step_id"), "operation": s.get("operation"),
+                 "verification": s.get("verification")}
+                for s in steps if isinstance(s, dict)],
+            "cancelled": data.get("cancelled"),
+            "error_code": data.get("error_code"),
+        })
+        if verdict == "PASSED":
+            return VerificationResult(
+                VerificationState.PASSED,
+                "The desktop workflow's postconditions were independently "
+                "observed.",
+                "desktop_workflow", evidence,
+            )
+        if verdict == "FAILED":
+            return VerificationResult(
+                VerificationState.FAILED,
+                str(data.get("verification_detail")
+                    or data.get("error")
+                    or "A desktop workflow postcondition was not observed."),
+                "desktop_workflow", evidence,
+            )
+        if verdict == "UNVERIFIED":
+            return VerificationResult(
+                VerificationState.UNVERIFIED,
+                str(data.get("verification_detail")
+                    or "The desktop workflow completed but could not be "
+                       "independently verified."),
+                "desktop_workflow", evidence,
+            )
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The desktop workflow returned no verification state, so nothing "
+            "about the desktop has been checked.",
+            "desktop_workflow", evidence,
         )
 
     def _workflow_verification(

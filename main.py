@@ -13,7 +13,13 @@ def build_confirmer_from(ui):
     return ui.confirmer
 
 
-def close_capability_runtime(workflow, integration, blender, windows=None) -> None:
+def close_capability_runtime(workflow, integration, blender, windows=None,
+                             desktop_workflow=None) -> None:
+    """Release every capability the runtime built.
+
+    ``desktop_workflow`` is optional, so this stays call-compatible with the
+    pre-M2.16.6 signature.
+    """
     try:
         if workflow is not None:
             workflow.close()
@@ -26,10 +32,13 @@ def close_capability_runtime(workflow, integration, blender, windows=None) -> No
                 if blender is not None:
                     blender.close()
             finally:
-                close_windows(windows)
+                try:
+                    close_desktop_workflow(desktop_workflow)
+                finally:
+                    close_windows(windows)
 
 
-def build_capability_runtime(settings, events):
+def build_capability_runtime(settings, events, permissions=None):
     from blender.capabilities import BlenderCapabilityLayer
     from integration import (
         BlenderCapabilityAdapter,
@@ -38,15 +47,19 @@ def build_capability_runtime(settings, events):
         BlenderVisionWorkflow,
         BlenderVisionWorkflowCapabilityAdapter,
         CapabilityRegistry,
+        DesktopWorkflow,
+        DesktopWorkflowCapabilityAdapter,
         VisionCapabilityAdapter,
         WindowsCapabilityAdapter,
     )
+    from tools import applications
     from vision.capabilities import VisionCapabilityLayer
 
     blender = None
     integration = None
     workflow = None
     windows = None
+    desktop_workflow = None
     try:
         blender = BlenderCapabilityLayer(work_dir=settings.data_dir / "blender")
         vision = VisionCapabilityLayer()
@@ -66,6 +79,18 @@ def build_capability_runtime(settings, events):
             windows = build_windows_capability()
             if windows.detect_capabilities().get("available"):
                 capability_registry.register(WindowsCapabilityAdapter(windows))
+                # M2.16.6: the desktop workflow composes the Windows capability
+                # that was just registered. It is built only on that path, because
+                # without a window layer there is nothing for it to orchestrate and
+                # its own capability probe would report unavailable anyway.
+                desktop_workflow = DesktopWorkflow(
+                    capability_registry,
+                    permissions=permissions,
+                    applications=applications.open_app,
+                    events=events,
+                )
+                capability_registry.register(
+                    DesktopWorkflowCapabilityAdapter(desktop_workflow))
             else:
                 close_windows(windows)
                 windows = None
@@ -73,11 +98,40 @@ def build_capability_runtime(settings, events):
             log.warning("native Windows capability unavailable: %s", exc)
             close_windows(windows)
             windows = None
+            close_desktop_workflow(desktop_workflow)
+            desktop_workflow = None
+        # Five values, unchanged from before M2.16.6. The desktop workflow is reached
+        # through the capability registry like every other capability rather than
+        # widening this helper's return shape - a six-tuple would break every caller
+        # that already unpacks five, for no benefit: nothing outside here needs the
+        # object, because the registry is where a capability is looked up.
         return capability_registry, integration, blender, workflow, windows
     except Exception:
         close_windows(windows)
+        close_desktop_workflow(desktop_workflow)
         close_capability_runtime(workflow, integration, blender)
         raise
+
+
+def close_desktop_workflow(desktop_workflow) -> None:
+    """Release the desktop workflow's task bindings and cancel tokens."""
+    if desktop_workflow is None:
+        return
+    try:
+        desktop_workflow.close()
+    except Exception:  # pragma: no cover - shutdown is best effort
+        pass
+
+
+def close_registered_desktop_workflow(capability_registry) -> None:
+    """Close the desktop workflow held by the registry, if one was registered."""
+    if capability_registry is None:
+        return
+    try:
+        adapter = capability_registry.get("desktop_workflow")
+    except Exception:  # pragma: no cover - shutdown is best effort
+        return
+    close_desktop_workflow(getattr(adapter, "layer", None))
 
 
 def close_windows(windows) -> None:
@@ -130,6 +184,15 @@ def main() -> int:
     provider = backend.provider
 
     bus = EventBus()
+    # M2.16.6: the PermissionManager is built *before* the capability runtime
+    # because the desktop workflow needs the same instance the Executor uses. Two
+    # managers would mean two session-block tables and two preference sets, and a
+    # block applied by one gate would not be seen by the other - which is exactly
+    # how a "blocked" tool ends up dispatching anyway.
+    from config.permissions import PermissionManager
+    preferences = PreferencesStore(settings.memory_dir)
+    permissions = PermissionManager(settings, preferences)
+
     capability_blender = None
     capability_integration = None
     capability_workflow = None
@@ -142,7 +205,7 @@ def main() -> int:
             capability_blender,
             capability_workflow,
             capability_windows,
-        ) = build_capability_runtime(settings, bus)
+        ) = build_capability_runtime(settings, bus, permissions=permissions)
     except Exception as exc:
         log.warning("S2 capability runtime unavailable: %s", exc)
         capability_registry = None
@@ -157,7 +220,6 @@ def main() -> int:
         capability_events=bus,
     )
     conversation = ConversationStore(settings.memory_dir, settings.max_conversation_turns)
-    preferences = PreferencesStore(settings.memory_dir)
     project_memory = ProjectMemory(settings.memory_dir, settings.workspace_root)
 
     discovered = project_memory.discover()
@@ -173,9 +235,6 @@ def main() -> int:
         project_memory.set_active(first.name)
 
     blender = BlenderController()
-
-    from config.permissions import PermissionManager
-    permissions = PermissionManager(settings, preferences)
 
     happy = f"-> AI backend: {backend.note}  [{len(backend.models)} model(s) detected]" if backend.models else f"-> AI backend: {backend.note}"
     print(happy)
@@ -202,7 +261,12 @@ def main() -> int:
         )
 
     def close_capabilities():
-        close_capability_runtime(capability_workflow, capability_integration, capability_blender, capability_windows)
+        # The desktop workflow is closed first: it holds references to the Windows
+        # capability and its task-scoped cancellation tokens, and both outlive the
+        # registry it was reached through.
+        close_registered_desktop_workflow(capability_registry)
+        close_capability_runtime(capability_workflow, capability_integration,
+                                 capability_blender, capability_windows)
 
     if args.demo:
         try:

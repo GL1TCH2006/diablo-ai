@@ -97,7 +97,11 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "github": ("gh",),
     "knowledge": ("memory", "rules"),
     "model_admin": ("models",),
-    "desktop": ("applications",),
+    # M2.16.6: the ``desktop`` signal widens to the high-level desktop workflow
+    # tools. ``capability.execute`` stays in the ``capability`` group so the
+    # primitives underneath are still reachable from the model - the high-level
+    # tools are a shorter route, not the only one.
+    "desktop": ("applications", "desktop"),
     "capability": ("capability",),
     "blender": ("capability",),
     "vision": ("capability",),
