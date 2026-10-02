@@ -7,6 +7,7 @@ from typing import Any
 
 from config.permissions import PermissionLevel, path_is_within
 from core.verification import VerificationResult, VerificationState
+from core.windows.errors import WindowsInvalidRequestError
 from integration import (
     CapabilityRegistry,
     CapabilityRequest,
@@ -781,6 +782,363 @@ def _verify_virtual_desktop(self: "CapabilityBridge", common: dict,
     )
 
 
+def _verify_uia_enumeration(self: "CapabilityBridge", common: dict,
+                            data: dict) -> VerificationResult:
+    """Discovery passes only when the elements returned were actually described.
+
+    The claim a caller would otherwise be making is "here is that window's UI", so
+    the check is that every returned element is anchored, described and
+    structurally complete. A truncation flag does not fail: a bounded search is a
+    legitimate answer, but only when the response *says* it was bounded.
+    """
+    from core.windows.uia import identity_from_payload
+
+    elements = data.get("elements") if isinstance(data.get("elements"), list) else []
+    evidence = _uia_evidence(self, common, data)
+    evidence["element_count"] = len(elements)
+    exhaustive = data.get("exhaustive")
+
+    # Read the anchor through the shared reader rather than reaching into
+    # ``element["identity"]`` directly: the model-facing payload keeps the identity
+    # inside its labelled ``recipe`` block, so a hardcoded path here found nothing
+    # and reported every real element as unanchored.
+    unanchored = []
+    for element in elements:
+        if not isinstance(element, dict):
+            unanchored.append("")
+            continue
+        try:
+            if not identity_from_payload(element).window_key:
+                unanchored.append(str(element.get("target_id")))
+        except WindowsInvalidRequestError:
+            unanchored.append(str(element.get("target_id")))
+    if unanchored:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"{len(unanchored)} element(s) came back without a window anchor, so "
+            "none of them could be acted on.",
+            "capability_execution", evidence,
+        )
+    malformed = [str((e or {}).get("target_id")) for e in elements
+                 if isinstance(e, dict) and not isinstance(e.get("bounds"), (dict, type(None)))]
+    if malformed:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"{len(malformed)} element(s) were returned without usable geometry.",
+            "capability_execution", evidence,
+        )
+    if exhaustive is not True and exhaustive is not False:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The response does not say whether the search was exhaustive, so its "
+            "completeness cannot be checked.",
+            "capability_execution", evidence,
+        )
+    if exhaustive is False:
+        return VerificationResult(
+            VerificationState.PASSED,
+            f"Described {len(elements)} element(s); the search hit a bound and was "
+            "not exhaustive, which the response reports.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Described {len(elements)} element(s) in an exhaustive search.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_uia_inspection(self: "CapabilityBridge", common: dict,
+                          data: dict) -> VerificationResult:
+    """A window inspection passes on the anchor, not on an element.
+
+    ``uia_inspect_window`` describes the window's own control tree root. It resolves
+    no element and names no target, so it must not be judged by
+    :func:`_verify_uia_target` - that would ask for ``resolved`` and ``target_id``
+    fields this response structurally cannot have, and report every honest
+    inspection as unverifiable.
+
+    What it *can* be held to is the window anchor being real and the payload being
+    labelled untrusted, since the whole privacy guarantee for M2.16.5 rests on
+    application text arriving marked as data.
+    """
+    from core.windows.coordinates import Rect
+
+    evidence = _uia_evidence(self, common, data)
+    window_key = str(data.get("window_key") or "")
+    evidence["window_key"] = window_key
+    if not window_key:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The inspection names no window anchor, so there is nothing to trust.",
+            "capability_execution", evidence,
+        )
+    window = data.get("window") if isinstance(data.get("window"), dict) else {}
+    try:
+        bounds = Rect.from_dict(window.get("bounds"))
+    except Exception as exc:  # noqa: BLE001
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The inspected window has unusable bounds: {exc}",
+            "capability_execution", evidence,
+        )
+    if bounds.is_empty:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The inspected window reported an empty rectangle.",
+            "capability_execution", evidence,
+        )
+    if data.get("untrusted") is not True:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The inspection did not mark application-supplied text as untrusted, so "
+            "it must not be treated as verified output.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Window {window_key!r} inspected; its bounds {bounds.to_dict()} were read "
+        "from the live window and its text is marked untrusted.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_uia_target(self: "CapabilityBridge", common: dict,
+                       data: dict) -> VerificationResult:
+    """A resolved target passes only when it re-resolved to the recorded identity.
+
+    Re-derived here rather than trusted: the recorded and observed identities are
+    compared field by field, so a "resolved" claim that quietly points at something
+    else is caught at the ledger rather than at the click.
+    """
+    from core.windows.uia import identity_from_payload
+
+    evidence = _uia_evidence(self, common, data)
+    if data.get("resolved") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The target was not reported as resolved, so there is nothing to "
+            "verify.",
+            "capability_execution", evidence,
+        )
+    element = data.get("element") if isinstance(data.get("element"), dict) else {}
+    try:
+        observed = identity_from_payload(element)
+    except WindowsInvalidRequestError as exc:
+        # A response that cannot produce an identity has not re-resolved anything,
+        # whatever else it claims. Failing closed here is the point of this
+        # verifier: an unreadable target must never be reported as a verified one.
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The response carries no readable UI element identity: {exc}",
+            "capability_execution", evidence,
+        )
+    recorded_id = str(data.get("target_id") or "")
+    evidence["target_id"] = recorded_id
+    if recorded_id and recorded_id != observed.target_id:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The response claims target {recorded_id!r} but describes "
+            f"{observed.target_id!r}. The target was resolved to something else.",
+            "capability_execution", evidence,
+        )
+    if not observed.window_key:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The resolved element has no window anchor, so it is not actionable.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"Target {observed.target_id!r} re-resolved to the recorded element in "
+        f"window {observed.window_key!r}.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_uia_point(self: "CapabilityBridge", common: dict,
+                      data: dict) -> VerificationResult:
+    """A derived point passes only when it is anchored and inside its window.
+
+    Recomputes the containment from the reported rectangles rather than believing
+    the point. An unanchored point is the M2.16.2 failure this whole path exists
+    to prevent, so it fails loudly rather than being reported as derived.
+    """
+    from core.windows.coordinates import Rect
+
+    evidence = _uia_evidence(self, common, data)
+    point = data.get("point") if isinstance(data.get("point"), dict) else {}
+    bounds = data.get("element_bounds") if isinstance(
+        data.get("element_bounds"), dict) else {}
+    window_rect = data.get("window_rect") if isinstance(
+        data.get("window_rect"), dict) else {}
+    try:
+        px, py = int(point["x"]), int(point["y"])
+        left, top = int(bounds["left"]), int(bounds["top"])
+        right, bottom = int(bounds["right"]), int(bounds["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The response is missing the point or the element bounds, so the "
+            "conversion cannot be verified.",
+            "capability_execution", evidence,
+        )
+    if data.get("anchored") is not True:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The derived point is not anchored to a verified window.",
+            "capability_execution", evidence,
+        )
+    inside = (left <= px < right) and (top <= py < bottom)
+    evidence["point_inside_element"] = inside
+    if not inside:
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"({px}, {py}) is outside the element rectangle it was derived from "
+            f"{bounds}.",
+            "capability_execution", evidence,
+        )
+    if window_rect:
+        window = Rect.from_dict(window_rect)
+        if window is not None and not window.contains(px, py):
+            return VerificationResult(
+                VerificationState.FAILED,
+                f"({px}, {py}) is outside the window it was derived from.",
+                "capability_execution", evidence,
+            )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"({px}, {py}) is an anchored point inside the element "
+        f"{bounds}. This establishes the conversion; dispatch still re-verifies "
+        "foreground.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_uia_action(self: "CapabilityBridge", common: dict,
+                       data: dict) -> VerificationResult:
+    """A UIA action passes only on an observed postcondition.
+
+    The adapter re-reads the pattern's own state property and reports what it saw;
+    this verifies that the reported state is a genuine one rather than defaulting
+    to PASSED because a COM call returned. ``UNVERIFIED`` from the adapter stays
+    ``UNVERIFIED`` here: ``Invoke`` exposes no state, and inventing a pass for it
+    is exactly the claim this repository refuses to make.
+    """
+    evidence = _uia_evidence(self, common, data)
+    verification = data.get("verification") if isinstance(
+        data.get("verification"), dict) else {}
+    status = str(verification.get("status") or "")
+    evidence.update({k: v for k, v in verification.items()
+                     if k not in ("status", "reason")})
+    evidence["target_id"] = data.get("target_id")
+    evidence["pattern"] = data.get("pattern")
+
+    if not status:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The action reported no verification state.",
+            "capability_execution", evidence,
+        )
+    if status == "PASSED":
+        return VerificationResult(
+            VerificationState.PASSED,
+            f"{data.get('pattern')} was applied and the postcondition was "
+            f"observed: {verification.get('observed_state') or verification.get('observed_value') or verification.get('observed_selected')}",
+            "capability_execution", evidence,
+        )
+    if status == "FAILED":
+        return VerificationResult(
+            VerificationState.FAILED,
+            f"The {data.get('pattern')} call was made but the postcondition was "
+            f"not observed. {verification.get('reason') or ''}".strip(),
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.UNVERIFIED,
+        f"The {data.get('pattern')} action could not be independently verified: "
+        f"{verification.get('reason') or status}.",
+        "capability_execution", evidence,
+    )
+
+
+def _verify_visual_target(self: "CapabilityBridge", common: dict,
+                          data: dict) -> VerificationResult:
+    """A visual target passes only when its claim was checked against real state.
+
+    And it is never *actionable*, whatever the verdict. That is the boundary this
+    operation exists to hold: a visual claim can be validated, and turning it into
+    a place to click goes through the anchored pointer path.
+    """
+    evidence = _uia_evidence(self, common, data)
+    verdict = str(data.get("verdict") or "")
+    checks = data.get("checks") if isinstance(data.get("checks"), dict) else {}
+    evidence["visual_verdict"] = verdict
+    evidence["target_id"] = data.get("target_id")
+
+    if data.get("actionable") is not False:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "A visual target reported itself as actionable, which it must never "
+            "do: dispatch goes through the anchored pointer path.",
+            "capability_execution", evidence,
+        )
+    if not verdict:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The response carries no verdict to verify.",
+            "capability_execution", evidence,
+        )
+    if checks.get("source_installed") is not True:
+        return VerificationResult(
+            VerificationState.UNVERIFIED,
+            "The target's declared source has no installed producer, so the claim "
+            "cannot be corroborated. It is still not actionable.",
+            "capability_execution", evidence,
+        )
+    if checks.get("within_display") is False or checks.get("within_window") is False:
+        return VerificationResult(
+            VerificationState.FAILED,
+            "The claimed region is not inside the display or window it was "
+            "attributed to.",
+            "capability_execution", evidence,
+        )
+    return VerificationResult(
+        VerificationState.PASSED,
+        f"The claim is structurally valid and consistent with current desktop "
+        f"state ({verdict}). It remains non-actionable by design.",
+        "capability_execution", evidence,
+    )
+
+
+def _uia_evidence(self: "CapabilityBridge", common: dict,
+                  data: dict) -> dict:
+    """Evidence common to UI Automation results.
+
+    ``untrusted`` is carried on purpose. Every string in a UIA result came from
+    another application, and a ledger entry that does not say so invites a later
+    reader to treat a button's label as if it were trustworthy text.
+    """
+    return self._json_safe({
+        **common,
+        "untrusted_application_data": data.get("untrusted") is not False,
+        "dead_nodes_skipped": data.get("dead_nodes_skipped"),
+    })
+
+
+_UIA_VERIFIERS: dict[str, Any] = {
+    "uia_inspect_window": _verify_uia_inspection,
+    "uia_find_elements": _verify_uia_enumeration,
+    "uia_resolve_target": _verify_uia_target,
+    "uia_target_point": _verify_uia_point,
+    "uia_invoke": _verify_uia_action,
+    "uia_set_value": _verify_uia_action,
+    "uia_toggle": _verify_uia_action,
+    "uia_select": _verify_uia_action,
+    "uia_expand_collapse": _verify_uia_action,
+    "visual_resolve_target": _verify_visual_target,
+}
+
 _DISPLAY_VERIFIERS: dict[str, Any] = {
     "list_displays": _verify_display_enumeration,
     "primary_display": _verify_primary_display,
@@ -1183,6 +1541,12 @@ class CapabilityBridge:
         # pixels, and a capture can never carry them into this evidence.
         if operation in _DISPLAY_VERIFIERS:
             return _DISPLAY_VERIFIERS[operation](self, common, data)
+
+        # M2.16.5 UI Automation and visual targeting. A resolved target is checked
+        # against its recorded identity, a derived point against the rectangle it
+        # came from, and an action only passes on an observed postcondition.
+        if operation in _UIA_VERIFIERS:
+            return _UIA_VERIFIERS[operation](self, common, data)
 
         # list / get / find: structural validity of the returned rows.
         rows = data.get("processes")

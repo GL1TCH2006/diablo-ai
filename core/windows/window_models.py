@@ -31,12 +31,24 @@ an opaque integer used only by the layer that produced it, exactly as a pid is.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .errors import WindowsInvalidRequestError
 
 __all__ = ["WindowIdentity", "WindowInfo"]
+
+# The inverse of ``WindowIdentity.key``. ``class_name`` is greedy so a class name
+# containing a colon survives the round trip, and the timestamp is matched
+# explicitly because its own colons make a positional split ambiguous.
+_WINDOW_KEY_PATTERN = re.compile(
+    r"^(?P<pid>\d+)"
+    r":(?P<created>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r":(?P<class_name>.*)"
+    r":(?P<instance>[0-9]+)"
+    r":(?P<hwnd>\d+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +105,43 @@ class WindowIdentity:
         """
         pid, created = self.process_identity
         return f"{pid}:{created}:{self.class_name}:{self.instance}:{self.hwnd}"
+
+    @classmethod
+    def from_key(cls, key: Any) -> "WindowIdentity":
+        """Rebuild an identity from its :attr:`key` string.
+
+        The key is the form that reaches logs, evidence and model context, so it has
+        to be usable as an input too - otherwise a caller holding only a key (which
+        is exactly what a stored UI element descriptor holds) has no way to re-resolve
+        the window it names.
+
+        This parses with a regex rather than ``split(":")`` for one specific reason:
+        ``created_at`` is a timestamp and **contains colons**, so a real key reads
+        ``1234:2026-10-02 19:14:52:MyClass:2a4:9876``. Splitting that on ":" does not
+        yield six fields, so a naive parser builds a silently wrong identity which
+        then fails the ``matches`` check against the live window - reported as a
+        confusing "identity mismatch" when the real fault is the parser. The class
+        name may also contain a colon, hence a greedy group anchored at both ends.
+
+        Refuses anything that is not a complete key rather than producing a partial
+        identity: an unanchored identity that looked usable would be worse than a
+        refusal.
+        """
+        if isinstance(key, WindowIdentity):
+            return key
+        text = str(key or "").strip()
+        match = _WINDOW_KEY_PATTERN.match(text)
+        if match is None:
+            raise WindowsInvalidRequestError(
+                f"{text!r} is not a window identity key; expected "
+                "pid:YYYY-MM-DD HH:MM:SS:class:instance:hwnd.")
+        return cls(
+            hwnd=int(match.group("hwnd")),
+            process_identity=(int(match.group("pid")),
+                              match.group("created")),
+            class_name=match.group("class_name"),
+            instance=int(match.group("instance")),
+        )
 
     def matches(self, other: "WindowIdentity | None") -> bool:
         """Whether ``other`` is provably the same window.

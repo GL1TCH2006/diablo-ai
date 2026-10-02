@@ -69,6 +69,8 @@ from .displays import (
     DisplayLayer,
     displays_available,
 )
+from .uia import UIALayer, uia_available
+from .visual import VisualTarget
 from .processes import ProcessLayer
 from .system import SystemLayer, system_available
 from .window_models import WindowIdentity
@@ -106,6 +108,15 @@ WINDOWS_OPERATIONS = (
     "point_to_display",
     # capture (M2.16.4). One operation, and the only mutating one in this block.
     "capture_screen",
+    # UI Automation queries (M2.16.5)
+    "uia_inspect_window", "uia_find_elements", "uia_resolve_target",
+    "uia_target_point",
+    # UI Automation actions (M2.16.5)
+    "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+    "uia_expand_collapse",
+    # Visual target evaluation (M2.16.5). Read-only: it validates a claim and
+    # never produces a dispatchable coordinate.
+    "visual_resolve_target",
 )
 
 #: Operations that need the display layer. Withheld on a host that cannot read
@@ -114,6 +125,15 @@ WINDOWS_OPERATIONS = (
 _DISPLAY_OPERATIONS = frozenset({
     "list_displays", "primary_display", "virtual_desktop", "get_display",
     "point_to_display", "capture_screen",
+})
+
+#: Operations that need UI Automation. Withheld on a host without COM or without a
+#: registered ``UIAutomationCore``, for the same reason: advertising a verb that can
+#: only report the provider missing would be worse than not offering it.
+_UIA_OPERATIONS = frozenset({
+    "uia_inspect_window", "uia_find_elements", "uia_resolve_target",
+    "uia_target_point", "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+    "uia_expand_collapse",
 })
 
 #: Operations that change machine state. Everything else is a query.
@@ -142,11 +162,15 @@ _MUTATING_OPERATIONS = frozenset({
     "key_tap",
     "hotkey",
     "type_text",
-    # M2.16.4. ``capture_screen`` is declared mutating because that is this
-    # codebase's term for "requires elevated permission", and capturing the screen
-    # is the first operation in M2.16 that can expose something the user did not
-    # intend to show. The five display queries above it are reads and stay SAFE.
+# capture is the only M2.16.4 mutation.
     "capture_screen",
+    # M2.16.5. Every UIA action mutates another application's UI, so all five are
+    # declared mutating and reach the bridge already escalated. None of them is
+    # "just a button click" from this system's point of view: pressing it changes
+    # state the user did not ask this process to change. The four query verbs and
+    # ``visual_resolve_target`` only read, and stay SAFE.
+    "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+    "uia_expand_collapse",
 })
 
 #: Input operations that cannot work without the window layer, because each one
@@ -229,12 +253,26 @@ class WindowsCapabilityLayer:
                           and op not in _WINDOW_DEPENDENT_INPUT_OPERATIONS]
         if native and not display_native:
             operations = [op for op in operations if op not in _DISPLAY_OPERATIONS]
+        uia_native = uia_available()
+        if native and not uia_native:
+            # UIA actions need a window to anchor to, so they are withheld with
+            # the rest of the window-dependent set above.
+            #
+            # ``visual_resolve_target`` is deliberately *not* withheld. Its whole
+            # point is to describe a rectangle an application drew, and the
+            # ``geometry`` source needs no UI Automation at all - it is plain
+            # window-rectangle arithmetic. Gating it on UIA would mean a host
+            # without comtypes quietly lost a capability it can genuinely perform,
+            # and a ``uia``-sourced target simply reports its own source
+            # unavailable at resolve time instead.
+            operations = [op for op in operations if op not in _UIA_OPERATIONS]
         return {
             "available": native,
             "operations": operations,
             "mutating_operations": sorted(_MUTATING_OPERATIONS),
             "window_available": window_native,
             "display_available": display_native,
+            "uia_available": uia_native,
             "backend": "native",
             "detail": ("native Windows APIs via pywin32"
                        if native else "pywin32 is not installed"),
@@ -248,12 +286,13 @@ class WindowsCapabilityLayer:
             return
         self._closed = True
         with self._lock:
-            # Display before capture: the capture layer holds a reference to the
-            # display layer and is closed first so it is not left pointing at a
+            # UIA before capture/display: the UIA layer holds a reference to the
+            # window layer and is closed first so it is not left pointing at a
             # closed dependency.
             for layer in (self._processes, self._system, self._windows,
                            getattr(self, "_capture", None),
                            getattr(self, "_input", None),
+                           getattr(self, "_uia", None),
                            getattr(self, "_displays", None)):
                 closer = getattr(layer, "close", None)
                 if callable(closer):
@@ -901,6 +940,184 @@ class WindowsCapabilityLayer:
         payload = {"capture": capture.metadata()}
         payload["trusted_request_id"] = self.trusted_request_id()
         return payload
+
+    # ------------------ M2.16.5 UI Automation and visual targeting
+
+    def _uia_layer(self) -> UIALayer:
+        """The UI Automation adapter, sharing the window layer.
+
+        The same window layer is passed in because every element is anchored
+        through it, and a second window layer could disagree about whether a window
+        is still valid.
+        """
+        layer = getattr(self, "_uia", None)
+        if layer is None:
+            layer = self._uia = UIALayer(self._window_layer())
+        return layer
+
+    def _uia_read(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the UI Automation query.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            payload = getattr(self._uia_layer(), method)(
+                cancelled=self._cancelled, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        result = dict(payload)
+        result["trusted_request_id"] = self.trusted_request_id()
+        return result
+
+    def uia_inspect_window(self, window: Any = None, **_ignored: Any) -> dict:
+        """Describe one window's root UI element. Read-only."""
+        if window is None:
+            raise WindowsInvalidRequestError(
+                "uia_inspect_window requires a window identity.")
+        return self._uia_read("inspect_window", window=window)
+
+    def uia_find_elements(self, window: Any = None, automation_id: Any = None,
+                          name: Any = None, control_type: Any = None,
+                          max_results: Any = None, max_depth: Any = None,
+                          **_ignored: Any) -> dict:
+        """Find elements under a window, bounded and typed. Read-only.
+
+        Four optional equality filters, never a predicate language: a model that can
+        express an arbitrary condition can express one this layer cannot bound or
+        cancel. Every response reports whether it was exhaustive.
+        """
+        if window is None:
+            raise WindowsInvalidRequestError(
+                "uia_find_elements requires a window identity.")
+        return self._uia_read(
+            "find_elements", window=window, automation_id=automation_id,
+            name=name, control_type=control_type, max_results=max_results,
+            max_depth=max_depth)
+
+    def uia_resolve_target(self, target: Any = None, window: Any = None,
+                           **_ignored: Any) -> dict:
+        """Re-resolve a recorded element and report whether it is still the same.
+
+        This is the stale-target gate. Read-only, and deliberately the *only* way
+        to convert a stored target into a live one.
+        """
+        if target is None:
+            raise WindowsInvalidRequestError(
+                "uia_resolve_target requires an element descriptor.")
+        return self._uia_read("resolve", target=target, window=window)
+
+    def uia_target_point(self, target: Any = None, window: Any = None,
+                         **_ignored: Any) -> dict:
+        """Convert an element to an anchored, window-relative point. Read-only.
+
+        The result is produced by the M2.16.2 coordinate resolver, so it carries
+        that provenance and can be handed to the existing pointer capability. It is
+        still not a dispatch: the pointer layer re-verifies foreground itself.
+        """
+        if target is None:
+            raise WindowsInvalidRequestError(
+                "uia_target_point requires an element descriptor.")
+        return self._uia_read("target_point", target=target, window=window)
+
+    def _uia_action(self, action: str, target: Any, window: Any,
+                    **kwargs: Any) -> dict[str, Any]:
+        """Shared shape for the five semantic actions.
+
+        Preflight cancellation here, then the adapter's resolve-verify-act-
+        re-read sequence. The permission check has already happened above this
+        layer, in the bridge.
+        """
+        self._guard()
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the UI Automation action.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            payload = self._uia_layer().act(action, target, window,
+                                            cancelled=self._cancelled,
+                                            **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        result = dict(payload)
+        result["trusted_request_id"] = self.trusted_request_id()
+        return result
+
+    def uia_invoke(self, target: Any = None, window: Any = None,
+                   observe: Any = None, settle: Any = None,
+                   **_ignored: Any) -> dict:
+        """Invoke an element's Invoke pattern. Mutating.
+
+        ``Invoke`` has no state of its own, so with no ``observe`` element the
+        result is honestly UNVERIFIED: Windows accepting the call is not evidence
+        that anything happened. Naming a second element whose visible state should
+        change turns it into a verifiable action, and that is the difference
+        between a button press that is checked and one that is merely attempted.
+        """
+        return self._uia_action("invoke", target, window, observe=observe,
+                                settle=settle)
+
+    def uia_set_value(self, target: Any = None, window: Any = None,
+                      value: Any = None, settle: Any = None,
+                      **_ignored: Any) -> dict:
+        """Set an element's value. Mutating.
+
+        Verified by reading the value back, so a provider that silently refuses
+        reports FAILED rather than applied.
+        """
+        return self._uia_action("set_value", target, window,
+                                value=str(value or ""), settle=settle)
+
+    def uia_toggle(self, target: Any = None, window: Any = None,
+                   settle: Any = None, **_ignored: Any) -> dict:
+        """Toggle an element. Mutating. Verified by re-reading the toggle state."""
+        return self._uia_action("toggle", target, window, settle=settle)
+
+    def uia_select(self, target: Any = None, window: Any = None,
+                   settle: Any = None, **_ignored: Any) -> dict:
+        """Select an element. Mutating. Verified by re-reading the selected flag."""
+        return self._uia_action("select", target, window, settle=settle)
+
+    def uia_expand_collapse(self, target: Any = None, window: Any = None,
+                            state: Any = None, settle: Any = None,
+                            **_ignored: Any) -> dict:
+        """Expand or collapse an element. Mutating.
+
+        Verified by re-reading the expand state.
+        """
+        return self._uia_action("expand_collapse", target, window,
+                                state=str(state or "expand"), settle=settle)
+
+    def visual_resolve_target(self, target: Any = None, **_ignored: Any) -> dict:
+        """Validate a visual-target claim against current desktop state. Read-only.
+
+        Never returns an actionable point. A visual target is a *claim*; turning it
+        into a place to click is the pointer layer's job, and it re-resolves and
+        re-checks foreground when it does. This exists so the claim is tested
+        against real state before anything downstream is allowed to rely on it.
+        """
+        self._guard()
+        if target is None:
+            raise WindowsInvalidRequestError(
+                "visual_resolve_target requires a visual target descriptor.")
+        if self._cancelled():
+            raise WindowsCancelledError(
+                "Cancelled before the visual target check.",
+                diagnostics={"cancellation_terminated": False})
+        try:
+            visual = VisualTarget.from_dict(target)
+            verdict = visual.revalidate(
+                display_layer=self._display_layer(),
+                window_layer=self._window_layer(),
+                cancelled=self._cancelled)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(exc)
+            raise
+        verdict["trusted_request_id"] = self.trusted_request_id()
+        verdict["untrusted"] = True
+        return verdict
 
     # ---------------------------------------------------------------- utils
 

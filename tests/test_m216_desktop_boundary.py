@@ -113,12 +113,16 @@ class TestMutationIsClassifiedByDeclaration:
             "mouse_double_click",
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
             "capture_screen",
+            "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+            "uia_expand_collapse",
         })
 
         keywords = tuple(w.lower() for w in bridge_module._MUTATING_WORDS)
         for verb in ("window_focus", "window_minimize", "window_restore",
                      "window_close", "mouse_left_click", "mouse_double_click",
-                     "key_tap", "hotkey", "type_text"):
+                     "key_tap", "hotkey", "type_text",
+                     "uia_invoke", "uia_set_value", "uia_toggle",
+                     "uia_select", "uia_expand_collapse"):
             assert not any(word in verb.lower() for word in keywords), (
                 f"{verb} would have been classified by a keyword rule, so this "
                 "test no longer proves the declaration is what is doing the work")

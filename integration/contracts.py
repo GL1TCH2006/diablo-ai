@@ -931,6 +931,15 @@ class WindowsCapabilityAdapter(_LayerAdapter):
         # necessarily intend to show, and must arrive at the bridge already
         # escalated. The five display queries are reads and deliberately absent.
         "capture_screen",
+        # M2.16.5. Each UIA action mutates another application's UI - pressing a
+        # button, changing a field, toggling a control - so each is declared
+        # mutating. None of them is "just a button click" from this system's point
+        # of view. The four query verbs are reads and deliberately absent.
+        "uia_invoke",
+        "uia_set_value",
+        "uia_toggle",
+        "uia_select",
+        "uia_expand_collapse",
     })
 
     def _operations_for_layer(self) -> tuple[str, ...]:

@@ -185,6 +185,77 @@ class WindowsInvalidRequestError(WindowsError):
     message = "The Windows request was invalid."
 
 
+# ══════════════════════════════════════════════════════ M2.16.5 targeting
+
+
+class WindowsTargetNotFoundError(WindowsError):
+    """No element matches the supplied target identity.
+
+    M2.16.5. Distinct from :class:`WindowsTargetStaleError` on purpose: "nothing
+    was ever found by that description" and "it was found and has since gone" are
+    different answers, and a caller recovering from one needs a fresh discovery
+    while the other may just need to retry.
+    """
+
+    code = "target_not_found"
+    message = "No UI element matches the supplied target identity."
+
+
+class WindowsTargetStaleError(WindowsError):
+    """The target's owning window is gone, so the element cannot exist.
+
+    M2.16.5. This is the race that makes UI automation dangerous: discovery found
+    an element, and by the time the action was about to run the application had
+    closed or rebuilt itself. Reported as its own outcome rather than being
+    silently retargeted at whatever occupies those coordinates now.
+    """
+
+    code = "target_stale"
+    message = ("The target's window is no longer valid, so the element cannot be "
+               "used.")
+
+
+class WindowsTargetChangedError(WindowsError):
+    """The element is still there, but it is no longer the thing that was found.
+
+    M2.16.5. Control type, automation id, bounds or accessible name have changed,
+    or the tree was rebuilt around it. Acting anyway would mean operating on a
+    target the caller never selected - the closest thing to a wrong-window action
+    that does not involve a window handle.
+    """
+
+    code = "target_changed"
+    message = ("The UI element still exists but no longer matches the recorded "
+               "target identity.")
+
+
+class WindowsInvalidGeometryError(WindowsError):
+    """A rectangle or point that cannot name a location.
+
+    M2.16.5. Zero-size, inverted, or off-screen element rectangles. Distinct from a
+    bad request because the geometry came from Windows, and the useful answer is
+    "this element cannot be pointed at" rather than "your arguments were wrong".
+    Never resolved by clamping: silently moving a target is how automation ends up
+    clicking something adjacent to what was asked for.
+    """
+
+    code = "invalid_geometry"
+    message = "The element geometry does not describe a usable location."
+
+
+class WindowsProviderUnavailableError(WindowsError):
+    """A required native provider is not present on this host.
+
+    M2.16.5. UI Automation needs COM and a registered ``UIAutomationCore``. A host
+    without either gets a typed "unavailable" rather than an ``AttributeError``
+    from deep inside a traversal, which is what makes the layer's absence
+    detectable instead of merely broken.
+    """
+
+    code = "provider_unavailable"
+    message = "The required native provider is unavailable on this host."
+
+
 class WindowsOperationFailedError(WindowsError):
     """An infrastructure failure that is none of the above."""
 
@@ -223,6 +294,18 @@ windows_error_status_table: dict[str, str] = {
     WindowsWindowNotFoundError.code: "invalid_request",
     WindowsWindowGoneError.code: "failure",
     WindowsWindowIdentityMismatchError.code: "invalid_request",
+    # M2.16.5 targeting. A name that matches nothing and a target that has gone
+    # away are both caller-visible problems, so they are invalid requests rather
+    # than generic failures; the distinction that matters is the *code*, which lets
+    # a caller tell "look again" from "that never existed". "Changed" is a real
+    # race like a destroyed window, so it is a failure. Absent geometry and an
+    # absent provider are neither: the first is an unusable location and the second
+    # is a host that cannot do this at all.
+    WindowsTargetNotFoundError.code: "invalid_request",
+    WindowsTargetStaleError.code: "invalid_request",
+    WindowsTargetChangedError.code: "failure",
+    WindowsInvalidGeometryError.code: "invalid_request",
+    WindowsProviderUnavailableError.code: "unavailable",
     WindowsOperationFailedError.code: "failure",
     WindowsError.code: "failure",
 }

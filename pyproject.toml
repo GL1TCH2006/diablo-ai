@@ -14,6 +14,14 @@ requires-python = ">=3.11"
 # PowerShell path, the ``windows`` capability to not being registered), so a
 # non-Windows host is degraded rather than broken.
 #
+# ``comtypes`` backs the M2.16.5 UI Automation layer. It is required separately
+# from ``pywin32`` because UIA is native-COM only: ``pywin32``'s ``win32com`` needs
+# an ``IDispatch``/typelib to bind late, and UIA exposes none, so ``win32com`` cannot
+# reach it at all. ``comtypes`` binds the interfaces properly and is what makes
+# ``uia_*`` possible. Also Windows-only, and gated the same way - ``uia_available()``
+# reports False and the ``uia_*`` operations are withheld, so a non-Windows host is
+# degraded rather than broken.
+#
 # ``requirements.txt`` is the full install set and additionally carries the
 # test dependency (pytest).
 dependencies = [
@@ -23,6 +31,7 @@ dependencies = [
     "numpy>=1.24",
     "matplotlib>=3.7",
     "pywin32>=306; sys_platform == 'win32'",
+    "comtypes>=1.4.17; sys_platform == 'win32'",
 ]
 
 [tool.pytest.ini_options]

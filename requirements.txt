@@ -7,3 +7,8 @@ matplotlib>=3.7
 # M2.15 native Windows systems layer. Windows-only; the agent degrades rather
 # than failing on a host without it (see core/windows/__init__.py).
 pywin32>=306; sys_platform == 'win32'
+# M2.16.5 UI Automation. Separate from pywin32 because UIA is native-COM only:
+# win32com needs an IDispatch/typelib to bind late and UIA exposes none, so only
+# comtypes can reach it. Windows-only; without it uia_available() is False and
+# the uia_* operations are withheld.
+comtypes>=1.4.17; sys_platform == 'win32'

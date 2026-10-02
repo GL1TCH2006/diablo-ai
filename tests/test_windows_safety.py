@@ -59,9 +59,10 @@ def layer():
 
 class TestTheOperationSurfaceIsClosed:
     def test_the_operations_are_exactly_the_documented_ones(self):
-        # M2.16 took the surface from five to eleven, and M2.16.2/.3 took it to
-        # twenty-two. Enumerated rather than counted, because the property under
-        # test is that the set is known and deliberate, not that it has a length.
+        # M2.16 took the surface from five to eleven, M2.16.2/.3 to twenty-two,
+        # M2.16.4 to twenty-eight and M2.16.5 to thirty-eight. Enumerated rather
+        # than counted, because the property under test is that the set is known
+        # and deliberate, not that it has a length.
         assert WINDOWS_OPERATIONS == (
             "list", "get", "find", "system_info",
             "list_windows", "get_window",
@@ -76,6 +77,13 @@ class TestTheOperationSurfaceIsClosed:
             # M2.16.4 display topology and bounded capture.
             "list_displays", "primary_display", "virtual_desktop", "get_display",
             "point_to_display", "capture_screen",
+            # M2.16.5 UIA and visual targeting. The reads expose application labels,
+            # so they carry untrusted text; the actions mutate and are declared.
+            "uia_inspect_window", "uia_find_elements", "uia_resolve_target",
+            "uia_target_point",
+            "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+            "uia_expand_collapse",
+            "visual_resolve_target",
         )
 
     def test_every_mutation_is_declared(self):
@@ -83,7 +91,7 @@ class TestTheOperationSurfaceIsClosed:
 
         The M2.15 wording was "terminate is the only one", which was true then
         and is not now. The property it guarded is still worth guarding, over all
-        fourteen.
+        twenty.
         """
         assert _MUTATING_OPERATIONS == frozenset({
             "terminate", "window_focus", "window_minimize",
@@ -92,6 +100,8 @@ class TestTheOperationSurfaceIsClosed:
             "mouse_double_click",
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
             "capture_screen",
+            "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+            "uia_expand_collapse",
         }), (
             "the mutating set changed; a new mutation needs a test and a "
             "permission level like the others have")

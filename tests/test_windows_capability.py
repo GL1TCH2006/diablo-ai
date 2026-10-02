@@ -243,10 +243,11 @@ class _StubLayer:
 
 class TestCapabilitySurface:
     def test_the_operation_set_is_closed(self):
-        # M2.16 extended the surface from five to eleven and M2.16.2/.3 took it to
-        # twenty-two. Enumerated explicitly rather than counted: the point of this
-        # test is that the set is known and deliberate, so a future addition has to
-        # be a conscious edit here.
+        # M2.16 extended the surface from five to eleven, M2.16.2/.3 to
+        # twenty-two, M2.16.4 to twenty-eight and M2.16.5 to thirty-eight.
+        # Enumerated explicitly rather than counted: the point of this test is that
+        # the set is known and deliberate, so a future addition has to be a
+        # conscious edit here.
         assert WINDOWS_OPERATIONS == (
             "list", "get", "find", "system_info",
             "list_windows", "get_window",
@@ -258,6 +259,11 @@ class TestCapabilitySurface:
             "key_press", "key_release", "key_tap", "hotkey", "type_text",
             "list_displays", "primary_display", "virtual_desktop", "get_display",
             "point_to_display", "capture_screen",
+            "uia_inspect_window", "uia_find_elements", "uia_resolve_target",
+            "uia_target_point",
+            "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+            "uia_expand_collapse",
+            "visual_resolve_target",
         )
 
     def test_the_adapter_advertises_what_the_layer_offers(self):
@@ -277,30 +283,38 @@ class TestCapabilitySurface:
     
         The original intent was that nothing could join the mutating set without a
         permission level and a test. That intent is stronger now that there are
-        fourteen mutating operations rather than one, so it is asserted over all of
+        twenty mutating operations rather than one, so it is asserted over all of
         them: each is declared, each is SENSITIVE, and no read is.
-    
+
         The pointer and keyboard verbs matter most here. Each one reaches a window
         the user did not necessarily name, so an input verb judged SAFE would
-        dispatch input with no permission asked for at all.
+        dispatch input with no permission asked for at all. The same argument
+        applies to the UIA actions, which reach into an application the user may
+        not have named either - ``uia_find_elements`` reads, ``uia_invoke`` presses.
         """
         from config.permissions import PermissionLevel
-    
+
         adapter = WindowsCapabilityAdapter(_StubLayer())
         assert adapter.is_mutating("terminate") is True
         for op in ("window_focus", "window_minimize", "window_restore",
                    "window_close", "mouse_move", "mouse_left_click",
                    "mouse_right_click", "mouse_double_click", "key_press",
-                   "key_release", "key_tap", "hotkey", "type_text"):
+                   "key_release", "key_tap", "hotkey", "type_text",
+                   "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+                   "uia_expand_collapse"):
             assert adapter.is_mutating(op) is True, f"{op} was not declared mutating"
         for op in ("list", "get", "find", "system_info", "list_windows",
-                   "get_window", "get_cursor_pos", "get_foreground_window"):
+                   "get_window", "get_cursor_pos", "get_foreground_window",
+                   "uia_inspect_window", "uia_find_elements", "uia_resolve_target",
+                   "uia_target_point", "visual_resolve_target"):
             assert adapter.is_mutating(op) is False, f"{op} was declared mutating"
         assert adapter.mutating_operations == tuple(sorted({
             "terminate", "window_close", "window_focus", "window_minimize",
             "window_restore", "mouse_move", "mouse_left_click",
             "mouse_right_click", "mouse_double_click", "key_press",
             "key_release", "key_tap", "hotkey", "type_text", "capture_screen",
+            "uia_invoke", "uia_set_value", "uia_toggle", "uia_select",
+            "uia_expand_collapse",
         })), "the adapter's mutating tuple is not the declared set, sorted"
         _ = PermissionLevel
 

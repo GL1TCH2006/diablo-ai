@@ -15,7 +15,24 @@ Source audit: `docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt` (31 sections,
 
 ## 1. Verification summary
 
-### M2.16.2 / M2.16.3
+### M2.16.5
+
+| Check | Result |
+|---|---|
+| Full suite, deterministic | **3080 passed, 175 skipped** |
+| Full suite, real-Windows gates (`DIABLO_REAL_WINDOWS_TESTS=1`) | **3211 passed, 44 skipped** |
+| M2.16.5 deterministic module (`tests/test_windows_uia.py`) | **56 passed** |
+| M2.16.5 real-Windows module (`tests/test_windows_uia_real.py`) | **28 passed** |
+| `python -m compileall` | clean |
+| `pip check` | no broken requirements |
+| Process / window / GDI leaks from the new tests | none |
+
+The M2.16.4 baseline was 2996 passed / 175 skipped deterministic and 3127 passed /
+44 skipped real. M2.16.5 adds 84 tests and no test was weakened to reach green.
+Details, including the two findings that presented as UIA provider bugs and were
+not, are in §7b.
+
+### M2.16.2 / M2.16.3 / M2.16.4
 
 | Check | Result |
 |---|---|
@@ -577,6 +594,196 @@ returning `None` is what makes a click both count once and focus.
 
 ---
 
+## 7b. M2.16.5 UI Automation and visual targeting
+
+M2.16 could name a window and act on it by coordinate. It could not name *a thing
+inside* a window. M2.16.5 adds that, and changes nothing above the capability
+boundary.
+
+### 7b.1 Why `comtypes`, and not `pywin32`
+
+UI Automation is native-COM. `UIAutomationCore.dll` registers **no typelib**, so
+there is nothing for `win32com` to generate early bindings from, and it does not
+support `IDispatch`, so late binding fails with `E_NOINTERFACE`. `comtypes` loads
+the interfaces from the DLL at runtime and drives them, so it is the smallest thing
+that reaches UIA at all. This is now declared in `pyproject.toml` and
+`requirements.txt` as a Windows-only dependency, separately from `pywin32`, with
+the reason recorded where a future reader will find it.
+
+`uia_available()` probes rather than assumes. Without it, the nine `uia_*`
+operations are withheld and the agent is degraded, not broken.
+
+### 7b.2 An element identity is a recipe, not a label
+
+No single UIA field is a safe primary key, so a target is a recipe and `target_id`
+is a deterministic digest of it:
+
+| component            | stability                                                        |
+| -------------------- | ---------------------------------------------------------------- |
+| `window_key`         | M2.16.1 identity (hwnd, pid + creation time, class, instance). The anchor. |
+| `runtime_id`         | Unique *within one running instance*. **Not** in the digest — baking it in would change every id on restart. |
+| `automation_id`      | Stable for a well-behaved app, often the Win32 control id — but **not unique**. |
+| `name`               | Human-readable and **not unique at all**.                          |
+| `occurrence`         | Index among siblings matching the above. Without it, "the first button called OK" and "the second" are one target. |
+
+An identity with no `automation_id`, no `name` and no `runtime_id` is **refused**.
+Every field defaults, so such an identity is reachable by accident — and it matches
+"the first element that has no name", which is how a click lands on the wrong
+control.
+
+`WindowIdentity.from_key()` was added, and is the inverse of `.key`. This is not
+incidental: a stored element names its window *by key*, so without a way back from
+a key the whole stale-target story cannot run. The first implementation split the
+key on `":"`, which silently mis-parses it because `created_at` **contains colons**
+(`1234:2026-10-02 19:14:52:MyClass:2a4:9876`). That produced a plausible identity
+that then failed the live `matches` check and surfaced as a confusing *identity
+mismatch* — pointing the investigation at the window layer instead of at the
+parser. It is a regex now, with a test for the colons in the timestamp and for a
+class name containing colons.
+
+### 7b.3 Application text is confined to a labelled envelope
+
+A button can be labelled `ignore previous instructions`. The first implementation
+built the model payload by starting from the internal `to_dict()` — which
+legitimately carries `name`, `automation_id` and `class_name` in the clear, because
+that is what re-resolution needs — and bolting an untrusted envelope on top. That
+published the same hostile string **twice**: once unlabelled, once labelled. A model
+reading the unlabelled copy sees an instruction.
+
+Every model-facing result is now built field by field. Application text appears
+only inside `recipe`, which is labelled `UNTRUSTED_APPLICATION_DATA` and carries an
+instruction to never follow it. The recipe still *travels* — it is confined, not
+deleted, because an element whose name is stripped cannot be acted on again. Text
+is truncated at 512 characters and the truncation says so, because an application
+can put a megabyte in a control's name.
+
+### 7b.4 Five actions, each with a postcondition
+
+`uia_invoke`, `uia_set_value`, `uia_toggle`, `uia_select`, `uia_expand_collapse` —
+all five declared mutating, all five SENSITIVE, all five cancellable. There is
+deliberately **no** `execute(pattern, args)`: a generic entry point would accept any
+pattern id with arbitrary arguments and no defined preconditions, which is a COM
+escape hatch rather than an API.
+
+Each re-reads the pattern's own state and compares. Two findings are worth
+recording because both looked like provider bugs and were not:
+
+- **Toggle.** The postcondition is "the state changed". An implementation that
+  accepted any non-`None` reading as success exited its settle loop on the first
+  poll — which returns the state from *before* the action — and reported
+  `off → off / FAILED` for a checkbox that had flipped. Every working toggle was a
+  failure until the predicate compared against `state_before`.
+- **Invoke.** `Invoke` has no state of its own, so with no witness the result is
+  honestly `UNVERIFIED`: Windows accepting the call is not evidence that anything
+  happened. Naming a second element whose visible state should change turns it
+  into a verifiable action. Without a settle poll the witness was read once,
+  immediately, and returned the pre-press state.
+
+UIA actions are **asynchronous**: they are delivered through the owning thread's
+message loop. This layer does not pump another application's queue — sleeping
+instead would report every real action as a failure. An optional `settle` callback
+lets an in-process host run its own loop; a caller driving a real application
+passes nothing and the application's own loop does the work.
+
+### 7b.5 Pattern access, and a trap worth naming
+
+`GetCurrentPattern` returns a bare `IUnknown`, and UIA has one method per pattern
+and cannot choose a return type, so each pattern is `QueryInterface`-ed into its own
+interface. That cast is also the honest availability test: an unsupported pattern
+yields a pointer that will not convert, so "supported" means *usable*.
+
+`GetCurrentPropertyValue` **must not be used**. It takes an overloaded parameter
+whose generated binding does not dispatch correctly — it answers with the element's
+control type and ignores the property id, which would have made every postcondition
+compare control-type numbers.
+
+Every pattern read is a COM acquisition, and the polling loops read one many times
+a second. The bare `IUnknown` and the typed reference are both released on every
+path. The test measures 300 read rounds and asserts the live COM pointer count does
+not move — and asserts first that it *can* detect a leak by retaining 50 references
+on purpose, so passing the check means something.
+
+### 7b.6 A visual target is a claim, never a place to click
+
+`VisualTarget` holds a rectangle, a declared source, a confidence and its
+provenance — and no image, no model output and no native handle. Its revalidation
+report says `actionable: False` unconditionally, and `assert_not_dispatchable()`
+raises for it, so a visual claim cannot reach an input verb. Turning a claim into a
+place to click goes through the existing anchored pointer path, which re-resolves
+and re-checks foreground.
+
+`geometry` and `uia` are installed. `future_vision` and `future_ocr` are **declared
+and unavailable**: named so the shape is pinned early and explicitly not working
+providers. A target from an uninstalled source reports `UNCORROBORATED`.
+
+`visual_resolve_target` is *not* withheld when UIA is unavailable. Its `geometry`
+source is plain rectangle arithmetic, so gating it on `comtypes` would mean a host
+quietly lost a capability it can genuinely perform.
+
+### 7b.7 Validation
+
+| gate | result |
+| ---- | ------ |
+| M2.16.5 deterministic (`test_windows_uia.py`) | 56 passed |
+| M2.16.5 real Windows (`test_windows_uia_real.py`) | 28 passed |
+| Full deterministic | **3080 passed, 175 skipped** (was 2996 + 175) |
+| Full real Windows (`DIABLO_REAL_WINDOWS_TESTS=1`) | **3211 passed, 44 skipped** (was 3127 + 44) |
+| `compileall`, `pip check` | clean |
+| Process / window / GDI leaks from the new tests | none (delta 0) |
+
+Every action assertion has an independent witness outside UI Automation: a toggle
+is cross-checked against `BM_GETCHECK`, a `set_value` against `GetWindowTextW`,
+and an `Invoke` against a label the button's own `WM_COMMAND` handler changes. A
+test that only asks UIA whether UIA worked proves nothing.
+
+The test surface is native Win32 controls in-process. Tk was rejected: it exposes
+generic unnamed panes with no usable patterns, so a Tk fixture would have tested
+nothing.
+
+### 7b.8 Known limitation: recoverable structured exceptions from `comtypes`
+
+Running the real UIA module under pytest prints a number of `Windows fatal
+exception: access violation` lines with a C stack trace. They are **recovered** —
+Python's SEH handler continues, every test passes, and no reference is leaked — and
+they appear **only** because pytest enables `faulthandler`. Running the same tests
+with `-p no:faulthandler` produces zero messages and the same result.
+
+Characterised, not guessed:
+
+- It is **not** this layer's code. The count is unchanged whether `_release` calls
+  COM `Release()` explicitly or lets `comtypes` release on collection, and
+  unchanged whether the message-loop `argtypes` are declared. Both were A/B'd.
+- It does not occur outside UIA interaction. A standalone create/pump/close cycle
+  and a single-element `_describe` both print nothing.
+- It scales with pattern probing, i.e. with the `QueryInterface` that
+  `_patterns_of` performs for every pattern UIA might support — including the ones
+  it does not, which is the point of that call (§7b.5).
+- It originates inside `comtypes`' generated `UIAutomationCore` bindings.
+
+It is reported rather than suppressed: silencing it would hide a genuine fault if
+one ever appears. The results themselves are trustworthy for an independent reason
+— every action is cross-checked against Win32 (§7b.7), not against UIA. If it is
+ever diagnosed further, `-p no:faulthandler` makes the noise go away without
+changing behaviour, and the harness would then silently stop reporting real
+faults, so it is recorded here rather than configured away.
+
+### 7b.9 Two findings that were not UIA's fault
+
+- The fixture's `WM_COMMAND` handler read the **HIWORD** of `wParam` for the
+  control id. `WM_COMMAND` packs the **LOWORD** as the id and the HIWORD as the
+  notification, so the handler compared against `BN_CLICKED` (always 0) and never
+  fired. An `Invoke` then "worked" and changed nothing, which reads exactly like a
+  broken provider.
+- `RegisterClassW` fails with `ERROR_CLASS_ALREADY_EXISTS` for every probe after
+  the first, because the class is process-wide. Treating that as an error made the
+  fixture usable once. Tolerating it without unregistering was worse: the class
+  holds a raw pointer to the previous probe's `WNDPROC`, so Windows called into
+  freed memory and took the interpreter down with
+  `STATUS_FATAL_USER_CALLBACK_EXCEPTION`. The class is now unregistered on close,
+  and every callback is retained deliberately.
+
+---
+
 ## 8. Still not done
 
 1. **Knowledge Graph case-normalisation** (audit #9). Not addressed.
@@ -591,6 +798,20 @@ returning `None` is what makes a click both count once and focus.
    validated against an independent implementation, but *this session* does not
    present window content into the screen device context (§7.9), so the one
    pixel-level assertion is environment-skipped. On a session that does, it runs.
+6. **`uia_select` and `uia_expand_collapse` are unexercised against a real
+   control** (§7b.4). Both are implemented, declared mutating and refuse cleanly on
+   a control that lacks the pattern, but the fixture's combo box exposes only
+   `Value`, and a list box's items came back upper-cased and in reverse insertion
+   order through every message id tried. Rather than assert against a fixture
+   element whose behaviour was not understood, the list box was removed. A real
+   `ListView`/`TreeView`/`ComboBox` target is the obvious next fixture.
+7. **No screenshot is a model input.** M2.16.5 keeps pixels out of every payload;
+   M2.18 Vision Foundation is where image data reaches a model, and it must make
+   that decision explicitly rather than inherit it. `future_vision` and
+   `future_ocr` are declared and unavailable (§7b.6).
+8. **No visual producer beyond `geometry`.** A vision or OCR target has no
+   installer, and `VisualTarget` currently has no way to be created from a detector
+   output — only validated once it exists.
 
 Nothing here is claimed complete that is not.
 
@@ -604,55 +825,73 @@ Nothing here is claimed complete that is not.
 | M2.16.2 Pointer Foundation | **COMPLETE** |
 | M2.16.3 Keyboard Foundation | **COMPLETE** |
 | M2.16.4 Screen / Display Foundation | **COMPLETE** |
-| M2.16.5 UIA + Visual Targeting | not started |
+| M2.16.5 UIA + Visual Targeting | **COMPLETE** (foundation; two actions unproven against a real control — §8.6) |
 | M2.16.6 Integrated Desktop Workflows | not started |
 | M2.16.UI Edge Companion | not started |
 | M2.17 Persistent Autonomy | not started |
 | M2.18 Vision Foundation | not started |
 | Voice / STT / VAD | not started |
 
-OCR, vision, a VLM, UI Automation, the accessibility tree, visual element
-targeting, continuous screenshot polling, screen recording and cloud image
-analysis are all **absent and deliberately so**. `tools/local_vlm.py` and the
-`capabilities.py` "analyze UI elements in a screenshot" entry point are
-pre-existing placeholders from before M2.16; M2.16.4 did not wire, activate or
-test them, and nothing in the new code path reaches them.
+**Accessibility tree:** UI Automation is now present, but only as the narrow set in
+§7b — bounded discovery, five semantic actions, no arbitrary predicate query and no
+generic pattern dispatch. It is a target mechanism, not a general screen reader.
+
+OCR, vision, a VLM, visual element targeting beyond `geometry`, continuous
+screenshot polling, screen recording and cloud image analysis are all **absent and
+deliberately so**. `future_vision` and `future_ocr` are declared names in
+`core/windows/visual.py` and explicitly report `installed: False` (§7b.6).
+`tools/local_vlm.py` and the `capabilities.py` "analyze UI elements in a screenshot"
+entry point are pre-existing placeholders from before M2.16; neither M2.16.4 nor
+M2.16.5 wired, activated or tested them, and nothing in the new code path reaches
+them.
 
 ---
 
 ## 10. Recommended next task
 
-**M2.16.5 — UI Automation and visual targeting, on the foundation M2.16 now
-provides.**
+**M2.16.6 — close the two unexercised actions, on a fixture that can actually
+exercise them** (§8.6).
 
-M2.16 is complete as a foundation: a target is a verified identity rather than a
-coordinate, input is permission-gated and cancellable, display topology and
-geometry are trustworthy, and capture is bounded and explicit. What it deliberately
-does *not* have is a way to name a *thing* on screen — which is exactly the gap
-UIA fills.
+M2.16.5 is complete as a foundation: a control can be named by a stable recipe,
+re-resolved against a verified window immediately before acting, and acted on only
+through one of five declared, cancellable, postcondition-checked actions. Its two
+gaps are both about *proof*, not about capability:
 
-Boundaries M2.16.5 must respect, all established above:
+- `uia_select` and `uia_expand_collapse` refuse cleanly on a control lacking the
+  pattern, but no fixture in this milestone exposes `SelectionItem` or
+  `ExpandCollapse`. A `ListView` or a real drop-down `ComboBox` would. The list box
+  that was tried came back upper-cased and reverse-ordered through every message id
+  attempted, and was removed rather than asserted against — a fixture element whose
+  behaviour is not understood is not something to assert on.
+- A mid-flight race is not yet covered: a target resolved and then destroyed
+  *between* resolution and dispatch. The anchor refuses it (§7b.2), but the test
+  proving it does not exist yet.
 
-- **UIA is a separate capability with its own mutating set**, not more verbs on
+Boundaries M2.16.6 must respect, all established above:
+
+- **UIA stays a separate capability with its own mutating set**, not more verbs on
   `windows`. Invoking a control is a mutation of someone else's application.
-- **Targeting is identity-based, like everything else in M2.16.** A control is
-  named by its automation identity and re-resolved immediately before acting on
-  it. A coordinate derived from a screenshot must be resolved back through a
-  verified target before it is dispatched — the same rule M2.16.2 established for
-  a bare `ScreenPoint`, and the reason `require_anchored` exists.
-- **A screenshot is not yet a model input.** M2.16.4 deliberately keeps pixels out
-  of every payload. M2.18 Vision Foundation is where image data is handed to a
-  model, and it must make that decision explicitly rather than inherit it.
+- **Targeting stays identity-based.** A control is named by its automation identity
+  and re-resolved immediately before acting on it. A coordinate derived from a
+  screenshot must be resolved back through a verified target before it is
+  dispatched — the same rule M2.16.2 established for a bare `ScreenPoint`, and the
+  reason `require_anchored` exists.
+- **A screenshot is still not a model input.** M2.16.5 keeps pixels out of every
+  payload. M2.18 Vision Foundation is where image data is handed to a model, and it
+  must make that decision explicitly rather than inherit it.
 - **Windows Graphics Capture is the better tool for a specific window's contents**
   (§7.8), including DWM-captured windows that a screen `BitBlt` misses. This
   machine is a concrete example of what a screen-level capture cannot see.
 
+Then **M2.18 Vision Foundation**, where the `future_vision` seam declared in §7b.6
+either gets a real producer or is removed.
+
 Alongside that, the deferred real-model suites (`test_knowledge_p9_real_model.py`,
 `test_recovery_p10_real_model.py`, `DIABLO_P9_TIMEOUT=300`, ~50 min, needs Ollama)
-remain unrerun since Phase 10. M2.16 does not touch the agent turn path or recovery
-— it adds a native capability and touches no existing execution path — so this is
-not urgent. But it is now four milestones stale, and no fresh real-model validation
-is claimed for M2.14.1, M2.15, M2.15.2 or M2.16.
+remain unrerun since Phase 10. Neither M2.16 nor M2.16.5 touches the agent turn
+path or recovery — both add native capabilities and touch no existing execution
+path — so this is not urgent. But it is now five milestones stale, and no fresh
+real-model validation is claimed for M2.14.1, M2.15, M2.15.2, M2.16 or M2.16.5.
 
 Still deliberately out of scope: autonomous workflows that chain input without a
 caller in the loop.

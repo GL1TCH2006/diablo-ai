@@ -94,6 +94,15 @@ from .displays import (
     read_virtual_desktop,
 )
 from .input import CURSOR_TOLERANCE, InputDispatchResult, InputLayer, Keys
+from .uia import (
+    DISCOVERY_LIMITS,
+    UIALayer,
+    UIElementDescriptor,
+    UIElementIdentity,
+    uia_available,
+)
+from .visual import SOURCES as VISUAL_SOURCES
+from .visual import VisualTarget
 from .processes import ProcessLayer
 from .system import SystemLayer, read_memory, read_system_info, system_available
 from .window_models import WindowIdentity, WindowInfo
@@ -137,6 +146,13 @@ __all__ = [
     "ScreenCapture",
     "displays_available",
     "read_virtual_desktop",
+    "UIALayer",
+    "UIElementIdentity",
+    "UIElementDescriptor",
+    "uia_available",
+    "DISCOVERY_LIMITS",
+    "VisualTarget",
+    "VISUAL_SOURCES",
     "windows_available",
     "ProcessInfo",
     "TerminationResult",
