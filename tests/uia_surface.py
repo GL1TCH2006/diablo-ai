@@ -150,6 +150,7 @@ _current_probe: "UiaProbe | None" = None
 _class_registered = False
 
 
+
 def _dispatch(hwnd, msg, wparam, lparam):
     probe = _current_probe
     if probe is None:
@@ -333,6 +334,27 @@ class UiaProbe:
 
     def control(self, name: str) -> int:
         return int(self.controls[name])
+
+    def own_window_key(self) -> str:
+        """This probe's key, resolved by handle rather than by title.
+
+        ``window_key()`` searches by title, so with two probes sharing a title it
+        may return the *other* one. When a test needs to name a specific window -
+        the ambiguity test does - it has to ask by handle. The full identity is
+        enumerated rather than assembled here, because ``get_window`` requires a
+        creation time before it will treat an identity as verifiable.
+        """
+        from core.windows.windows import WindowLayer
+
+        layer = WindowLayer()
+        try:
+            for info in layer.enumerate_windows(include_untitled=True):
+                if int(info.hwnd) == int(self.hwnd):
+                    return info.identity.key
+        finally:
+            layer.close()
+        raise AssertionError(
+            f"window 0x{self.hwnd:X} was not found among the enumerated windows")
 
     def window_key(self) -> str:
         """The M2.16.1 identity key for this window, as the capability sees it.

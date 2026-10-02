@@ -15,6 +15,23 @@ Source audit: `docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt` (31 sections,
 
 ## 1. Verification summary
 
+### M2.16.6
+
+| Check | Result |
+|---|---|
+| Full suite, deterministic | **3163 passed, 197 skipped** |
+| Full suite, real-Windows gates (`DIABLO_REAL_WINDOWS_TESTS=1`) | **3316 passed, 44 skipped** |
+| M2.16.6 deterministic module (`tests/test_m2166_desktop_workflow.py`) | **83 passed** |
+| M2.16.6 real-Windows module (`tests/test_m2166_desktop_workflow_real.py`) | **22 passed** |
+| `python -m compileall` | clean |
+| `pip check` | no broken requirements |
+| Leaks from the M2.16.6 tests (processes / windows / apps) | 0 / 0 / 0 |
+
+The M2.16.5 baseline was 3080 passed / 175 skipped deterministic and 3211 passed /
+44 skipped real. **REAL-MODEL VALIDATION DEFERRED** — the Ollama-gated suites were
+not rerun, so no claim is made that a model selects the new tools (§10). Details,
+including three findings that presented as workflow bugs and were not, are in §7c.
+
 ### M2.16.5
 
 | Check | Result |
@@ -782,6 +799,201 @@ faults, so it is recorded here rather than configured away.
   `STATUS_FATAL_USER_CALLBACK_EXCEPTION`. The class is now unregistered on close,
   and every callback is retained deliberately.
 
+## 7c. M2.16.6 Integrated Desktop Workflows
+
+M2.16 could name a window and act on it by coordinate. M2.16.5 could name a control
+inside it. Neither could *sequence* those steps - open an application, focus its
+window, resolve a target by name, act on it, and prove the result. M2.16.6 adds
+exactly that and nothing else.
+
+### 7c.1 Composition, not capability
+
+`integration/desktop_workflow.py` contains no native code. It cannot import
+`pywin32`, `comtypes` or anything under `core.windows`, and a test asserts that it
+does not. Every step is a `CapabilityRequest` against the already-registered
+`windows` capability, dispatched through the existing `CapabilityRegistry`.
+
+There is one Windows capability layer, one `Executor`, one `TaskManager`, one
+`TaskStore` and one `VerificationLedger`; this milestone added none of them. A
+workflow step projects onto the existing `PlanStepRecord` rather than introducing a
+second persistent plan format.
+
+### 7c.2 What a workflow context may hold
+
+`DesktopContext` carries logical references only: process identity (pid **plus**
+creation time), window key, an optional UIA target recipe, an optional display id.
+`DesktopContext.from_dict` **refuses** any payload containing a handle key
+(`hwnd`, `handle`, `HMonitor`, `PyHANDLE`, ...) - not because the key would be
+dangerous alone, but because it means the boundary was already crossed and better
+stopped at the edge.
+
+The window layer learned to accept its own key string in this milestone
+(`WindowLayer._coerce_identity`). It had a shape it emitted and could not consume,
+which M2.16.6 hit immediately: every `get_window` call that passed a key back was
+refused. A key that cannot be read back is not a durable identity.
+
+### 7c.3 UIA-first, and what a fallback costs
+
+`interact` takes an *intent* ("click the OK button") and chooses the pattern from a
+table, so the caller never picks a COM interface. `targeting_mode` and
+`fallback_reason` are recorded on every action.
+
+Pointer fallback happens only when the caller allowed it **and** a UIA target point
+exists - never a fabricated coordinate. Two distinctions the tests pin down:
+
+- An **unavailable** pattern justifies a pointer click at the target's own point.
+- A pattern that was **dispatched and did not meet its postcondition** does not. It
+  may already have applied, so re-aiming at the same spot is a second attempt at an
+  action of unknown outcome - which is how a form gets submitted twice.
+- A pointer click has no pattern state to re-read, so it cannot carry the same
+  `PASSED` claim a semantic invoke can. It reports `UNVERIFIED`.
+
+### 7c.4 Verification is separate from success
+
+A workflow that returned successfully has *not* thereby changed the desktop.
+Status and verdict stay independent:
+
+| what happened | status | verification |
+|---|---|---|
+| pressed a button, witness confirmed the change | success | PASSED |
+| pressed a button, no witness | success | UNVERIFIED |
+| dispatched, postcondition not met | failed | FAILED |
+| cancelled | cancelled | UNVERIFIED |
+
+The bridge verifier reads the verdict from the workflow's own `verification` field
+and its per-step evidence, never from `result.success`. A step whose declared
+`expect`ation did not hold is a **failed step**, not a clean completion - the
+terminal-state invariant in `core.task_manager` does not admit a completed task
+paired with a failed verdict, and it is right not to.
+
+### 7c.5 Ambiguity and staleness are answers
+
+`find_window` returning two candidates is `WINDOW_AMBIGUOUS` with the candidate
+keys and titles attached and **no** choice made. `find_target` returning several
+elements is `TARGET_AMBIGUOUS`, likewise.
+
+This is not theoretical. Notepad genuinely owns a `GDI+ Hook Window Class` helper
+whose title mentions it, so a title-only search for "Notepad" *is* ambiguous on this
+machine, and the workflow refused until the test named the class. That is the
+feature working.
+
+Window failures and element failures are reported as `WINDOW_*` and `TARGET_*`
+respectively, because the caller's recovery differs: re-enumerate the window, or
+narrow the recipe.
+
+### 7c.6 Permissions, twice, and why
+
+A workflow is internal, but internal is not trusted. Each primitive is evaluated
+against `PermissionManager` with the operation's own declared sensitivity, and the
+tool-level decision the Executor already made remains the outer gate.
+
+Two details were found the hard way and are worth recording:
+
+- The inner gate treats `requires_confirmation` as *not* a denial and returns
+  `true`. Confirmation is interactive and owned by the Executor, which already asked
+  before the tool was dispatched; the inner gate is policy. Returning the raw
+  decision made every sensitive desktop step impossible, because
+  `CapabilityRegistry._authorized` reads `.allow`, which is false precisely when
+  confirmation is pending.
+- A sensitivity probe that *raises* widens to SENSITIVE. It never widens the other
+  way, and the requirement is recorded in the result's evidence.
+
+### 7c.7 Cancellation
+
+Checked before expensive work, again immediately before every mutation, and between
+plan steps. A cancelled plan does not run its remaining steps, and the test asserts
+the fixture's click count and checkbox state are unchanged afterwards. Cancellation
+propagates into the bound token, and is scoped per task.
+
+One bug here is worth naming because it was silent: `run_plan` passed its internal
+step wrapper to the event sink, which has no `to_dict`. The `AttributeError` was
+swallowed as "sink is advisory", so a sink that requested cancellation never ran
+and the workflow continued. A silently ignored cancellation is the worst version of
+that bug.
+
+### 7c.8 Replay
+
+`DesktopStep.is_replayable` follows the planner's rule: read-only steps may be
+repeated, side-effecting ones may not. The projection onto `PlanStepRecord` is
+deliberately *more* conservative - every desktop step is non-replayable there,
+because `tool_is_read_only` matches registered tool-name prefixes and a capability
+operation is not one. Over-refusing a replay costs a re-observation;
+under-refusing one duplicates a button press.
+
+There is no retry loop anywhere in the workflow. Recovery re-anchors a *target*; it
+never re-sends an *action*.
+
+### 7c.9 The high-level tools
+
+Five tools, each a thin schema over the `desktop_workflow` capability:
+
+| tool | mutating | purpose |
+|---|---|---|
+| `desktop.open` | yes | launch an application and anchor to its window |
+| `desktop.find` | no | resolve one window or one named target |
+| `desktop.interact` | yes | act on a target, UIA-first, verified |
+| `desktop.read` | no | read a target's current value or state |
+| `desktop.verify` | no | confirm a window is still the same window |
+
+`capability.execute` remains registered and reachable: these tools make hand-
+composition optional, not impossible. The `desktop` tool-context signal now selects
+them (16 tools for that signal) while the primitives stay available under
+`capability`.
+
+### 7c.10 Validation
+
+| gate | result |
+| ---- | ------ |
+| M2.16.5 deterministic baseline | 3080 passed / 175 skipped |
+| Full deterministic | **3163 passed, 197 skipped** |
+| Full real Windows (`DIABLO_REAL_WINDOWS_TESTS=1`) | **3316 passed, 44 skipped** |
+| M2.16.6 deterministic (`test_m2166_desktop_workflow.py`) | **83 passed** |
+| M2.16.6 real Windows (`test_m2166_desktop_workflow_real.py`) | **22 passed** |
+| `compileall`, `pip check` | clean |
+| leaks from the M2.16.6 tests (processes / windows / apps) | 0 / 0 / 0 |
+
+Every action assertion has a witness outside UI Automation - `BM_GETCHECK`,
+`GetWindowTextW`, and a label the button's own `WM_COMMAND` handler writes.
+
+### 7c.11 Three findings that were not the workflow's fault
+
+- **A background pump cannot stand in for an application loop.** `PeekMessage`
+  with a null hwnd pulls messages *system-wide*, so a background thread takes the
+  target's messages and dispatches them on the wrong thread; the action never
+  appears to take effect. Pumping has to happen on the thread that owns the window -
+  which is why `DesktopWorkflow` takes a host `settle` hook, exactly as M2.16.5's
+  `act` does.
+- **A witness must be addressed by its stable fields.** Re-resolving a witness
+  after the action means searching for the value it is *about to stop having* if its
+  `name` is part of the recipe. `name` is stripped, and a partial witness supplied
+  by a plan (which cannot know the window key yet) is resolved to a complete recipe
+  first.
+- **Notepad and Calculator are not scriptable the way this suite first assumed.**
+  Notepad is genuinely ambiguous by title; Calculator's `ApplicationFrameWindow` is
+  a protected shell window that M2.16.1 refuses to focus *by policy*. Both tests now
+  assert the refusal instead of working around it.
+
+### 7c.12 Limitations
+
+1. **`123 x 456` is not asserted as a result.** Calculator's control ids differ
+   between builds and the assertion would be a guess. What is asserted is that the
+   window is found, anchored, verified, and that its buttons are reachable
+   *semantically* - including that several match, which is why it refuses.
+2. **Typing into Notepad is not asserted end-to-end.** Reading the typed text back
+   needs a document UIA element whose availability varies by build, and fabricating
+   a coordinate to type at is forbidden. The test asserts what holds everywhere: the
+   window identity is stable across an input attempt, and unanchored typing is
+   refused.
+3. **No visual producer.** `future_vision` / `future_ocr` remain declared and
+   unavailable (§7b.6). No model output is indexed as durable knowledge.
+4. **Knowledge Graph integration is deliberately minimal.** A desktop workflow is
+   not indexed. Task, application and window relationships belong to a later
+   milestone, and indexing runtime state as durable truth is exactly what §7b.2
+   warns against.
+5. **`run_plan` is not exposed as a model tool.** `desktop_workflow.run_plan` exists
+   for callers that have a plan, but the agent gets the five intent-level tools;
+   exposing plans to the model would grow the surface without adding capability.
+
 ---
 
 ## 8. Still not done
@@ -826,7 +1038,7 @@ Nothing here is claimed complete that is not.
 | M2.16.3 Keyboard Foundation | **COMPLETE** |
 | M2.16.4 Screen / Display Foundation | **COMPLETE** |
 | M2.16.5 UIA + Visual Targeting | **COMPLETE** (foundation; two actions unproven against a real control — §8.6) |
-| M2.16.6 Integrated Desktop Workflows | not started |
+| M2.16.6 Integrated Desktop Workflows | **COMPLETE** (composition only; no autonomy, no vision) |
 | M2.16.UI Edge Companion | not started |
 | M2.17 Persistent Autonomy | not started |
 | M2.18 Vision Foundation | not started |
@@ -849,49 +1061,47 @@ them.
 
 ## 10. Recommended next task
 
-**M2.16.6 — close the two unexercised actions, on a fixture that can actually
-exercise them** (§8.6).
+**M2.16.6 hardening, then M2.16.UI — the Edge Companion over a contract that is
+already clean enough to consume.**
 
-M2.16.5 is complete as a foundation: a control can be named by a stable recipe,
-re-resolved against a verified window immediately before acting, and acted on only
-through one of five declared, cancellable, postcondition-checked actions. Its two
-gaps are both about *proof*, not about capability:
+M2.16.6 is complete as composition, and the backend contract it leaves behind is
+the thing worth building on: a workflow is a sequenced, permission-gated,
+cancellation-aware, independently verified set of capability calls over an anchored
+window identity, with no handles in its state.
 
-- `uia_select` and `uia_expand_collapse` refuse cleanly on a control lacking the
-  pattern, but no fixture in this milestone exposes `SelectionItem` or
-  `ExpandCollapse`. A `ListView` or a real drop-down `ComboBox` would. The list box
-  that was tried came back upper-cased and reverse-ordered through every message id
-  attempted, and was removed rather than asserted against — a fixture element whose
-  behaviour is not understood is not something to assert on.
-- A mid-flight race is not yet covered: a target resolved and then destroyed
-  *between* resolution and dispatch. The anchor refuses it (§7b.2), but the test
-  proving it does not exist yet.
+Before any product surface, two gaps remain and both are about proof rather than
+capability:
 
-Boundaries M2.16.6 must respect, all established above:
+- `uia_select` and `uia_expand_collapse` still refuse cleanly but are unexercised
+  against a real control (§8.6). A `ListView` or a genuine drop-down `ComboBox`
+  would cover them.
+- **REAL-MODEL VALIDATION DEFERRED.** The `DIABLO_P9_TIMEOUT=300` suites
+  (`test_knowledge_p9_real_model.py`, `test_recovery_p10_real_model.py`) were not
+  rerun; they need Ollama and ~50 minutes. Last verified at Phase 10. The desktop
+  tools are therefore validated deterministically and against real Windows, but
+  **no claim is made that a model has selected them**. Neither M2.16 nor M2.16.5
+  nor M2.16.6 touches the agent turn path, so this is six milestones stale rather
+  than urgent.
 
-- **UIA stays a separate capability with its own mutating set**, not more verbs on
-  `windows`. Invoking a control is a mutation of someone else's application.
-- **Targeting stays identity-based.** A control is named by its automation identity
-  and re-resolved immediately before acting on it. A coordinate derived from a
-  screenshot must be resolved back through a verified target before it is
-  dispatched — the same rule M2.16.2 established for a bare `ScreenPoint`, and the
-  reason `require_anchored` exists.
-- **A screenshot is still not a model input.** M2.16.5 keeps pixels out of every
-  payload. M2.18 Vision Foundation is where image data is handed to a model, and it
-  must make that decision explicitly rather than inherit it.
-- **Windows Graphics Capture is the better tool for a specific window's contents**
-  (§7.8), including DWM-captured windows that a screen `BitBlt` misses. This
-  machine is a concrete example of what a screen-level capture cannot see.
+Boundaries any next milestone must respect, all established above:
 
-Then **M2.18 Vision Foundation**, where the `future_vision` seam declared in §7b.6
-either gets a real producer or is removed.
+- **No general GUI agent.** No autonomous screen exploration, no
+  screenshot → model → click loop, no coordinate search, no unbounded retry. Every
+  desktop action must still be a named, anchored, permission-gated capability call.
+- **Uncertain mutations are never replayed.** Fresh observation or reconciliation,
+  not a second attempt (§7c.8).
+- **Ambiguity and staleness stay refusals**, not best-effort fallbacks (§7c.5).
+- **Application text stays untrusted data**, including inside workflow evidence
+  (§7b.3).
+- **A screenshot is still not a model input.** M2.18 Vision Foundation is where that
+  decision gets made explicitly rather than inherited.
+- **Windows Graphics Capture** remains the better tool for a specific window's
+  contents (§7.8).
 
-Alongside that, the deferred real-model suites (`test_knowledge_p9_real_model.py`,
-`test_recovery_p10_real_model.py`, `DIABLO_P9_TIMEOUT=300`, ~50 min, needs Ollama)
-remain unrerun since Phase 10. Neither M2.16 nor M2.16.5 touches the agent turn
-path or recovery — both add native capabilities and touch no existing execution
-path — so this is not urgent. But it is now five milestones stale, and no fresh
-real-model validation is claimed for M2.14.1, M2.15, M2.15.2, M2.16 or M2.16.5.
+The companion may consume `DesktopWorkflowResult` for display and must not reach
+past it into capability internals — the result already carries the targeting mode,
+the fallback reason, the observation and the verdict needed to render an honest
+status.
 
 Still deliberately out of scope: autonomous workflows that chain input without a
 caller in the loop.
