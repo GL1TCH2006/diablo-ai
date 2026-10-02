@@ -228,15 +228,38 @@ def _normalise(name: Any) -> str:
     return str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
+#: The *only* metadata keys this module is willing to read.
+#:
+#: ``AgentEvent.metadata`` carries the backend's entire raw source event - tool
+#: payloads, capability detail, whatever the producer put there. Forwarding that to
+#: a presentation layer is exactly the Part 10 violation. But three scalar keys are
+#: genuinely needed to render honestly: ``tool_status`` is what distinguishes a
+#: permission prompt from ordinary progress, and ``detail`` is what lets a line say
+#: "Opening Calculator" instead of "desktop.open: running".
+#:
+#: An explicit allowlist is used rather than a denylist because a denylist silently
+#: forwards whatever nobody thought to forbid. Everything else - including
+#: ``source_event`` - is never read.
+_METADATA_ALLOWLIST = ("tool", "tool_status", "detail")
+
+
+def _allowed_metadata(payload: Any) -> dict[str, Any]:
+    """Extract only the allowlisted metadata keys from a payload."""
+    metadata = getattr(payload, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return {}
+    return {key: metadata[key] for key in _METADATA_ALLOWLIST if key in metadata}
+
+
 def _fields(payload: Any) -> dict[str, Any]:
     """Pull the display-relevant fields out of any supported payload shape.
 
     Accepts an ``AgentEvent``, a mapping, or anything else exposing the same
-    attributes. Metadata is deliberately *not* collected: it is the raw backend
-    payload, and Part 10 forbids forwarding it.
+    attributes. Only the allowlisted metadata is consulted; the rest of the raw
+    backend payload is left untouched.
     """
     if isinstance(payload, Mapping):
-        return {
+        base = {
             "type": payload.get("type") or payload.get("kind") or payload.get("event")
                     or payload.get("name") or "",
             "status": payload.get("status") or payload.get("state") or "",
@@ -246,10 +269,16 @@ def _fields(payload: Any) -> dict[str, Any]:
             "timestamp": payload.get("timestamp"),
             "tool": payload.get("tool") or payload.get("tool_name") or "",
             "tool_status": payload.get("tool_status") or "",
+            "detail": payload.get("detail") or "",
         }
+        for key, value in _allowed_metadata(payload).items():
+            base.setdefault(key, "")
+            if not base.get(key):
+                base[key] = value
+        return base
     # Duck-typed object (``AgentEvent`` and anything shaped like it).
     if hasattr(payload, "type") or hasattr(payload, "message"):
-        return {
+        base = {
             "type": getattr(payload, "type", "") or getattr(payload, "kind", "") or "",
             "status": getattr(payload, "status", "") or "",
             "message": getattr(payload, "message", "") or "",
@@ -258,7 +287,12 @@ def _fields(payload: Any) -> dict[str, Any]:
             "timestamp": getattr(payload, "timestamp", None),
             "tool": getattr(payload, "tool", "") or "",
             "tool_status": getattr(payload, "tool_status", "") or "",
+            "detail": getattr(payload, "detail", "") or "",
         }
+        for key, value in _allowed_metadata(payload).items():
+            if not base.get(key):
+                base[key] = value
+        return base
     return {}
 
 
@@ -293,24 +327,30 @@ def _resolve(fields: dict[str, Any]) -> CompanionEventKind | None:
 def summarise(kind: CompanionEventKind, fields: dict[str, Any]) -> str:
     """Build the short label shown in the scannable progress list.
 
-    Prefers a real subject (a tool name) over a generic verb, because
-    "Opening Calculator" tells a user something and "Working..." does not.
+    Prefers a real subject (a tool name plus its detail) over a generic verb,
+    because "desktop.open: Opening Calculator" tells a user something and
+    "Working..." does not.
+
+    The bridge already formats ``message`` as ``"<tool>: <status>"``, so the tool
+    name is frequently *already* the prefix of the message. Re-prepending it
+    produced "desktop.open: desktop.open: running", hence the startswith guards.
     """
     explicit = sanitize_text(fields.get("summary"), limit=MAX_SUMMARY_CHARS)
     if explicit:
         return explicit
     tool = sanitize_text(fields.get("tool"), limit=28)
+    detail = sanitize_text(fields.get("detail"), limit=MAX_SUMMARY_CHARS)
     message = sanitize_text(fields.get("message"), limit=MAX_SUMMARY_CHARS)
-    if tool and message:
-        combined = f"{tool}: {message}"
-        if len(combined) <= MAX_SUMMARY_CHARS:
-            return combined
-        return combined[: MAX_SUMMARY_CHARS - 1].rstrip() + "\u2026"
-    if tool:
-        return tool
-    if message:
-        return message
-    return _DEFAULT_SUMMARY[kind]
+
+    subject = detail or message
+    if not subject:
+        return _DEFAULT_SUMMARY[kind]
+    if not tool or subject.startswith(tool):
+        return subject[:MAX_SUMMARY_CHARS]
+    combined = f"{tool}: {subject}"
+    if len(combined) <= MAX_SUMMARY_CHARS:
+        return combined
+    return combined[: MAX_SUMMARY_CHARS - 1].rstrip() + "\u2026"
 
 
 _DEFAULT_SUMMARY: dict[CompanionEventKind, str] = {
@@ -368,7 +408,7 @@ def map_backend_event(payload: Any) -> CompanionEvent | None:
     if kind is None:
         return None
 
-    message = sanitize_text(fields.get("message"))
+    message = sanitize_text(fields.get("detail")) or sanitize_text(fields.get("message"))
     if not message:
         message = _TERMINAL_DEFAULT.get(kind, "")
 

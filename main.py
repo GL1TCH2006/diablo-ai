@@ -153,6 +153,18 @@ def main() -> int:
     parser.add_argument("--companion", action="store_true",
                         help="Launch the floating companion UI instead of the console UI (M2.14.1). "
                              "Falls back to the console UI with a message if Tk is unavailable.")
+    parser.add_argument("--edge-companion", action="store_true",
+                        help="Launch the M2.16.UI edge-docked companion: a small sleeping "
+                             "presence at a screen edge that wakes on click, takes a task, "
+                             "shows progress and retracts. Client of the same Agent; "
+                             "starts no backend of its own.")
+    parser.add_argument("--edge", default="right",
+                        choices=["left", "right", "top", "bottom"],
+                        help="Which screen edge the companion docks to (default: right).")
+    parser.add_argument("--edge-speak", action="store_true",
+                        help="Let the companion speak through the existing SAPI TTS. "
+                             "Text input always works regardless. There is no STT or "
+                             "wake-word support: activation is by click.")
     parser.add_argument("--log-level", default="", help="DEBUG/INFO/WARNING/ERROR")
     args = parser.parse_args()
 
@@ -284,6 +296,32 @@ def main() -> int:
 
     agent = make_agent(None)
     project_label = f"{active_project.name} @ {active_project.path}" if active_project else "(none)"
+
+    # M2.16.UI: the edge companion is a second *presentation* of the same Agent, not
+    # a second backend. It gets the same Agent and the same EventBus, so there is
+    # still exactly one TaskManager, one Executor and one permission path.
+    if args.edge_companion:
+        from ui.launch import run_edge_companion
+        from ui.edge_companion import EdgeCompanionUnavailable
+
+        def confirm(tool, description):
+            print(f"[confirm required] {tool}: {description}")
+            try:
+                return input("allow? [y/N] ").strip().lower().startswith("y")
+            except EOFError:
+                return False
+
+        agent.set_confirmer(confirm)
+        try:
+            status = run_edge_companion(agent, bus, edge=args.edge,
+                                        speak=args.edge_speak)
+        except (EdgeCompanionUnavailable, CompanionUnavailable) as exc:
+            reason = getattr(exc, "reason", "unavailable")
+            log.warning("edge companion unavailable (%s); falling back to console UI", reason)
+            print(f"[edge companion unavailable: {reason}] {exc}")
+        else:
+            close_capabilities()
+            return status
 
     # M2.14.1: the floating companion now has a product launch path. It is
     # chosen with --companion, and it falls back to the console UI with an

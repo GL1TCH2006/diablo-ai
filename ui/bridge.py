@@ -279,12 +279,28 @@ class CoreEventBusBridge:
         else:
             status = ""
             message = f"{data.get('tool', 'tool')}: {tool_status or 'update'}"
+        # The ``message`` above is deliberately terse and part of the established
+        # contract other UIs assert on, so it is not changed. Instead the raw tool
+        # fields are surfaced under three explicit keys for consumers that need
+        # them - notably the M2.16.UI edge companion, which needs ``tool_status`` to
+        # tell a permission prompt apart from ordinary progress, and ``detail`` to
+        # show something meaningful like "Opening Calculator" rather than
+        # "desktop.open: running".
+        #
+        # ``source_event`` remains in metadata for existing consumers. The companion
+        # never reads it: ``ui.companion_events`` forwards only this three-key
+        # allowlist, which is what keeps raw backend payloads out of the UI.
         self._emit(
             AgentEvent(
                 type="activity",
                 message=message,
                 status=status,
-                metadata={"source_event": data},
+                metadata={
+                    "source_event": data,
+                    "tool": str(data.get("tool", "") or ""),
+                    "tool_status": tool_status,
+                    "detail": str(data.get("detail", "") or ""),
+                },
             )
         )
 

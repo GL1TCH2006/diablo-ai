@@ -271,6 +271,12 @@ class CompanionController:
     #: Explicit transition table. Anything not listed here is refused, which is
     #: what stops a late or duplicated backend event from dragging a retracting
     #: companion back into execution.
+    #:
+    #: ``SLEEPING`` is reachable from every non-sleeping state so that ``retract()``
+    #: is total: "go back to the edge" must never silently fail. Hiding the
+    #: companion mid-task is safe because a backend event arriving afterwards is
+    #: refused by the table (``SLEEPING -> EXECUTING`` is not permitted), and the
+    #: terminal result is still readable when the user next activates it.
     _TRANSITIONS: dict[CompanionState, frozenset[CompanionState]] = {
         CompanionState.SLEEPING: frozenset({CompanionState.AWAKENING}),
         CompanionState.AWAKENING: frozenset({CompanionState.LISTENING,
@@ -282,10 +288,12 @@ class CompanionController:
         CompanionState.THINKING: frozenset({CompanionState.EXECUTING,
                                             CompanionState.RETURNING,
                                             CompanionState.ERROR,
-                                            CompanionState.LISTENING}),
+                                            CompanionState.LISTENING,
+                                            CompanionState.SLEEPING}),
         CompanionState.EXECUTING: frozenset({CompanionState.RETURNING,
                                              CompanionState.ERROR,
-                                             CompanionState.THINKING}),
+                                             CompanionState.THINKING,
+                                             CompanionState.SLEEPING}),
         CompanionState.RETURNING: frozenset({CompanionState.SLEEPING,
                                              CompanionState.LISTENING,
                                              CompanionState.AWAKENING}),
