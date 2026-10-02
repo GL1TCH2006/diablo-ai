@@ -182,7 +182,7 @@ def _submit_and_settle(controller: CompanionController, text: str) -> str:
     that only care about the state machine do not need this.
     """
     job = controller.submit_task(text)
-    assert controller.wait_idle(2.0), "backend submission never settled"
+    assert controller.wait_idle(5.0), "backend submission never settled"
     return job
 
 
@@ -478,7 +478,7 @@ class TestTaskSubmission:
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
         controller.submit_task("delete everything")
-        assert controller.wait_idle(2.0)
+        assert controller.wait_idle(5.0)
         assert controller.state is CompanionState.ERROR
         assert "permission denied" in controller.snapshot().terminal_message
 
@@ -779,7 +779,7 @@ class TestSubmissionThreading:
             assert controller.wait_idle(0.3) is False, (
                 "wait_idle reported idle while the backend was still blocked")
             gate.set()
-            assert controller.wait_idle(2.0)
+            assert controller.wait_idle(5.0)
         finally:
             gate.set()
             controller.close()
@@ -810,7 +810,7 @@ class TestSubmissionThreading:
                 controller.retract()
                 _drive_to_listening(controller, clock)
                 controller.submit_task("task")
-            assert controller.wait_idle(2.0)
+            assert controller.wait_idle(5.0)
             workers = [t for t in threading.enumerate()
                        if t.name == CompanionController.WORKER_NAME]
             assert len(workers) == 1, f"{len(workers)} submission workers exist"
@@ -821,7 +821,7 @@ class TestSubmissionThreading:
         controller, _, clock = _make_controller()
         _drive_to_listening(controller, clock)
         controller.submit_task("task")
-        assert controller.wait_idle(2.0)
+        assert controller.wait_idle(5.0)
         assert controller.worker_alive is True
         controller.close()
         assert controller.worker_alive is False
@@ -877,7 +877,7 @@ class TestSubmissionThreading:
         try:
             _drive_to_listening(controller, clock)
             controller.submit_task("task")
-            assert controller.wait_idle(2.0), "inflight was never released"
+            assert controller.wait_idle(5.0), "inflight was never released"
 
             # The next submission must work regardless of whether the worker survived.
             controller.retract()

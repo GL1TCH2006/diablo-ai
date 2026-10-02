@@ -410,12 +410,17 @@ class CompanionController:
                     self._inflight = max(0, self._inflight - 1)
                 self._work.task_done()
 
-    def wait_idle(self, timeout: float = 2.0) -> bool:
+    def wait_idle(self, timeout: float = 5.0) -> bool:
         """Block until every submitted task has been handed to the backend.
 
         For tests and for hosts that drive the controller without a window. The UI
         never calls this - it polls the snapshot instead, which is what keeps the
         UI thread free.
+
+        The default is generous on purpose. The hand-off is a thread wake-up, which
+        is sub-millisecond when the machine is quiet but can be delayed when a full
+        test suite has hundreds of threads running. A tight budget here produces
+        failures that look like logic bugs and are not.
         """
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:

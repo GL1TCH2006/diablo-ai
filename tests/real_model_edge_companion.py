@@ -41,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--edge", default="right", help="which edge to dock to")
     parser.add_argument("--offline", action="store_true",
                         help="force the rule-based backend instead of Ollama")
+    parser.add_argument("--confirm", action="store_true",
+                        help="auto-allow tool confirmations. Without it a tool that "
+                             "needs confirmation is cancelled, because the "
+                             "PermissionManager's confirmer is what authorises it - "
+                             "which is the correct behaviour and is itself worth "
+                             "observing.")
     args = parser.parse_args(argv)
 
     from config.settings import load_settings
@@ -90,13 +96,19 @@ def main(argv: list[str] | None = None) -> int:
 
     from core.agent import Agent
 
+    confirmer = None
+    if args.confirm:
+        def confirmer(tool: str, description: str) -> bool:  # noqa: F811
+            print(f"[auto-confirm] {tool}: {description}")
+            return True
+
     agent = Agent(
         provider=backend.provider,
         settings=settings,
         registry=registry,
         permissions=permissions,
         events=bus,
-        confirmer=None,          # non-interactive: rely on PermissionManager policy
+        confirmer=confirmer,
         project=None,
         memory_conversation=conversation,
         memory_preferences=preferences,

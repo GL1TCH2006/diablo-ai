@@ -154,7 +154,14 @@ class TestEnumeration:
         assert me.handle_count >= 1
 
     def test_filtering_by_name_finds_this_interpreter(self, process_layer):
-        matches = process_layer.find_processes("python", limit=20)
+        # The limit must exceed the number of live processes that match, or the
+        # assertion silently becomes a statement about enumeration *order*: on a
+        # machine running more than 20 python processes at once this test failed
+        # because the interpreter under test fell outside the truncated result,
+        # even though filtering by name does find it. The property under test is
+        # "filtering finds me", so the limit is set well above any plausible
+        # count rather than at an arbitrary small number.
+        matches = process_layer.find_processes("python", limit=512)
         assert matches, "the running interpreter was not found by name"
         assert any(p.pid == os.getpid() for p in matches), (
             f"filtering by 'python' missed this process: {[p.pid for p in matches]}")

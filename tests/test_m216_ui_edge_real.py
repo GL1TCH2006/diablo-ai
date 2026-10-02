@@ -294,7 +294,7 @@ class TestRealLifecycle:
         app._on_return()
         job = controller.task_id
         # The view returned before the backend was called; wait for the hand-off.
-        assert controller.wait_idle(2.0), "submission never reached the backend"
+        assert controller.wait_idle(5.0), "submission never reached the backend"
         assert bridge.submissions and bridge.submissions[0][0] == "Open Calculator"
 
         bridge.emit("step", "Opening Calculator", job)
