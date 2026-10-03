@@ -233,6 +233,15 @@ class CompanionSnapshot:
     cancellation_requested: bool = False
     terminal_message: str = ""
     sleeping: bool = True
+    #: M2.17: a bounded, read-only projection of persistent autonomous work.
+    #:
+    #: Deliberately two scalars and nothing more. The companion *reads* goal state
+    #: and renders it; it never creates a goal, schedules one, or holds authority
+    #: over one. Keeping it a projection is what stops the UI from becoming a second
+    #: autonomy backend - the scheduler and GoalStore stay authoritative, and this is
+    #: only what a person can see.
+    goal_line: str = ""
+    goal_active: bool = False
 
     @property
     def expanded(self) -> bool:
@@ -251,6 +260,8 @@ class CompanionSnapshot:
             "cancellation_requested": self.cancellation_requested,
             "terminal_message": self.terminal_message,
             "sleeping": self.sleeping,
+            "goal_line": self.goal_line,
+            "goal_active": self.goal_active,
             "events": [event.to_dict() for event in self.events],
         }
 
@@ -356,6 +367,8 @@ class CompanionController:
         self._terminal_task_ids: set[str] = set()
         self._state_changed_at = self._clock()
         self._closed = False
+        self._goal_line = ""
+        self._goal_active = False
         self._unsubscribe: Callable[[], None] | None = None
         # Backend submission queue and its single worker. See the class docstring:
         # the view calls submit_task from Tk's main thread and must not block.
@@ -520,7 +533,55 @@ class CompanionController:
                 cancellation_requested=self._cancellation_requested,
                 terminal_message=self._terminal_message,
                 sleeping=state is CompanionState.SLEEPING,
+                goal_line=self._goal_line,
+                goal_active=self._goal_active,
             )
+
+    # ── persistent autonomy projection (M2.17) ───────────────────────
+
+    def apply_goal_projection(self, summary: Any) -> bool:
+        """Render persistent autonomous work. Read-only, and it grants nothing.
+
+        ``summary`` is ``core.autonomy.summarise_goal`` output, or any mapping with
+        the same keys. The companion takes it as *display data*:
+
+        * it never creates, schedules, cancels or completes a goal;
+        * the GoalStore and the scheduler remain the only authorities;
+        * the text is redacted and length-capped here as well, because a goal's
+          objective is user data crossing into a presentation surface.
+
+        Returns whether anything visible changed, so a caller can avoid a pointless
+        repaint on every poll.
+        """
+        if summary is None:
+            changed = bool(self._goal_line or self._goal_active)
+            self._goal_line = ""
+            self._goal_active = False
+            return changed
+        if isinstance(summary, Mapping):
+            state = str(summary.get("state") or "")
+            objective = summary.get("objective") or ""
+            progress = summary.get("progress_summary") or ""
+        else:
+            state = str(getattr(summary, "state", "") or "")
+            objective = getattr(summary, "objective", "") or ""
+            progress = getattr(summary, "progress_summary", "") or ""
+
+        # Reuse the companion's own redaction rather than importing the goal module:
+        # one policy at the display boundary, already tested.
+        from ui.companion_events import sanitize_text
+
+        text = sanitize_text(objective, limit=90)
+        detail = sanitize_text(progress, limit=90)
+        if detail and detail != text:
+            text = f"{text} - {detail}" if text else detail
+        if state:
+            text = f"[{sanitize_text(state, limit=24)}] {text}".strip()
+        active = state in ("created", "active", "resumable", "paused")
+        changed = text != self._goal_line or active != self._goal_active
+        self._goal_line = text[:200]
+        self._goal_active = active
+        return changed
 
     # -- state machine --------------------------------------------------
 

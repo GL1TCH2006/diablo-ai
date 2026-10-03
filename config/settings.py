@@ -64,6 +64,13 @@ class Settings:
     # M2.16.UI.1: minimum classifier confidence before the presented tool set is
     # narrowed to the desktop family. Below this the normal widened set is used.
     desktop_focus_min_confidence: float = 0.6
+    # M2.17 persistent autonomy. Ceilings on how much autonomous work may happen,
+    # never permissions. Small by default: a companion that quietly starts dozens of
+    # tasks is worse than one that visibly does a few.
+    autonomy_max_active_goals: int = 3
+    autonomy_max_tasks: int = 32
+    autonomy_max_concurrent: int = 1
+    autonomy_min_interval_seconds: int = 60
     max_conversation_turns: int = 20
     allowed_roots: list[Path] = field(default_factory=list)
     terminal_auto_allow: list[str] = field(default_factory=list)
@@ -144,6 +151,10 @@ def load_settings() -> Settings:
         max_recovery_attempts=int(_int(toml, ["agent", "max_recovery_attempts"], 3)),
         desktop_mismatch_corrections=max(0, int(_int(toml, ["agent", "desktop_mismatch_corrections"], 1))),
         desktop_focus_min_confidence=max(0.0, min(1.0, _float(toml, ["agent", "desktop_focus_min_confidence"], 0.6))),
+        autonomy_max_active_goals=max(0, int(_int(toml, ["autonomy", "max_active_goals"], 3))),
+        autonomy_max_tasks=max(0, int(_int(toml, ["autonomy", "max_tasks"], 32))),
+        autonomy_max_concurrent=max(1, int(_int(toml, ["autonomy", "max_concurrent"], 1))),
+        autonomy_min_interval_seconds=max(1, int(_int(toml, ["autonomy", "min_interval_seconds"], 60))),
         max_conversation_turns=int(_int(toml, ["memory", "max_conversation_turns"], 20)),
         allowed_roots=allowed_roots,
         terminal_auto_allow=_list(toml, ["terminal", "auto_allow_patterns"]),

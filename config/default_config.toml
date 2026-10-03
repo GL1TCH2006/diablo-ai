@@ -130,3 +130,10 @@ enabled = false
 
 [logging]
 level = "INFO"
+[autonomy]
+# Ceilings on persistent autonomous work. These bound how much may happen; they
+# grant nothing. Permission, cancellation and verification are unchanged.
+max_active_goals = 3
+max_tasks = 32
+max_concurrent = 1
+min_interval_seconds = 60

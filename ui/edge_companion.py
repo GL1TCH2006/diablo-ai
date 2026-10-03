@@ -576,7 +576,8 @@ class EdgeCompanionApp:
         key = (snapshot.state.value, snapshot.task_id, snapshot.task_text,
                snapshot.status_line, snapshot.terminal_message,
                tuple(snapshot.progress), snapshot.can_cancel,
-               snapshot.cancellation_requested, len(snapshot.events))
+               snapshot.cancellation_requested, len(snapshot.events),
+               snapshot.goal_line, snapshot.goal_active)
         if key == self._last_render_key:
             return
         self._last_render_key = key
@@ -599,7 +600,8 @@ class EdgeCompanionApp:
         task_text = snapshot.task_text
         if not task_text and state is CompanionState.SLEEPING:
             task_text = "Diablo"
-        self._task_label.configure(text=task_text or "", fg=_TEXT)
+        if not snapshot.goal_line:
+            self._task_label.configure(text=task_text or "", fg=_TEXT)
 
         status = snapshot.status_line
         if snapshot.cancellation_requested:
@@ -609,6 +611,15 @@ class EdgeCompanionApp:
             status = snapshot.terminal_message
         self._status.configure(
             text=status, fg=_ERROR if state is CompanionState.ERROR else _MUTED)
+
+        # M2.17: persistent autonomous work, rendered as one bounded line. The
+        # companion reads goal state; it never creates or schedules any.
+        if snapshot.goal_line:
+            self._task_label.configure(
+                text=snapshot.goal_line,
+                fg=_ACCENT if snapshot.goal_active else _MUTED)
+        elif task_text:
+            self._task_label.configure(text=task_text, fg=_TEXT)
 
         self._render_progress(snapshot.progress, accent)
 

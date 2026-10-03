@@ -2102,6 +2102,223 @@ class Agent:
         from core.constants import GREETING
         return GREETING
 
+    # ═════════════════════════════════════════════════ M2.17 resume
+
+    def resume(self, goal_id: str = "", task_id: str = "") -> Any:
+        """Continue durable work after a restart, refusing what is unsafe.
+
+        M2.17. This is the capability the repository's own contract document had
+        been pointing at: ``core/windows/__init__.py`` said "``Agent.resume()`` and
+        cross-restart autonomy are M2.17 and likewise absent", and
+        ``docs/contracts/cross_layer_execution_contracts.md`` had pinned the rule
+        for how it must read state: *through* ``terminal_verdict(state,
+        verification)``, never by inferring from ``status == "completed"``.
+
+        The nine steps the milestone asks for, and where each happens:
+
+        1. load durable state          - ``_task_store`` / ``GoalStore`` records
+        2. reconcile interrupted work   - ``_reconcile_interrupted_tasks`` ran in
+                                         ``__init__``; steps left RUNNING are marked
+                                         ``interrupted`` with their status untouched
+        3. inspect the execution plan   - ``record.plan``
+        4. inspect the verification     - ``VerificationLedger.from_dict`` restore,
+                                         which production never did before
+        5. inspect recovery state       - ``_restore_recovery_state``
+        6. determine what is resumable - ``_classify_resume``
+        7. refuse uncertain replay      - a side-effecting interrupted step is
+                                         never re-dispatched
+        8. reconstruct model context    - a normal RequestContext and the ordinary
+                                         system prompt
+        9. continue through the normal  - ``_execute_step``, i.e. the same
+           TaskManager/Executor path     permission-checked path as any request
+
+        Returns a :class:`core.autonomy.ResumeReport`. It never raises: a resume
+        that cannot proceed is a *reported outcome*, not an exception, because the
+        caller is usually a scheduler that must keep running.
+        """
+        from core.autonomy import ResumeReport
+
+        report = ResumeReport(goal_id=str(goal_id or ""),
+                              task_id=str(task_id or ""))
+        # Deliberately no "is the agent closed" check: Agent has no close()
+        # and no closed flag, and inventing one here would be a second lifecycle
+        # concept sitting next to the existing one. What resume needs is for the
+        # durable record to exist and for the request context to be rebuildable,
+        # both of which are checked below.
+
+        record = None
+        if task_id:
+            record = self._task_store.get(str(task_id))
+        elif goal_id:
+            report.reason = (
+                "resume by goal_id requires a current task; the goal's task is "
+                "selected by the scheduler, which owns goal state")
+            report.action = ResumeReport.REFUSED
+            return report
+        else:
+            report.reason = "resume needs a goal_id or a task_id"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        if record is None:
+            report.reason = f"no durable task record for {task_id!r}"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        # Steps 4 and 5: restore the ledger and the recovery counters *before*
+        # deciding anything, so the decision is made against real durable state.
+        restored_ledger = self._restore_verification_ledger(record)
+        report.ledger_entries = restored_ledger
+        restored_recovery = self._restore_recovery_state(record)
+        report.recovery_restored = restored_recovery
+
+        # A task that reached a terminal state is not resumed. Read through
+        # terminal_verdict, never from ``status == "completed"``: a reloaded
+        # COMPLETED + UNVERIFIED means the work was never checked, and resuming it
+        # as though it were done is exactly the rounding-up this must not do.
+        lifecycle = record.metadata.get("lifecycle") or {}
+        prior_state = str(lifecycle.get("state") or record.status or "")
+        prior_verification = str(lifecycle.get("verification") or "")
+        from core.task_manager import terminal_verdict
+
+        verdict = terminal_verdict(prior_state, prior_verification)
+        report.prior_verdict = getattr(verdict, "value", str(verdict))
+        if report.prior_verdict in ("completed", "cancelled"):
+            report.reason = f"task already {report.prior_verdict}"
+            report.action = ResumeReport.NOOP
+            return report
+        if report.prior_verdict == "failed":
+            report.reason = "task previously failed; recovery decides, not resume"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        # Step 6 and 7: classify, and refuse uncertain side effects.
+        resumable, refused, reason = self._classify_resume(record)
+        report.refused_steps = refused
+        report.reason = reason
+        if refused:
+            # A single uncertain mutation blocks automatic resumption of the whole
+            # task. Partial replay would leave the durable plan describing a world
+            # that never existed.
+            report.action = ResumeReport.BLOCKED
+            self._emit_lifecycle("resume_refused", task_id=report.task_id,
+                                 reason=reason, refused_steps=list(refused))
+            return report
+        if not resumable:
+            report.action = ResumeReport.NOOP
+            self._emit_lifecycle("resume_noop", task_id=report.task_id,
+                                 reason=reason)
+            return report
+
+        # Step 8 and 9: rebuild normal request state and continue through the
+        # ordinary execution path.
+        plan = getattr(record, "plan", None)
+        self._begin_request_context()
+        self._active_cancellation_token = None
+        self._terminal_event_emitted = False
+        self._router_verify_ok = True
+        self._escalations_used = 0
+        self._offline_fallback_used = False
+        self._provider_failures = []
+        self._exhausted_task_ids = {}
+        self._recovered_task_ids = []
+        self._apply_restored_recovery_state()
+        self._tasks.begin_task(record.title or record.goal or "resumed task",
+                               task_id=record.task_id)
+        if plan is not None:
+            self._active_plan = plan
+        self._transition(TaskState.EXECUTING)
+        self._emit_lifecycle("resume_started", task_id=report.task_id,
+                             goal_id=report.goal_id,
+                             steps=len(resumable))
+        report.action = ResumeReport.RESUMED
+        report.resumable_steps = list(resumable)
+        return report
+
+    def _restore_verification_ledger(self, record: Any) -> int:
+        """Rebuild the ledger from its persisted projection.
+
+        Until M2.17 this was write-only in production:
+        ``VerificationLedger.from_dict`` existed and was exercised only by tests,
+        and ``docs/contracts/cross_layer_execution_contracts.md`` recorded that as a
+        known gap. A resume that could not see prior evidence would re-verify work
+        that had already been verified, or worse, trust a terminal state with an
+        empty ledger.
+        """
+        lifecycle = getattr(record, "metadata", {}).get("lifecycle") or {}
+        payload = lifecycle.get("verification_ledger")
+        if not isinstance(payload, Mapping):
+            return 0
+        from core.verification_ledger import VerificationLedger
+
+        try:
+            ledger = VerificationLedger.from_dict(payload)
+        except Exception as exc:  # noqa: BLE001 - a hostile payload degrades
+            log.warning("verification ledger restore failed: %s", exc)
+            return 0
+        count = len(ledger)
+        try:
+            self._tasks.ledger = ledger
+        except Exception:  # noqa: BLE001
+            return 0
+        return count
+
+    def _classify_resume(self, record: Any) -> tuple[list[str], list[str], str]:
+        """Decide which steps may be re-dispatched. ``(resumable, refused, reason)``.
+
+        The rule that matters: an interrupted step whose side effect may already
+        have applied is **never** re-dispatched automatically. ``PlanStepRecord``
+        already encodes this - ``mark_interrupted`` leaves the status RUNNING and
+        sets ``interrupted``, and ``is_replayable`` is False for any side-effecting
+        step. This method applies that rule to a whole task.
+        """
+        plan = getattr(record, "plan", None)
+        if plan is None:
+            return [], [], "task has no durable execution plan"
+        steps = list(getattr(plan, "steps", []) or [])
+        if not steps:
+            return [], [], "plan has no steps"
+
+        resumable: list[str] = []
+        refused: list[str] = []
+        for step in steps:
+            if step.status is StepStatus.DONE:
+                continue
+            if step.status in (StepStatus.FAILED, StepStatus.CANCELLED,
+                               StepStatus.BLOCKED, StepStatus.SKIPPED):
+                refused.append(step.step_id)
+                continue
+            if step.status is StepStatus.RUNNING or getattr(step, "interrupted", False):
+                # RUNNING at shutdown means the effect may or may not have applied.
+                if step.is_replayable:
+                    resumable.append(step.step_id)
+                else:
+                    refused.append(step.step_id)
+                continue
+            resumable.append(step.step_id)
+
+        if refused:
+            return resumable, refused, (
+                "refusing to replay steps whose side effects are uncertain: "
+                + ",".join(refused))
+        if not resumable:
+            return [], [], "no step is executable"
+        return resumable, [], ""
+
+    def _execute_resume_step(self, step_id: str) -> Any:
+        """Dispatch one already-classified-resumable step through the normal path.
+
+        Split out from :meth:`resume` so a caller can advance one step at a time and
+        observe each result, rather than having resume silently run work.
+        """
+        plan = self._active_plan
+        if plan is None:
+            return None
+        step = plan.step(step_id)
+        if step is None or not step.is_replayable:
+            return None
+        return self._execute_step(step.tool, step.args, plan_step=step)
+
     def respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
         """Handle one user request inside its own RequestContext.
 
