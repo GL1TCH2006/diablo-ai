@@ -19,9 +19,10 @@ A. REPOSITORY
 ================================================================================
 
 Starting HEAD (before this milestone)  : 4e64a87
-Final HEAD (code state audited)         : 622e7e2, plus this audit commit
-Branch                                   : main
-Working tree                             : clean at each commit
+Code audited at                        : df2f33d (M2.17 production runtime)
+Audit committed at                     : the commit containing this file
+Branch                                 : main
+Working tree                           : clean at each commit
 
 Commits in this milestone
 --------------------------
