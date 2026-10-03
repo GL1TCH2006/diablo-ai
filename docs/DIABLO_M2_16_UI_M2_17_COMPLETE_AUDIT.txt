@@ -1,0 +1,814 @@
+﻿================================================================================
+DIABLO COMPLETE AUDIT
+M2.16.UI + M2.16.UI.1 + M2.17
+================================================================================
+
+Authoritative record for the combined milestone. Written so another developer can
+continue without any conversation context.
+
+Where evidence is thin, that is stated rather than smoothed over. Three separate
+measurement defects were found *in my own harnesses* during this milestone and each
+one had been hiding real capability; they are documented where they were fixed
+because "the number was wrong" is only half the story.
+
+Audit path follows the repository's existing convention
+(docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt).
+
+================================================================================
+A. REPOSITORY
+================================================================================
+
+Starting HEAD (before this milestone)  : 4e64a87
+Final HEAD (code state audited)         : 622e7e2, plus this audit commit
+Branch                                   : main
+Working tree                             : clean at each commit
+
+Commits in this milestone
+--------------------------
+  fe6ba49  M2.16.UI: companion state machine, edge geometry, narrow event stream
+  59d0fe5  M2.16.UI: edge companion window, launch integration, end-to-end tests
+  6efc59f  M2.16.UI: real-Windows companion validation
+  b924101  M2.16.UI: move backend submission off the UI thread
+  77115d4  M2.16.UI: robust wait budgets and a pre-existing test fragility fix
+  6841fd6  M2.16.UI: complete audit TXT and roadmap reconciliation
+  a3f826b  M2.16.UI.1: desktop intent routing, adaptive tool context, recovery
+  622e7e2  M2.17: persistent goals, durable resume, scheduler, reconciliation
+  (next)   M2.17: production runtime, CLI wiring, redaction and evidence fixes
+  (next)   M2.16.UI + M2.17: complete audit TXT and roadmap reconciliation
+
+History preservation
+--------------------
+Verified: 4e64a87 is an ancestor of HEAD. No reset, rebase, squash, amend,
+force-push, branch deletion or history discard was performed at any point.
+
+Files added
+-----------
+  core/desktop_intent.py                  476 lines   bounded intent families
+  core/goals.py                           562 lines   durable Goal + GoalStore
+  core/autonomy.py                        825 lines   scheduler, reconciliation, runtime
+  tests/test_m216_ui1_desktop_routing.py  449 lines   80 tests
+  tests/test_m217_persistent_autonomy.py  658 lines   63 tests
+  tests/test_m217_autonomy_runtime.py     388 lines   30 tests
+  tests/test_m217_autonomy_integration.py 199 lines    7 tests, real Agent
+  tests/test_m217_restart_real.py          89 lines    6 tests
+  tests/test_m217_companion_goals.py      112 lines   20 tests
+  tests/m217_restart_child.py             152 lines   restart child process
+  tests/real_model_desktop_selection.py   314 lines   selection probe
+  tests/real_model_autonomy.py            199 lines   autonomy probe
+
+Files modified
+--------------
+  core/agent.py            resume(), family tool context, telemetry, correction
+  core/planner.py          fast_intent gated on a real single launch
+  core/tool_context.py     family signal, focus mode
+  core/request_context.py  reverted - kept at its pinned nine fields
+  core/context.py          system prompt no longer steers at the legacy tool
+  config/settings.py       new knobs + two pre-existing bugs fixed
+  config/default_config.toml
+  main.py                  --autonomy, --autonomy-interval, startup reconciliation
+  tools/__init__.py        applications.open description and capability tag
+  tools/desktop.py         desktop.* descriptions
+  ui/companion_state.py    read-only goal projection
+  ui/edge_companion.py     goal line rendering
+  docs/DIABLO_IMPLEMENTATION_AUDIT.md
+
+Environment
+-----------
+  Python 3.14.6, Windows 11 10.0.26200-SP0
+  Display: 1 monitor, 1707x1067 virtualised, scale_percent 150, DPI unaware
+  Ollama: online, qwen3:8b / qwen3:14b / qwen3:latest / nemotron-3.5-lightning:30b
+
+================================================================================
+B. M2.16.UI - EDGE COMPANION (carried forward, re-verified)
+================================================================================
+
+Implemented and unchanged in this milestone; re-verified by the full gates below.
+Architecture, state machine, edge geometry, event narrowing, redaction, threading
+and cancellation are as recorded in docs/DIABLO_M2_16_UI_COMPLETE_AUDIT.txt.
+
+Evidence re-confirmed on the final tree:
+  deterministic suite           3568 passed, 218 skipped
+  real Windows suite            3742 passed, 44 skipped, 0 failed
+  32-minute soak                640 cycles, 1.2% CPU, +1.9 MB, no growth
+  leak deltas                   windows +0, threads +0
+  access violations added        0
+
+The one design deviation carried forward: sleeping is NOT click-through.
+WS_EX_TRANSPARENT would satisfy Part 5 and destroy Part 15, because it swallows
+the click on the companion itself. The compromise - a genuinely tiny footprint
+plus WS_EX_NOACTIVATE, and no global keyboard or mouse hook of any kind - is
+documented rather than silently chosen.
+
+================================================================================
+C. M2.16.UI.1 - DESKTOP TOOL SELECTION
+================================================================================
+
+C.1 Root cause - and a correction to the previous audit
+-------------------------------------------------------
+
+The M2.16.UI audit reported real-model desktop-tool selection at 0/3 and
+attributed it to the model preferring `applications.open`. That attribution was
+wrong. Three defects were actually responsible, and only the third is about the
+model at all:
+
+  (1) No model was ever consulted.
+      Planner.fast_intent matched ^(?:open|launch|start)\s+(.+)$ and returned
+      applications.open *before* any LLM call. All three audited runs hit it. The
+      audit's other observation - that 8b passed the whole sentence as the
+      application name - was this same regex being greedy, not a model defect. The
+      previous audit drew a model conclusion from a regex.
+
+  (2) The desktop tools were unreachable by routing.
+      Agent._requested_capabilities could only emit debugging, coding or
+      version_control, so the "desktop" capability group could never be selected
+      and desktop.* was never presented. A tool the model cannot see is a tool it
+      cannot select.
+
+  (3) The tool-context selector was dead in production.
+      config/settings.py passed the *string* "false" through _str(...) as
+      _as_bool's default for tools_full_context and resource_check_enabled.
+      _as_bool returns its default unchanged when the env var is absent, so both
+      settings were the truthy string "false". Agent._tool_context therefore called
+      select(full=True) on every turn: the whole M2.13.0 selector was bypassed and
+      the model received all 74 tools every turn. This had been silently disabling
+      the selector since M2.13.0.
+
+C.2 Changes
+-----------
+
+  core/desktop_intent.py (new)
+    Eight bounded intent families: APPLICATION_LAUNCH, WINDOW_MANAGEMENT,
+    UI_DISCOVERY, UI_ACTION, KEYBOARD_INTERACTION, POINTER_INTERACTION,
+    SCREEN_DISPLAY, COMPOUND_DESKTOP_TASK, plus NONE. A table of compiled
+    patterns and a pure function - no NLP system, no I/O, no clock, no
+    randomness. A pure classifier is asserted by import test.
+
+    Unclassified widens to the whole desktop surface and never narrows.
+
+  core/planner.py
+    fast_intent short-circuits only for a genuine single launch with an isolable
+    name. Compound requests reach the model. Demonstratives ("Open this") are
+    refused rather than launched, since they cannot name a program.
+    "run" is deliberately NOT a launch verb: adding it would have routed "run my
+    test suite" to an application launcher, a regression the old path never had.
+
+  core/tool_context.py
+    New `families` signal and a `focus_families` mode. The selector receives a
+    resolved family name and never inspects user text, preserving the property an
+    existing architectural test asserts. Only tool *names* are added for a family -
+    adding the capability would pull in every tool sharing that namespace, and all
+    five desktop tools share one, which silently defeated the bound.
+
+  core/agent.py
+    Classifies once per request, passes families plus focus, and records structured
+    telemetry. Implements bounded wrong-tool recovery: when *every* desktop tool in
+    a plan mismatches the request's family, the model is asked once more, within a
+    settings budget. Telemetry is emitted whether or not a correction was spent.
+
+  tools/__init__.py, tools/desktop.py, core/context.py
+    applications.open now states it can only START a program and names the
+    alternative. The desktop tools state when they apply, what they operate on and
+    what they require. The system prompt no longer steers unconditionally at the
+    legacy tool and now names the desktop route.
+
+  config
+    desktop_mismatch_corrections (default 1), desktop_focus_min_confidence
+    (default 0.6), and the two pre-existing string-truthy bugs fixed.
+
+C.3 Real-model selection results
+--------------------------------
+
+qwen3:8b, N=12, one fresh Agent and one private memory directory per case:
+
+  correct routing       10/12   (3 by fast path, 7 of 9 model-consulted)
+  desktop.* selected     6/12   (5 of 9 model-consulted)
+  tools intercepted     10, none executed
+
+qwen3:14b, N=9 (model-consulted cases only):
+
+  correct routing        5/9
+  desktop.* selected     3/9
+  mean latency         141.9s per case (8b: 100.2s)
+
+The larger model routed *worse* than the smaller one on these cases. That is a
+single observation on one machine, not a general claim, but it is reported because
+it is what was measured and because "use the bigger model" would be the wrong
+default to draw from it.
+
+Still not correct, stated plainly:
+  - "Press Ctrl+S in Notepad." - no tool call, both models.
+  - "Open Notepad and click Save" - no tool call, 8b.
+  Both are interaction-shaped requests where the model answers in prose rather than
+  calling a tool that is present in its context.
+
+C.4 Three measurement defects in my own harness
+------------------------------------------------
+
+Each of these made a working path look broken. They are recorded because the
+previous audit's wrong conclusion came from exactly this class of error.
+
+  (a) No capability runtime. build_registry without one registers no desktop.* tools
+      at all, so the probe measured routing against an empty set. The first run
+      reported "0 desktop tools offered".
+  (b) Shared durable conversation. A fresh Agent per case was not enough, because
+      ConversationStore is persisted and every new Agent restored the previous
+      run's transcript. Each case was therefore answered by a model that had just
+      read ten of its own earlier refusals ("Notepad must be manually opened") and
+      reproduced them verbatim. Isolating memory_dir per run fixed it, and took
+      correct routing from 6/12 to 10/12.
+  (c) Only the last provider call was read. The agent loops; a first turn may
+      select correctly and a later recovery turn contain prose. Reading only the
+      last call reported "no selection" for requests that had already chosen well.
+
+  Separately, the probe leaked real side effects: it intercepted _execute_step but
+  not _run_intent, so two cases actually launched Notepad on this machine. Both
+  paths are intercepted now, and the stray processes were cleaned up.
+
+================================================================================
+D. M2.17 - PERSISTENT AUTONOMY
+================================================================================
+
+D.1 The Goal is not a Task
+--------------------------
+
+TaskState is untouched. A Goal models an objective that outlives any single
+attempt; a Task models one attempt. A Goal may produce many Tasks; a Task belongs
+to at most one Goal. Overloading TaskState would make "this task is done" and "this
+objective is achieved" indistinguishable, which is the conflation that lets an
+agent claim success it did not earn.
+
+  GoalState: CREATED, ACTIVE, PAUSED, RESUMABLE, COMPLETED, FAILED, CANCELLED
+  Explicit transition table; nothing unlisted is permitted.
+
+D.2 Durable storage
+-------------------
+
+One JSON file per goal under <sessions_dir>/goals/<goal_id>.json, written with
+memory.storage.save_json - the repository's single atomic helper (temp file in the
+same directory, then os.replace). Unsafe identifiers are refused. Records are
+versioned. An unreadable record reads as *absent*, not as an empty goal, because
+"no work ran" and "we cannot tell what ran" must not collapse into one answer.
+Unknown fields survive a round trip in metadata rather than being dropped.
+
+All free text is redacted with the same policy the companion uses, so a credential
+typed into a goal cannot come back out of the store. Verified by reading the raw
+file.
+
+D.3 Agent.resume
+----------------
+
+The capability core/windows/__init__.py had recorded as absent. Nine steps:
+
+  1-2  load durable state; interrupted steps already classified in __init__
+  3    inspect the execution plan
+  4    restore the VerificationLedger from its persisted projection
+  5    restore recovery state
+  6    classify what is resumable
+  7    REFUSE uncertain side-effect replay
+  8    rebuild normal request context and system prompt
+  9    continue through the ordinary permission-checked execution path
+
+Two properties worth naming:
+
+  - Step 4 closes a documented gap. VerificationLedger.from_dict existed and was
+    exercised only by tests; production never restored a ledger. A resume that
+    could not see prior evidence would re-verify completed work.
+  - Step 7 is the milestone's central safety rule. A step persisted RUNNING by a
+    process death may or may not have applied its effect. PlanStepRecord already
+    encodes this via interrupted and is_replayable; resume applies it to a whole
+    task and BLOCKS the entire task rather than replaying the safe subset, because
+    partial replay leaves a durable plan describing a world that never existed.
+
+  Prior terminal state is read through terminal_verdict(state, verification),
+  never from status == "completed". A reloaded COMPLETED + UNVERIFIED means the
+  work was never checked and is not resumed as though it were done.
+
+D.4 Scheduler
+-------------
+
+AutonomyScheduler decides only whether a due, authorised goal should start a Task,
+and records that durably before submitting. It reaches tools solely through an
+injected submit callback, which in production is the Agent's normal request path -
+so there is no autonomous execution path that could be unsafe. Asserted by import
+test: no core.executor, no core.windows, no tools.registry, no ctypes.
+
+Idempotency is durable, not in-memory. Each goal carries last_started_tick keyed
+on its own due instant, so a repeated tick, a restart mid-tick and two racing
+schedulers all compare the same string and all decline. A wall-clock timestamp
+would not do: two checks in the same second would produce different strings.
+
+Persistence happens BEFORE submission. A crash between the two skips one run; the
+reverse order would duplicate one. The schedule is advanced before the save, so the
+persisted record already carries the next due time - an ordering bug found by test
+that left the advance in memory only.
+
+Every non-started goal is reported with a reason. Silently omitting a declined goal
+would make one that never runs indistinguishable from one that does not exist.
+
+D.5 Startup reconciliation
+--------------------------
+
+Deterministic: reads durable state, writes durable state, and decides nothing else.
+Running it twice produces the same report - asserted.
+
+  cancelled goal          left cancelled; restart never resurrects it
+  awaiting permission     left paused; autonomy never auto-confirms
+  recovery exhausted      surfaced as failed, not retried
+  unauthorised            paused
+  in-flight task          marked RESUMABLE - may be picked up, not that it will be
+  task finished while down goal returns ACTIVE; its evidence is the goal's call
+
+A task that completed while the process was down does NOT complete the goal. That
+case is tested explicitly: a goal needing two evidences stays uncompleted after its
+only task reports success.
+
+D.6 Goal/task relationship and completion
+------------------------------------------
+
+  Goal completion requires len(verified_task_ids) >= required_evidence.
+  Evidence recording is idempotent, so a repeated completion event cannot inflate
+  the count toward completion.
+  mark_completed() refuses without the evidence and the state does not move.
+  Tested: "create the project and make all tests pass" with required_evidence=3
+  stays ACTIVE after one task completes.
+
+D.7 Cancellation
+----------------
+
+Durable and irreversible. cancel_requested is persisted the moment the user
+cancels, is_schedulable() refuses it, the scheduler declines it with reason
+"cancelled", and reconciliation leaves it cancelled. Tested across a restart.
+
+D.8 Resource limits
+-------------------
+
+New [autonomy] settings: max_active_goals=3, max_tasks=32, max_concurrent=1,
+min_interval_seconds=60. These are ceilings on how much may happen, never
+permissions. No second resource-management system was created; the scheduler's
+concurrency counter is its own and nothing else was added. Verified live: 40 due
+goals, scheduler started exactly 3 and declined the rest with a stated reason.
+
+D.9 Companion integration
+-------------------------
+
+A bounded read-only projection: goal_line and goal_active on the existing
+snapshot, rendered as one redacted line. The companion displays autonomous work and
+has no authority over any goal. Tests assert it never grew a create, schedule or
+cancel path, and that its state module does not import the goal model or the
+scheduler - it receives a projection, not the authority.
+
+D.10 The production runtime (added after the first audit draft)
+----------------------------------------------------------------
+
+Writing this section is itself a finding. The first draft of this audit described the
+scheduler's submit callback as reaching "the Agent's normal request path in
+production". That was **false when written**. A grep for importers of
+``core.goals`` and ``core.autonomy`` across every non-test module returned nothing:
+the goal layer was correct, comprehensively tested, and completely unreachable. A
+durable feature that nothing can start is a feature that does not exist, and the
+tests had been structured so that this was invisible - they injected their own
+submit callback and therefore never needed a production one.
+
+``AutonomyRuntime`` closes the gap. It owns the goal lifecycle in production:
+reconcile, tick, submit, observe, cancel, project. Its permissions are narrow on
+purpose:
+
+* It creates a Task by calling the Agent's ordinary ``respond`` - the same entry
+  point a typed user turn uses - and then *observes* the task record that call
+  produced.
+* It never executes a tool, mints a task id, auto-confirms a permission, decides
+  success, or resurrects a cancelled goal.
+* ``goal_completed`` is True only because ``Goal.mark_completed`` accepted
+  accumulated *verified* evidence.
+
+Wiring, opt-in and off by default:
+
+    main.py --autonomy [--autonomy-interval 30]
+
+Opt-in is the honest choice rather than a cautious one. A goal becomes a Task
+without a user typing anything, so starting that unasked would be the surprise this
+project is supposed to avoid. Reconciliation and the scheduler thread are created
+only under the flag, and the thread is stopped through ``atexit`` so it cannot outlive
+the capability runtime on any of the four UI exit paths.
+
+Verified end to end, in a real process, against the real Agent:
+
+    [autonomy] reconciled 1 goal(s); active: Report the free disk space ...
+    [autonomy] scheduler running as diablo-autonomy-scheduler (every 3s)
+    autonomy autonomy_goal_observed {'goal_id': 'smoke1',
+        'task_id': 'cf426ea3f40e4e0fb563fff886168529', 'verdict': 'unverified',
+        'goal_completed': False}
+    autonomy autonomy_task_started {'goal_id': 'smoke1', ...}
+    autonomy autonomy_tick {'started': 1, 'due': 1, 'skipped': 0, 'errors': 0}
+    autonomy autonomy_tick {'started': 0, 'due': 0, 'skipped': 1, 'errors': 0}
+    ...
+    state: active | task_ids: ['cf426ea3f40e4e0fb563fff886168529']
+    last_started_tick: 20200101-000000 | next_run_at: 20261003-170903
+
+The task id came from the TaskManager's own minting path. The first tick started the
+goal; every later tick declined it with "not due" and wrote nothing.
+
+Four defects this work exposed, all fixed, none of them hypothetical:
+
+1. **A goal could never be completed by a direct submit.** The scheduler transitions
+   a goal to ACTIVE before submitting, so a tick-driven start was fine. Any other
+   caller - the real-model probe, an operator script, a test - arrived with the goal
+   still CREATED, and CREATED cannot reach COMPLETED through the transition table.
+   The runtime could not complete the goals it was asked to run. Fixed in ``observe``.
+2. **Every in-flight task read as "unknown".** ``TaskRecord.status`` says
+   "pending"/"active"; ``TaskState`` says CREATED/EXECUTING. Passing a record status
+   straight into ``terminal_verdict`` raises, and the exception was degraded into
+   "unknown" - so a task still running looked unreadable, and would never have
+   contributed evidence. Fixed with an explicit, listed translation table.
+3. **Free-form ``metadata`` was persisted unredacted.** Every other field went
+   through ``sanitize_goal_text``; ``metadata`` was written with
+   ``dict(self.metadata)``. A caller-supplied
+   ``{"headers": {"Authorization": "Bearer ..."}}`` landed on disk in the clear while
+   this audit claimed goals redact on write. Now walked recursively, with a depth
+   cap and an entry cap.
+4. **``ReconciliationReport.changed`` counted decisions, not changes.** Every startup
+   reported "N goals changed" for goals already exactly where reconciliation wanted
+   them. Now tracks goals whose persisted state actually moved, separately from the
+   decision lists.
+
+A fifth problem was in a test rather than the code. The ledger-restore test built an
+**empty** ledger - its helper ignored its argument - and then asserted
+``report.ledger_entries >= 0``. It could not fail, and it read like coverage of the
+exact gap M2.17 claims to close. It now persists a real one-entry ledger and asserts
+the restored count, state and evidence.
+
+And one caution about the CLI evidence above: the first three attempts to reproduce
+it reported "the scheduler never ticked", which was the harness, not the code. The
+console UI reads stdin, and a headless launch gets EOF immediately, so the process
+exits about a second after startup - before the first tick. Two of those runs also
+seeded the goal into a directory the settings never read. Both failures looked
+exactly like a broken feature. The lesson is the same one as in section C.4: check
+that the harness can observe success before believing it observed failure.
+
+D.11 Real-model autonomy results
+--------------------------------
+
+qwen3:8b, N=5 goals, each turned into a task through the scheduler's submit
+callback, tools intercepted:
+
+  goal -> sensible task    3/5
+  tools intercepted        3, none executed
+
+  OK   Create a project folder...    -> terminal.execute
+  OK   Open Notepad and save...      -> applications.open
+  OK   Read config.toml...           -> filesystem.read_file
+  no   Find the OK button in a dialog and press it.   -> (no tool call)
+  no   Show me what this machine's CPU and memory... -> (no tool call)
+
+Wrong-tool recovery was probed directly rather than by waiting for a model to
+misroute on demand: mismatch detected True, corrections bounded at 1 of a budget of
+1, permission path unchanged.
+
+================================================================================
+E. SECURITY AUDIT
+================================================================================
+
+  Permission bypass        NO. Autonomy has no execution path. Every task goes
+                            through the existing TaskManager and PermissionManager.
+                            A goal awaiting permission is declined with reason
+                            "awaiting permission" and is never auto-confirmed.
+                            Real-model run 2 of the earlier audit showed a
+                            confirmation-requiring tool correctly refused.
+  Scheduler bypass         NO. The scheduler's entire surface is an injected
+                            callback. Import-tested: no executor, no windows, no
+                            tool registry, no ctypes.
+  Resume replay            NO. A side-effecting interrupted step blocks the whole
+                            task. Proven across a real process restart.
+  Task identity            NO. The scheduler generates no task id; the TaskManager
+                            mints it. A goal cannot supply one.
+  Request identity         NO. Unchanged; the UI-chosen id is still not forwarded.
+  Secret persistence       NO. Goals redact on write with the companion's policy;
+                            verified by reading the raw file for the secret.
+  Prompt injection         NO. Persisted goal text is data. It is read back as task
+                            input through the normal request lifecycle, and the
+                            goal record exposes no field that could be mistaken for
+                            policy (no system_prompt, no policy).
+  Native handle leakage    NO. Handle-shaped literals are redacted and the modules
+                            import no native API.
+  Target spoofing          NO. Unchanged from M2.16.5/6; autonomy adds no targeting.
+  Companion isolation      NO. Read-only projection, asserted by import and
+                            attribute tests.
+  Event telemetry          Redacted and structured: intent family, confidence, tool
+                            counts, selected tool, mismatch flag. Never user prose.
+  Verification bypass      NO. Goal completion requires accumulated evidence.
+  Cancellation bypass      NO. Durable, restart-safe, checked in three places.
+  Runtime reach            The goal layer is reachable only through --autonomy,
+                            which is opt-in, and only ever calls Agent.respond.
+                            Verified by a real CLI run: a due goal produced a
+                            TaskManager-minted task id and no other execution.
+  Runtime adjudication     NO. The runtime copies the verdict that
+                            terminal_verdict computes from the task's own durable
+                            lifecycle. It cannot turn an unverified completion into
+                            evidence; asserted against a real Agent.
+
+================================================================================
+F. REAL MODEL
+================================================================================
+
+Model: qwen3:8b (primary) and qwen3:14b (comparison). Provider: real Ollama.
+All selection probes intercept tool dispatch; nothing on the desktop was touched.
+
+F.1 Desktop tool selection, N=12
+----------------------------------
+  request                                    intent            tools shown  selected          ok
+  Open Calculator.                           application_launch   0        applications.open  YES fast_path
+  Launch Notepad.                            application_launch   0        applications.open  YES fast_path
+  start notepad                              application_launch   0        applications.open  YES fast_path
+  Click Save in Notepad.                     ui_action            4        desktop.find       YES model
+  find the OK button in the Calculator...    ui_discovery         2        desktop.find       YES model
+  Press Ctrl+S in Notepad.                   keyboard_interaction 2        (none)             NO
+  type hello into the search box             keyboard_interaction 2        desktop.find       YES model
+  minimize the Notepad window                window_management   4        desktop.find       YES model
+  Capture the screen.                        screen_display      2        capability.execute YES model
+  Open Calculator and calculate 123 x 456.   compound             6        desktop.open       YES model
+  Open Notepad and click Save                compound             6        (none)             NO
+  Open Calculator, then verify it is open.   compound             6        desktop.open       YES model
+
+  correct 10/12 | desktop.* chosen 6/12 | latency mean 100.2s, max 772.6s
+
+F.2 Same cases, qwen3:14b, model-consulted only, N=9
+------------------------------------------------------
+  correct 5/9 | desktop.* chosen 3/9 | latency mean 141.9s, max 295.8s
+
+  Not correct: Click Save in Notepad. / Press Ctrl+S in Notepad. /
+               minimize the Notepad window / Capture the screen.
+
+F.3 Autonomy goal -> task, qwen3:8b, N=5
+--------------------------------------------
+  correct 3/5, as listed in D.10.
+
+F.4 What is NOT claimed
+------------------------
+  - No natural-language desktop autonomy is claimed. Selection improved from a
+    measured 0/3 to 10/12 on one machine with one model; that is a measurement,
+    not a reliability claim.
+  - No multi-task goal completion was validated with a real model. Goal evidence
+    accumulation is covered deterministically only.
+  - Real-model validation covers selection and planning. Desktop execution is not
+    re-validated here; M2.16.6's real-Windows execution evidence stands unchanged.
+  - N is small and stated everywhere. No confidence interval is implied.
+
+================================================================================
+G. RESTART
+================================================================================
+
+G.1 Cross-restart continuation - 6 tests, each spawning a real interpreter
+--------------------------------------------------------------------------
+  seed   write goal, task and a durable plan; leave a step persisted RUNNING
+  resume a fresh process reconciles, then attempts to resume
+
+  Case: side-effecting interrupted step (filesystem.write_file)
+    result: BLOCKED, refused_steps ["s2"]
+            "refusing to replay steps whose side effects are uncertain"
+            durable plan still shows s1 done, s2 interrupted, s2 not replayable
+  Case: interrupted read-only step (filesystem.read_file)
+    result: RESUMED, resumable_steps ["s2"]
+  Case: the resuming process learns the goal      pass
+  Case: a completed step is not re-offered         pass
+  Case: resume is idempotent across restarts       pass (blocked both times)
+  Case: no execution occurred during resume        pass (child's provider raises if
+                                                      used; no out.txt on disk)
+
+G.2 Durable state observed across the boundary
+-----------------------------------------------
+  goal_id, objective, state, task_ids, current_task_id, required_evidence
+  plan: step_id, tool, status, interrupted, replayable, side_effect_key
+  lifecycle: state, verification, recovery counters
+
+G.3 What the resuming process refused to do
+--------------------------------------------
+  Re-dispatch a step whose side effect may already have applied. This is the single
+  most important guarantee in the milestone and it is proven by a real process
+  boundary, not by an object constructed in the same interpreter.
+
+================================================================================
+H. PERFORMANCE
+================================================================================
+
+  Startup reconciliation     O(goals); measured in the deterministic suite
+  Scheduler overhead         one store read per tick; declined goals are reported
+                             with a reason rather than silently dropped
+  Goal persistence          one atomic write per state change
+  Model latency              8b mean 100.2s / max 772.6s per request on this box;
+                             14b mean 141.9s / max 295.8s
+  Companion UI latency       unchanged from M2.16.UI; goal projection adds two
+                             snapshot fields and one label configure
+  Memory / threads          40 goal + scheduler + reconciliation cycles:
+                             threads 1 -> 1, delta 0; 40 goal files for 40 goals
+  Event history              bounded by the controller, unchanged
+  Timer count                bounded by the view, unchanged
+
+  32-minute companion soak (M2.16.UI, re-confirmed on this tree): 640 cycles,
+  1.2% CPU, +1.9 MB working set, timers stable at 2, companion windows constant
+  at 1, clean shutdown.
+
+================================================================================
+I. TEST RESULTS
+================================================================================
+
+Focused
+  M2.16.UI.1 routing              80 passed
+  M2.17 goal/scheduler/reconcile  63 passed
+  M2.17 runtime (fake Agent)      30 passed
+  M2.17 runtime (real Agent)       7 passed
+  M2.17 cross-restart (real)       6 passed
+  M2.17 companion goals           20 passed
+  M2.16.UI (from the prior audit) 295 passed with real Windows enabled
+
+Full suites, final code
+  Deterministic   3568 passed, 218 skipped          EXIT 0
+  Real Windows    3742 passed, 44 skipped, 0 FAILED  EXIT 0
+
+  Note on the run before this one: it reported 3699 passed, 44 skipped, 1 failed -
+  the M2.16.6 Calculator cross-file test described below. On the final tree the same
+  suite is completely green, which is consistent with the diagnosis given: the
+  failure depends on windows left behind by earlier test files, and this run did not
+  hit that state. It remains an environmental flake rather than a fixed bug, and it
+  is described rather than declared solved.
+
+  The one genuinely new observation from this round is a timing flake:
+  ``test_m216_ui_companion.py::TestSubmissionThreading::
+  test_a_raising_worker_is_recovered_from`` failed once under full-suite load with
+  "backend submission never settled", then passed in isolation, in its own file
+  (82 passed), and on the full re-run. It waits on a 5-second idle budget, and this
+  machine runs 3786 tests. Nothing in the companion submission path was changed.
+  Recorded because a flake that only appears under load is exactly the kind of thing
+  that gets mistaken for a regression later.
+
+  Also pre-existing and unchanged: the suites print "Windows fatal exception:
+  access violation" to stderr at interpreter shutdown while passing with exit 0.
+  Verified present at the M2.16.6 baseline with all new test files excluded.
+
+  The Calculator failure, investigated in full:
+    - It is in M2.16.6 code, untouched by this milestone.
+    - It passed at the M2.16.UI baseline commit 6841fd6's tree only when run in
+      isolation; the same failure appeared in the full real run before any
+      M2.16.UI.1 or M2.17 code existed.
+    - It passes in isolation (3 passed) and passes with its whole file
+      (22 passed).
+    - It fails only in the full cross-file run, where earlier files leave a window
+      that makes three windows match.
+    - The refusal itself is correct M2.16.6 behaviour: ambiguous match must not
+      guess. The environment is polluted, the code is right.
+    - A stale ApplicationFrameHost from 30-09 (before this milestone) is present on
+      the machine and can host a Calculator window.
+  Not "fixed": making that test robust to cross-file window pollution means changing
+  an M2.16.6 assertion whose whole purpose is to refuse ambiguity, which would
+  weaken a real safety property to satisfy a runner. Recorded as a known
+  environmental flake instead.
+
+Static
+  compileall (whole repo)    clean, exit 0
+  pip check                   No broken requirements found
+  package imports             13 modules, 0 failures
+
+Leaks
+  8 companion cycles          windows +0, threads +0
+  32-minute soak              windows +0, threads +0, timers +2 -> +2
+  40 autonomy cycles          threads +0, no duplicate goal files
+  5 runtime start/stop cycles threads 1 -> 1, delta 0, no autonomy thread left
+
+Blender
+  NOT RERUN, and the reason is not ceremony: this milestone changed no shared
+  Blender execution path. No change to Executor, TaskManager, cancellation,
+  VerificationLedger, the capability contracts, or the Blender adapters. The one
+  shared path touched was model routing and the tool-context selector, and the
+  deterministic and real-Windows suites both include the Blender-tool registration
+  and capability-bridge tests, which pass. A ceremonial Blender run would add
+  minutes and no evidence.
+
+================================================================================
+J. LIMITATIONS
+================================================================================
+
+COMPLETE
+  M2.16.UI architecture, state machine, docking, event narrowing, redaction,
+  threading, cancellation, real-Windows validation, soak
+  M2.16.UI.1 intent classification, family routing, focus mode, descriptions,
+  bounded wrong-tool recovery, telemetry
+  M2.17 durable Goal/GoalStore, Agent.resume, scheduler, reconciliation,
+  cancellation, evidence-based completion, resource ceilings, companion projection
+  M2.17 production runtime: --autonomy wiring, submit/observe, goal cancellation
+  converging its live task, bounded presentation, startup reconciliation
+  Cross-restart continuation across a real process boundary
+
+COMPLETE WITH LIMITATIONS
+  Real-model desktop selection - 10/12, desktop.* in 6/12, one model, one machine
+  Real-model autonomy planning - 3/5 goals
+  Multi-monitor placement - geometry exhaustively tested against synthetic
+    displays including negative virtual coordinates, and against one real display;
+    no second physical monitor was available
+  DPI - the process is DPI-virtualised, so geometry is self-consistent and
+    validated on real hardware but is not per-monitor aware
+  Verification ledger restore - implemented, exercised by the restart tests, and now
+    asserted against a real one-entry projection rather than an empty one
+  Autonomy under a live model clock - the scheduler is proven deterministically,
+    across restarts, and against a real Agent offline, but not against a real model
+    on a real schedule
+
+PARTIAL
+  Real-model multi-task goal completion - not validated with a model at all
+  Scheduled autonomy against a real model - no run has left a due goal to be picked
+    up by a background tick with a real provider behind it
+
+DEFERRED
+  M2.18 Vision Foundation - not started, and deliberately so
+  STT / wake word / VAD / barge-in - no code pretends these exist
+  A "still waiting" watchdog for a backend that never emits a terminal event
+  Per-monitor DPI awareness via a process manifest
+  uia_select / uia_expand_collapse against a real ListView/TreeView/ComboBox
+
+UNPROVEN
+  That a model reliably drives multi-step desktop work end to end
+  That natural-language desktop autonomy is reliable - one machine, small N
+  That 14b routes better than 8b - one observation, and it went the other way
+
+NOT DONE / KNOWN BAD
+  The M2.16.6 Calculator cross-file test flake described in section I. Green on the
+  final run, still environmental rather than fixed
+  The pre-existing access-violation stderr noise described in section I
+  One load-sensitive companion submission test, described in section I
+
+================================================================================
+FINAL ROADMAP STATE
+================================================================================
+
+  M2.16.1  Window Foundation              COMPLETE
+  M2.16.2  Pointer Foundation             COMPLETE
+  M2.16.3  Keyboard Foundation            COMPLETE
+  M2.16.4  Screen / Display Foundation    COMPLETE
+  M2.16.5  UIA + Visual Targeting         COMPLETE WITH LIMITATIONS
+  M2.16.6  Integrated Desktop Workflows   COMPLETE WITH LIMITATIONS
+  M2.16.UI Edge Companion                COMPLETE WITH LIMITATIONS
+  M2.16.UI.1 Desktop Model Selection     COMPLETE WITH LIMITATIONS
+  M2.17    Persistent Autonomy            COMPLETE WITH LIMITATIONS
+  M2.18a   Vision Foundation              NOT STARTED
+  M2.18b   Blender Vision Depth           NOT STARTED
+  Voice    STT / VAD / wake word          NOT STARTED
+
+No future milestone is marked complete and none was invented.
+
+================================================================================
+RECOMMENDED NEXT MILESTONE
+================================================================================
+
+M2.18a Vision Foundation, entered with three cheap closures:
+
+  1. Real-model multi-task goal completion. The goal layer is the newest and least
+     model-exercised part of the system; two more evidences of it under a real
+     model would cost less than any new surface.
+  2. The interaction-shaped requests that still fail - "Press Ctrl+S in Notepad."
+     produced no tool call with either model. That is a prompt/description problem,
+     not an architecture problem, and it is cheap to iterate on.
+  3. The M2.16.6 Calculator cross-file flake, so the real-Windows gate is green and
+     stays meaningful.
+
+================================================================================
+FINAL VERDICT
+================================================================================
+
+M2.16.UI, M2.16.UI.1 and M2.17 are COMPLETE WITH LIMITATIONS.
+
+The central architectural claim held: there is still exactly one Agent, one
+TaskManager, one TaskStore, one Executor, one PermissionManager, one
+VerificationLedger, one cancellation protocol and one capability layer. The goal
+layer records intent and authorisation and routes work through them; the scheduler
+can only ask for a task; the companion can only display. Each of those is asserted
+by test rather than by comment.
+
+The most valuable outcome is the correction. A previous audit reported that a model
+would not choose the desktop tools, and built a recommendation on that. The model
+was never asked: a regex answered first, and a truthy string had disabled the tool
+selector entirely. Fixing the three defects moved real-model selection from a
+measured 0/3 to 10/12 with desktop tools chosen in half the cases.
+
+The second correction is this one. The first draft of this audit described the goal
+scheduler as feeding "the Agent's normal request path in production", and a grep
+showed that no production module imported the goal layer at all. The tests had been
+arranged so that this could never show up. Building the runtime then exposed four
+defects that only exist on the real path - a goal that could never complete, an
+in-flight task that read as unreadable, metadata persisted unredacted, and a change
+counter that counted decisions rather than changes - plus a test that could not fail.
+The lesson generalises past this milestone: a layer that is only ever exercised
+through an injected seam is a layer whose integration is unproven, no matter how many
+of its own tests pass.
+
+The most important guarantee is negative and is proven across a real process
+boundary: a step interrupted by a crash, whose side effect may already have applied,
+is refused rather than replayed, and the whole task is blocked rather than
+partially resumed.
+
+What is not claimed is as long as what is. Selection improved materially; it is not
+reliable. Autonomy is proven deterministically, across restarts, and against a real
+Agent - but never against a real model on a real schedule. The real-Windows gate is
+green on the final tree, and the one test that failed on an earlier run of it is
+named, diagnosed as environmental, and not declared fixed.
+
+================================================================================
+END OF AUDIT
+================================================================================

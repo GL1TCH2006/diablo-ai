@@ -1040,7 +1040,8 @@ Nothing here is claimed complete that is not.
 | M2.16.5 UIA + Visual Targeting | **COMPLETE** (foundation; two actions unproven against a real control — §8.6) |
 | M2.16.6 Integrated Desktop Workflows | **COMPLETE** (composition only; no autonomy, no vision) |
 | M2.16.UI Edge Companion | **COMPLETE WITH LIMITATIONS** (§7d) — see `DIABLO_M2_16_UI_COMPLETE_AUDIT.txt` |
-| M2.17 Persistent Autonomy | not started |
+| M2.16.UI.1 Desktop Model Selection | **COMPLETE WITH LIMITATIONS** — see `DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt` |
+| M2.17 Persistent Autonomy | **COMPLETE WITH LIMITATIONS** — see `DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt` |
 | M2.18 Vision Foundation | not started |
 | Voice / STT / VAD | not started |
 
@@ -1145,3 +1146,49 @@ another milestone.
 **Next milestone: M2.17 Persistent Autonomy**, entered with real-model tool
 selection for M2.16.6 as its first task, since six milestones of desktop
 capability are currently unreachable by the model that has to call them.
+
+---
+
+## 12. M2.16.UI.1 and M2.17 - status
+
+Both are complete with limitations. The authoritative record is
+`docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt`.
+
+**M2.16.UI.1 - desktop tool selection.** The audit above attributed the 0/3 result
+to the model preferring `applications.open`. That attribution was wrong, and §11's
+own recommendation to make selection work was aimed at the wrong target. Three
+defects were actually responsible:
+
+1. `Planner.fast_intent` matched `^(?:open|launch|start)\s+(.+)$` and short-circuited
+   before any model call, so **no audited run ever consulted a model**. The greedy
+   capture was also what produced the "application name" that §11 blamed on 8b.
+2. Nothing could emit the `desktop` capability, so the desktop tools were
+   unreachable by routing.
+3. `tools_full_context` and `resource_check_enabled` were loaded from the *string*
+   `"false"`, which is truthy. The tool-context selector was therefore bypassed on
+   every production turn and the model saw all 74 tools. This one had been silently
+   disabling M2.13.0's selector since that milestone.
+
+After the fixes, real-model selection is **10/12 correct with `desktop.*` chosen in
+6/12** (qwen3:8b), up from a measured 0/3.
+
+**M2.17 - persistent autonomy.** Durable `Goal`/`GoalStore`, `Agent.resume`, a
+bounded scheduler, deterministic startup reconciliation, and `AutonomyRuntime` - the
+production wiring behind `--autonomy`. A goal records intent and authorisation and
+routes every piece of work through the existing TaskManager; it has no execution
+path of its own. Completion requires accumulated verified evidence, never "the last
+task completed".
+
+Two notes worth carrying forward. First, the goal layer shipped *unreachable*: no
+production module imported it, and the tests injected their own submit callback so
+they could never have noticed. Second, building the runtime exposed four defects
+that existed only on the real path - including a goal that could never complete and
+in-flight tasks that read as unreadable - plus one test that asserted `>= 0` and so
+could not fail. A layer exercised only through an injected seam has an unproven
+integration, whatever its own test count says.
+
+**Next milestone: M2.18a Vision Foundation** is now genuinely reachable, because
+the model can finally reach the desktop stack. M2.17's remaining limits - autonomy
+proven against a real Agent but never against a real model on a real schedule, and
+no real-model validation of multi-task goal completion - should be closed early in
+that milestone rather than left to accumulate.
