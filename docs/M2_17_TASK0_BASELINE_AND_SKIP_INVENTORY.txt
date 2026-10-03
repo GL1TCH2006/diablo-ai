@@ -1,0 +1,169 @@
+================================================================================
+M2.17.x TASK 0 - BASELINE AND SKIP INVENTORY
+================================================================================
+
+Measurement only. No implementation was modified in this task.
+
+Method note: skip reasons were captured with a pytest plugin held *outside* the
+repository, so the baseline measurement could not itself alter the tree it was
+measuring.
+
+================================================================================
+A. GIT STATE
+================================================================================
+
+  HEAD                989aaa57e360cb6206daa6df00c38304074719f0
+  short HEAD          989aaa5  M2.17: wire the companion projection, single-gate
+                                limits, real-model execution
+  branch              main
+  working tree        CLEAN (git status --porcelain empty)
+  history integrity   4e64a87 (pre-milestone HEAD) IS an ancestor of HEAD
+                      Verified with `git merge-base --is-ancestor`. No reset,
+                      rebase, squash, force-push or history rewrite occurred.
+
+  environment         Python 3.14.6, Windows 11 10.0.26200-SP0
+
+================================================================================
+B. BASELINE RESULTS
+================================================================================
+
+  Deterministic suite (no opt-in env vars)
+    3585 passed, 218 skipped          exit 0
+
+  Real-Windows suite (DIABLO_REAL_WINDOWS_TESTS=1)
+    3759 passed,  44 skipped          exit 0
+
+  Both match the figures carried into this milestone. No pre-existing failure and
+  no flaky failure reproduced. The M2.16.6 Calculator cross-file flake that appeared
+  in an earlier run did not appear in either baseline run; it remains an
+  environmental flake, not a fixed defect.
+
+================================================================================
+C. SKIP INVENTORY - DETERMINISTIC MODE (218 skips)
+================================================================================
+
+  Bucket                            Count
+  --------------------------------  -----
+  PLATFORM-SPECIFIC                    90
+  EXPECTED-ENVIRONMENTAL               85
+  OPTIONAL-BACKEND                      43
+  UNCLASSIFIED                           0
+
+  By module
+    55  test_m2164_display_real.py        EXPECTED-ENVIRONMENTAL
+    37  test_windows_real.py              PLATFORM-SPECIFIC
+    30  test_m2162_input_real.py          EXPECTED-ENVIRONMENTAL
+    22  test_m2166_desktop_workflow_real.py PLATFORM-SPECIFIC
+    21  test_recovery_p10_real_model.py   OPTIONAL-BACKEND
+    21  test_m216_ui_edge_real.py         PLATFORM-SPECIFIC
+    19  test_knowledge_p9_real_model.py   OPTIONAL-BACKEND
+    10  test_m216_windows_real.py         PLATFORM-SPECIFIC
+     2  test_blender_concurrency.py       OPTIONAL-BACKEND
+     1  test_m2152_blender_cancellation.py OPTIONAL-BACKEND
+
+================================================================================
+D. SKIP INVENTORY - REAL-WINDOWS MODE (44 skips)
+================================================================================
+
+  Bucket                            Count
+  --------------------------------  -----
+  OPTIONAL-BACKEND                      43
+  EXPECTED-ENVIRONMENTAL                1
+  UNCLASSIFIED                           0
+
+  The single environmental skip is honest and specific:
+    test_m2164_display_real.py::
+      TestCapturingATestOwnedSurface::
+        test_a_test_owned_window_can_be_captured_with_its_known_colour
+    "this session's screen surface does not present window content: the capture of
+     a known (51, 102, 204) surface returned (24, 24, 24). DWM composition is
+     enabled and PrintWindow returns the correct colour only into a bitmap the
+     compositor then replaces."
+
+  That is a host property (DWM composition on a virtualised desktop), it is M2.16.4
+  display capture rather than M2.17, and the skip states the measured numbers rather
+  than hiding behind a flag. ACCEPTABLE.
+
+  Real-Windows mode removes 174 of the 218 skips. Every one of the 90
+  PLATFORM-SPECIFIC skips is therefore *executed* in the real-Windows gate, not
+  merely counted. This matters: the real-Windows result is not a narrower run of the
+  deterministic one.
+
+================================================================================
+E. M2.17-RELEVANT SKIPS
+================================================================================
+
+  Skips inside any test_m217_* file                        : 0
+  Skips whose test id mentions autonomy or goal            : 0
+  Skips whose test id mentions verification / ledger /
+  completion / complete                                    : 4
+
+  All four are OPTIONAL-BACKEND, gated on DIABLO_REAL_MODEL_TESTS=1, and all four
+  live in other milestones' real-model suites:
+
+    test_knowledge_p9_real_model.py::
+      TestRealModelTask::test_verification_went_through_the_ledger
+    test_knowledge_p9_real_model.py::
+      TestRealModelTask::test_verification_is_never_claimed_without_evidence
+    test_recovery_p10_real_model.py::
+      TestRealModelRepair::
+        test_an_unverified_task_is_labelled_unverified_not_complete_as_verified
+    test_recovery_p10_real_model.py::
+      TestRealModelRepair::test_the_graph_never_claims_more_than_the_ledger
+
+  Classification: MUST RUN IN REAL ENVIRONMENT.
+
+  These are the closest thing the repository has to an existing real-model
+  verification test, and they are exactly on the seam this milestone has to close:
+  "verification went through the ledger" and "verification is never claimed without
+  evidence". They have apparently never been run on this machine - the gate has not
+  been set in any baseline run recorded so far. Two of the four assert precisely the
+  property that M2.17 currently lacks under a real model.
+
+================================================================================
+F. STRUCTURAL GAP FOUND - NOT VISIBLE AS A SKIP
+================================================================================
+
+  Classification: M2.17-ACCEPTANCE-GAP.
+
+  No test file in test_m217_* references DIABLO_REAL_MODEL_TESTS. Verified by grep.
+
+  The three M2.17 real-model probes are *scripts*, not pytest tests:
+
+    tests/real_model_autonomy.py
+    tests/real_model_desktop_selection.py
+    tests/real_model_edge_companion.py
+
+  None of them matches pytest's default collection patterns (`test_*.py`,
+  `*_test.py`), and `pytest tests --collect-only` confirms none of the three is
+  collected. Verified directly.
+
+  Consequence, stated plainly: **M2.17's real-model evidence currently lives
+  entirely outside the test suite.** Not skipped - absent. There is no pytest test,
+  passing or skipped, that exercises the M2.17 autonomy path with a real model. A
+  reviewer running the suite sees 3585 green and cannot tell that real-model goal
+  completion has never succeeded.
+
+  This is the single most important finding in Task 0, and it is directly in scope
+  for the primary objective: Tasks 9, 10 and 18 require a real production-path
+  proof, and the right shape for that proof is a gated pytest test in the repository
+  that states its own preconditions - not a script nobody's CI will ever run.
+
+  Note this is not a criticism of the probes: they work, and they produced the
+  evidence the previous audit relied on. It is a statement about where that evidence
+  lives.
+
+================================================================================
+G. SUMMARY
+================================================================================
+
+  Baseline recorded                          YES
+  Current suite green                        YES  (both modes, exit 0)
+  Git state understood                        YES  (clean, history intact)
+  Unexplained M2.17 skip                     NONE (0 unclassified, 0 in m217 files)
+  M2.17 acceptance criterion hidden behind
+  an unexplained skip                        NO for skips; YES for the structural
+                                             gap in section F, which is not a skip
+
+  TASK 0 STATUS: PASS
+================================================================================
