@@ -215,6 +215,55 @@ def _now() -> str:
 
 _VALID_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+#: ``metadata`` is persisted verbatim by ``to_dict`` unless it is bounded. Two limits,
+#: both needed: a recursion depth cap so a self-referential structure cannot loop, and
+#: an entry cap so a caller cannot write an unbounded blob into the durable record.
+MAX_METADATA_DEPTH = 6
+MAX_METADATA_ENTRIES = 200
+
+
+def _sanitize_metadata(value: Any, *, _depth: int = 0) -> Any:
+    """Make an arbitrary caller-supplied structure safe to persist.
+
+    ``objective`` and the summaries go through :func:`sanitize_goal_text`, but
+    ``metadata`` is a free-form mapping supplied by the caller and previously
+    persisted with ``dict(self.metadata)``. That was a hole in the redaction claim
+    and not a theoretical one: anything that reaches a goal's metadata - a nested
+    ``{"request": {"headers": {"Authorization": "Bearer ..."}}}``, say - would be
+    written to disk in the clear while the audit claimed goals redact on write.
+
+    Scalars are redacted, containers are walked, and anything past the depth or
+    entry cap is replaced rather than dropped, so the shape of the record stays
+    legible to whoever has to diagnose it.
+    """
+    if _depth >= MAX_METADATA_DEPTH:
+        return "[truncated]"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return sanitize_goal_text(value, limit=MAX_SUMMARY_CHARS)
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_METADATA_ENTRIES:
+                out["[truncated]"] = True
+                break
+            safe_key = sanitize_goal_text(key, limit=64) or "key"
+            out[safe_key] = _sanitize_metadata(item, _depth=_depth + 1)
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out_list: list[Any] = []
+        for index, item in enumerate(list(value)):
+            if index >= MAX_METADATA_ENTRIES:
+                out_list.append("[truncated]")
+                break
+            out_list.append(_sanitize_metadata(item, _depth=_depth + 1))
+        return out_list
+    # An object with a hostile __str__ must not be able to break persistence.
+    return sanitize_goal_text(type(value).__name__, limit=64)
+
 
 def _valid_goal_id(goal_id: Any) -> bool:
     """Reject anything that could escape the goals directory or name a temp file."""
@@ -408,7 +457,10 @@ class Goal:
             "last_started_tick": self.last_started_tick,
             "required_evidence": int(self.required_evidence),
             "schema_version": int(self.schema_version),
-            "metadata": dict(self.metadata),
+            # Bounded and redacted recursively. A free-form caller mapping is
+            # persisted user data exactly like ``objective`` is, and treating it
+            # differently would have made the redaction guarantee untrue.
+            "metadata": _sanitize_metadata(self.metadata),
         }
 
     @classmethod
@@ -489,7 +541,7 @@ def create_goal(objective: str, *, goal_id: str = "", authorized: bool = True,
         required_evidence=max(1, int(required_evidence)),
         interval_seconds=max(0, int(interval_seconds)),
         next_run_at=str(next_run_at or ""),
-        metadata=dict(metadata or {}),
+        metadata=_sanitize_metadata(metadata or {}),
     )
 
 

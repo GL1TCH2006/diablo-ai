@@ -95,6 +95,9 @@ class RecordingProvider:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", type=int, default=len(CASES))
+    parser.add_argument("--only-model", action="store_true",
+                        help="skip cases the fast path answers, so a slower model "
+                             "can be measured on the cases that actually reach it")
     parser.add_argument("--model", default="")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--json-out", default="")
@@ -115,6 +118,16 @@ def main(argv: list[str] | None = None) -> int:
         print("REFUSING: offline backend cannot measure model tool selection.")
         return 1
     return _run(backend, settings, args)
+
+
+def _is_fast_path(text: str) -> bool:
+    from core.desktop_intent import DesktopIntentFamily, classify_desktop_intent
+    from core.planner import Planner
+    from config.settings import load_settings
+
+    planner = Planner(load_settings())
+    return planner.fast_intent(text) is not None and \
+        classify_desktop_intent(text).family is DesktopIntentFamily.APPLICATION_LAUNCH
 
 
 def _build_agent(settings: Any, backend: Any, bus: Any, preferences: Any,
@@ -224,7 +237,12 @@ def _run(backend: Any, settings: Any, args: Any) -> int:
     # Nothing is dispatched, on either execution path. See ``_intercept``.
     dispatched: list[str] = []
 
-    cases = CASES[: max(1, min(args.cases, len(CASES)))]
+    selected_cases = CASES[: max(1, min(args.cases, len(CASES)))]
+    if getattr(args, "only_model", False):
+        planner_probe = Planner_probe(settings) if False else None
+        selected_cases = [c for c in selected_cases
+                          if not _is_fast_path(c[0])]
+    cases = selected_cases
     print(f"\ncases: {len(cases)}   (N is stated, not implied)")
     print("one fresh Agent per case, and a fresh conversation with it\n")
     print("-" * 100)

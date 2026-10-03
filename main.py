@@ -165,6 +165,15 @@ def main() -> int:
                         help="Let the companion speak through the existing SAPI TTS. "
                              "Text input always works regardless. There is no STT or "
                              "wake-word support: activation is by click.")
+    parser.add_argument("--autonomy", action="store_true",
+                        help="M2.17: reconcile durable goals at startup and run the "
+                             "bounded goal scheduler. Off by default: a goal becomes a "
+                             "Task through the same Agent, PermissionManager and "
+                             "Executor as a typed request, but it starts without a user "
+                             "asking, so it is opt-in.")
+    parser.add_argument("--autonomy-interval", type=float, default=30.0,
+                        help="Seconds between scheduler passes under --autonomy "
+                             "(default: 30).")
     parser.add_argument("--log-level", default="", help="DEBUG/INFO/WARNING/ERROR")
     args = parser.parse_args()
 
@@ -296,6 +305,39 @@ def main() -> int:
 
     agent = make_agent(None)
     project_label = f"{active_project.name} @ {active_project.path}" if active_project else "(none)"
+
+    # M2.17: the goal layer is opt-in and shares this one Agent. Without this block
+    # nothing in the application imported core.goals or core.autonomy, so a durable
+    # goal could only be created and scheduled by hand from a test.
+    autonomy_runtime = None
+    if args.autonomy:
+        from core.autonomy import AutonomyRuntime, SchedulerLimits
+        from core.goals import GoalStore
+
+        goal_store = GoalStore(settings.sessions_dir)
+        autonomy_runtime = AutonomyRuntime(
+            agent,
+            goal_store,
+            limits=SchedulerLimits.from_settings(settings),
+            poll_seconds=args.autonomy_interval,
+            on_event=lambda name, payload: log.info("autonomy %s %s", name, payload),
+        )
+        reconciliation = autonomy_runtime.reconcile()
+        if reconciliation.changed:
+            log.info("autonomy reconciliation: %s", reconciliation.to_dict())
+        print(f"[autonomy] reconciled {reconciliation.changed} goal(s); "
+              f"{autonomy_runtime.summary_line()}")
+        autonomy_runtime.start()
+        print(f"[autonomy] scheduler running as {AutonomyRuntime.THREAD_NAME} "
+              f"(every {args.autonomy_interval:g}s)")
+        # Registered rather than sprinkled through the exit paths: this function
+        # returns from four different UI branches, and a scheduler thread that
+        # outlived one of them would keep ticking against a closed capability
+        # runtime. The thread is a daemon, so this is tidiness, not a hang risk -
+        # but a stopped scheduler reports its own stop, which is worth having.
+        import atexit
+
+        atexit.register(autonomy_runtime.stop)
 
     # M2.16.UI: the edge companion is a second *presentation* of the same Agent, not
     # a second backend. It gets the same Agent and the same EventBus, so there is

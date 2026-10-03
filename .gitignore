@@ -31,6 +31,9 @@ data/backups/
 # runtime state rather than source.
 data/sessions/
 data/blender/
+# Project knowledge graphs are per-machine runtime databases, and a test run
+# creates one. Without this they show up as an untracked binary in every status.
+data/knowledge/
 # Output of `main.py --demo`; recreated by the demo itself.
 workspace/hello_world.py
 workspace/generated/
