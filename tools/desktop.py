@@ -159,9 +159,12 @@ def build_desktop_tools(
     tools = [
         _make(
             "desktop.open", "open_application",
-            "Open a desktop application and anchor to its window. Waits for the "
-            "window to appear and returns a context naming it. Refuses rather "
-            "than guessing if more than one window matches.",
+            "LAUNCH a desktop application AND anchor to its window, so later "
+            "steps can act on it. Prefer this over applications.open whenever the "
+            "request involves doing anything with the app after starting it, "
+            "because it returns a context naming a verified window. Operates on "
+            "the window, not on any control inside it. Waits for the window to "
+            "appear; refuses rather than guessing if more than one window matches.",
             _schema({
                 "app": {"type": "string",
                         "description": "Application name, e.g. 'notepad'."},
@@ -175,10 +178,15 @@ def build_desktop_tools(
         ),
         _make(
             "desktop.find", "find_target",
-            "Resolve one desktop window or one named UI element, semantically. "
-            "Prefers UI Automation: an element is named by its automation id, "
-            "visible name or control type rather than by coordinates. Refuses when "
-            "the match is not unique.",
+            "DISCOVER one desktop window or one named UI element, semantically. "
+            "Use this first whenever you need to act on something: it is how a "
+            "control is located before it can be pressed, and how a window is "
+            "located before it can be interacted with. Prefers UI Automation - an "
+            "element is named by its automation id, visible name or control "
+            "type, never by screen coordinates. Operates on windows and on "
+            "controls inside them, and needs nothing but a hint of what to look "
+            "for. Returns a context or target recipe. Refuses when the match is "
+            "not unique, so a successful result really is the element you meant.",
             _schema({
                 "window_key": {"type": "string",
                                "description": "Anchors to a specific window "
@@ -198,10 +206,15 @@ def build_desktop_tools(
         ),
         _make(
             "desktop.interact", "interact",
-            "Act on a desktop target: press a button, set a field, toggle a "
-            "checkbox, select an item or expand a control. Uses UI Automation and "
-            "verifies the result by re-reading the control's state; a press with "
-            "no observable effect is reported as unverified rather than done.",
+            "ACT on a desktop target - click a button, set a field, toggle a "
+            "checkbox, select an item, expand a control, or send keys and typed "
+            "text to the focused control. This is the tool that performs UI "
+            "actions; use it for clicks, typing and key presses on an already-"
+            "discovered target. Requires a target, normally from desktop.find, "
+            "passed as 'target' or via 'context'. Operates on controls inside a "
+            "window, not on the window itself. Uses UI Automation and verifies the "
+            "result by re-reading the control's state; an action with no "
+            "observable effect is reported as UNVERIFIED rather than done.",
             _schema({
                 "action": {"type": "string",
                            "description": "invoke | set_value | toggle | select "
@@ -224,8 +237,10 @@ def build_desktop_tools(
         ),
         _make(
             "desktop.read", "read_target",
-            "Read a desktop target's current value or state without acting on "
-            "it. Use this to check a result rather than assuming one.",
+            "READ a desktop target's current value or state without acting on it. "
+            "Use this to CHECK a result rather than assume one - after an action, "
+            "or to decide what to do next. Operates on windows and on controls, "
+            "and needs a target from desktop.find. Safe: it changes nothing.",
             _schema({
                 "context": _CONTEXT_PROPERTY,
                 "target": {"type": "object",
@@ -235,9 +250,12 @@ def build_desktop_tools(
         ),
         _make(
             "desktop.verify", "verify_window",
-            "Verify that a desktop window is still the same verified window it "
+            "VERIFY that a desktop window is still the same verified window it "
             "was, optionally checking its title. Use before trusting an action "
-            "that happened some time ago.",
+            "that happened some time ago, and before acting on a window found by "
+            "an earlier step. Operates on windows only - not on controls. Refuses "
+            "if the window has been replaced or closed rather than continuing "
+            "against whatever now occupies that title.",
             _schema({
                 "window_key": {"type": "string"},
                 "expect_title": {"type": "string"},

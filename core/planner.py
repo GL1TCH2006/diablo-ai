@@ -7,6 +7,10 @@ import time
 from dataclasses import dataclass, field
 
 from config.settings import Settings
+from core.desktop_intent import (
+    DesktopIntentFamily,
+    classify_desktop_intent,
+)
 from core.task_manager import (
     STEP_SATISFIED_STATES,
     STEP_TERMINAL_STATES,
@@ -645,10 +649,27 @@ class Planner:
         if not stripped:
             return None
 
-        match = self.OPEN_RE.match(stripped)
-        if match:
-            app = _clean_app_name(match.group(1))
-            if app.lower() not in ("ai", "openai", "source"):
+        # M2.16.UI.1. This used to be ``OPEN_RE.match`` on its own, which matched
+        # ``^(?:open|launch|start)\s+(.+)$`` and captured everything after the verb.
+        # Two things were wrong with that, and both were invisible until the
+        # milestone audit reported 0/3 real-model desktop-tool selections:
+        #
+        #   * "Open Calculator, then verify that it is open." captured the whole
+        #     sentence as the application name, so the request launched an app
+        #     literally called "Calculator, then verify that it is open".
+        #   * Every one of those requests short-circuited *before any model call*,
+        #     so "the model prefers applications.open" was never a measurement of
+        #     the model at all.
+        #
+        # A short-circuit is now only taken for a request that is genuinely
+        # nothing but a launch, with an application name that can be isolated.
+        # Anything longer falls through to the LLM loop, which is where the
+        # desktop workflow tools are actually reachable.
+        desktop_intent = classify_desktop_intent(stripped)
+        if (desktop_intent.family is DesktopIntentFamily.APPLICATION_LAUNCH
+                and desktop_intent.app_name):
+            app = _clean_app_name(desktop_intent.app_name)
+            if app and app.lower() not in ("ai", "openai", "source"):
                 return Intent(
                     name="open_app",
                     steps=[("applications.open", {"app": app})],

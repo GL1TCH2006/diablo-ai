@@ -58,6 +58,12 @@ class Settings:
     max_turns: int = 4
     max_tool_calls: int = 32
     max_recovery_attempts: int = 3
+    # M2.16.UI.1: bounded wrong-tool corrections per request. Zero disables the
+    # correction entirely and leaves only the telemetry.
+    desktop_mismatch_corrections: int = 1
+    # M2.16.UI.1: minimum classifier confidence before the presented tool set is
+    # narrowed to the desktop family. Below this the normal widened set is used.
+    desktop_focus_min_confidence: float = 0.6
     max_conversation_turns: int = 20
     allowed_roots: list[Path] = field(default_factory=list)
     terminal_auto_allow: list[str] = field(default_factory=list)
@@ -136,6 +142,8 @@ def load_settings() -> Settings:
         max_turns=int(_int(toml, ["agent", "max_turns"], 4)),
         max_tool_calls=int(_int(toml, ["agent", "max_tool_calls"], 32)),
         max_recovery_attempts=int(_int(toml, ["agent", "max_recovery_attempts"], 3)),
+        desktop_mismatch_corrections=max(0, int(_int(toml, ["agent", "desktop_mismatch_corrections"], 1))),
+        desktop_focus_min_confidence=max(0.0, min(1.0, _float(toml, ["agent", "desktop_focus_min_confidence"], 0.6))),
         max_conversation_turns=int(_int(toml, ["memory", "max_conversation_turns"], 20)),
         allowed_roots=allowed_roots,
         terminal_auto_allow=_list(toml, ["terminal", "auto_allow_patterns"]),
@@ -157,8 +165,18 @@ def load_settings() -> Settings:
         models_complexity_threshold=_float(toml, ["models", "complexity_threshold"], 0.6),
         models_max_attempts_before_escalate=int(_int(toml, ["models", "max_attempts_before_escalate"], 1)),
         models_max_escalations=int(_int(toml, ["models", "max_escalations"], 1)),
-        resource_check_enabled=_as_bool(env.get("RESOURCE_CHECK"), _str(toml, ["resources", "check_enabled"], "false")),
-        tools_full_context=_as_bool(env.get("TOOLS_FULL_CONTEXT"), _str(toml, ["tools", "full_context"], "false")),
+        resource_check_enabled=_as_bool(env.get("RESOURCE_CHECK"), _bool(toml, ["resources", "check_enabled"], False)),
+        # M2.16.UI.1 fix. These two previously passed a *string* default through
+        # ``_str(...)``, and ``_as_bool`` returns its default unchanged when the env
+        # var is absent - so both settings were the truthy string "false".
+        #
+        # The consequence was not cosmetic: ``tools_full_context`` truthy made
+        # Agent._tool_context call ``select(full=True)`` on every turn, so the whole
+        # M2.13.0 tool-context selector was dead in production and the model was
+        # handed all 74 tools every turn. ``resource_check_enabled`` truthy turned
+        # the model resource guard permanently on. Both now take a real bool default,
+        # matching allow_remote_ollama and voice_enabled above.
+        tools_full_context=_as_bool(env.get("TOOLS_FULL_CONTEXT"), _bool(toml, ["tools", "full_context"], False)),
         git_push_policy=_str(toml, ["git", "push"], "blocked"),
         git_restore_policy=_str(toml, ["git", "restore"], "blocked"),
         git_branch_policy=_str(toml, ["git", "branch"], "blocked"),

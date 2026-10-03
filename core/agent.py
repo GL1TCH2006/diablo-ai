@@ -2134,6 +2134,12 @@ class Agent:
         context.inherit_pending_recoveries(previous)
         self._request_context = context
         self._active_plan = None
+        # M2.16.UI.1: desktop routing is per-request. Reset here so a correction
+        # budget spent on one turn cannot be spent again by the next, and a stale
+        # intent cannot be reported against an unrelated request.
+        routing = getattr(self, "_desktop_routing", None)
+        if routing is not None:
+            routing.reset()
         return context
 
     def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
@@ -2410,6 +2416,138 @@ class Agent:
             )
             return response
 
+    def _desktop_mismatch_correction(self, plan: Any) -> str | None:
+        """Detect a wrong-tool selection and, if systematic, ask once more.
+
+        M2.16.UI.1, bounded semantic mismatch recovery.
+
+        The failure this exists for is concrete: the request asked to *interact*
+        with an application, and the model answered with ``applications.open``,
+        which can only start a program. Executing that would silently do the wrong
+        thing - or nothing - and report success for a step it never performed.
+
+        Three deliberate limits:
+
+        * **Correct only a systematic mismatch.** One mismatched tool among several
+          that collectively make sense is not a routing failure, and rewriting it
+          would discard a partly-correct plan. Correction requires *every* desktop
+          step in the plan to mismatch the request's family.
+        * **Bounded by a budget, not by a loop condition.** The budget lives in
+          settings and is spent per request, so this cannot become an unbounded
+          retry even if the model keeps making the same mistake.
+        * **Never bypasses anything.** A correction only re-asks the model with the
+          full registry still authoritative. No tool is dispatched, no permission
+          is implied, no target is fabricated.
+
+        Returns the corrective message to append, or None to proceed as planned.
+        Telemetry is emitted either way - a mismatch that was tolerated is still
+        the fact worth recording.
+        """
+        try:
+            from core.desktop_intent import detect_tool_mismatch
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        routing = self._desktop_routing_state()
+        intent = routing.intent
+        if intent is None or not intent.is_desktop:
+            return None
+        steps = [s for s in getattr(plan, "steps", ()) or () if getattr(s, "tool", "")]
+        if not steps:
+            return None
+
+        mismatches = []
+        for step in steps:
+            found = detect_tool_mismatch(intent, step.tool)
+            if found is not None:
+                mismatches.append(found)
+        if not mismatches:
+            return None
+
+        for found in mismatches:
+            self._desktop_routing_state().record(found)
+        systematic = len(mismatches) == len(steps)
+        self._emit_lifecycle(
+            "desktop_tool_mismatch",
+            intent_family=intent.family.value,
+            intent_confidence=intent.confidence,
+            selected_tools=[s.tool for s in steps],
+            mismatched_tools=[m.selected_tool for m in mismatches],
+            expected_tools=list(intent.expected_tools),
+            systematic=systematic,
+            selected_at=time.strftime("%Y%m%d-%H%M%S"),
+        )
+
+        if not systematic:
+            return None
+
+        routing = self._desktop_routing_state()
+        used = int(routing.corrections_used)
+        budget = max(0, int(getattr(self._settings, "desktop_mismatch_corrections", 1)))
+        if used >= budget:
+            # Budget spent. The plan proceeds as the model wrote it; if it was
+            # wrong, the normal failure and verification paths report that. This
+            # milestone does not get to invent a stronger outcome.
+            log.info(
+                "desktop tool mismatch correction budget spent (%d/%d); proceeding",
+                used, budget,
+            )
+            return None
+        routing.corrections_used = used + 1
+
+        tools_list = ", ".join(intent.expected_tools)
+        self._emit_lifecycle(
+            "desktop_tool_mismatch_corrected",
+            attempt=used + 1,
+            budget=budget,
+            intent_family=intent.family.value,
+        )
+        log.info(
+            "desktop tool mismatch: %s cannot serve %s; asking once more (attempt %d/%d)",
+            ",".join(sorted({m.selected_tool for m in mismatches})),
+            intent.family.value, used + 1, budget,
+        )
+        return (
+            f"None of the tools you just chose can carry out this request: "
+            f"{', '.join(sorted({m.selected_tool for m in mismatches}))} "
+            f"cannot perform a '{intent.family.value}' request. Use the appropriate "
+            f"tools instead: {tools_list}. If you need a window or control to act "
+            f"on, find it first and reuse the context it returns."
+        )
+
+    def _desktop_intent(self, user_input: str) -> Any:
+        """Classify the request into a desktop intent family (M2.16.UI.1).
+
+        Recorded on the request context so the tool selector, the mismatch check
+        and telemetry all read the *same* classification. Classifying once and
+        reusing it is what stops routing and diagnostics from disagreeing.
+        """
+        try:
+            from core.desktop_intent import classify_desktop_intent
+
+            intent = classify_desktop_intent(user_input)
+        except Exception:  # pragma: no cover - defensive
+            intent = None
+        routing = self._desktop_routing_state()
+        if intent is not None:
+            routing.intent = intent
+        return intent
+
+    def _desktop_routing_state(self):
+        """The Agent-owned desktop routing record for the current request.
+
+        Deliberately not on `RequestContext`: that dataclass has a pinned
+        nine-field contract whose assertion reads "new state belongs elsewhere".
+        Routing decisions already live beside `_tool_context_decision` here.
+        """
+        state = getattr(self, "_desktop_routing", None)
+        if state is None:
+            from core.desktop_intent import DesktopRoutingState
+
+            state = DesktopRoutingState()
+            self._desktop_routing = state
+        return state
+
     def _tool_context(self, user_input: str) -> tuple[list, Any]:
         """Select which tool specs to present to the model for this turn.
 
@@ -2425,6 +2563,18 @@ class Agent:
             selector = ToolContextSelector(self._registry)
             self._tool_selector = selector
         settings = getattr(self, "_settings", None)
+        # Classified before the branch so telemetry has the intent even when the
+        # full registry is forced by settings.
+        intent = self._desktop_intent(user_input)
+        families = (intent.family.value,) if (intent and intent.is_desktop) else ()
+        # Focus is requested only for a confident desktop classification. Below the
+        # threshold the request keeps the normal widened set, because a shaky
+        # classification is exactly when narrowing would be wrong.
+        focus = bool(
+            intent and intent.is_desktop
+            and intent.confidence >= float(
+                getattr(settings, "desktop_focus_min_confidence", 0.6) or 0.0)
+        )
         if getattr(settings, "tools_full_context", False):
             decision = selector.select(full=True)
         else:
@@ -2440,9 +2590,12 @@ class Agent:
                 planner_class=planner_class,
                 used_tool_names=used,
                 capabilities=self._requested_capabilities(user_input),
+                families=families,
+                focus_families=focus,
             )
         specs = selector.specs_for(decision)
         self._tool_context_decision = decision
+        presented = tuple(spec.name for spec in specs)
         self._emit_lifecycle(
             "tool_context_selected",
             tool_count=decision.tool_count,
@@ -2451,11 +2604,19 @@ class Agent:
             capabilities=list(decision.capabilities),
             reason=decision.reason,
             degraded=decision.degraded,
+            # M2.16.UI.1 selection telemetry. Structured, bounded and free of user
+            # prose: an intent family and a count, never the request text.
+            desktop_intent=intent.family.value if intent else "",
+            desktop_confidence=intent.confidence if intent else 0.0,
+            desktop_expected_tools=list(intent.expected_tools) if intent else [],
+            desktop_tools_presented=sorted(
+                name for name in presented if name.startswith(("desktop.", "applications."))),
         )
         log.info(
-            "tool context: %d/%d tools (%.0f%% withheld) via %s",
+            "tool context: %d/%d tools (%.0f%% withheld) via %s%s",
             decision.tool_count, decision.total_tools,
             decision.reduction_ratio * 100, decision.reason,
+            f" [desktop={intent.family.value}]" if intent and intent.is_desktop else "",
         )
         return specs, decision
 
@@ -2547,6 +2708,13 @@ class Agent:
             except (PlanValidationError, ValueError) as exc:
                 self._mark_failure(f"Invalid execution plan: {exc}")
                 return f"Task failed: invalid execution plan ({exc})."
+
+            # M2.16.UI.1: bounded wrong-tool recovery. Runs *before* anything is
+            # dispatched, so a mismatched plan costs nothing.
+            correction = self._desktop_mismatch_correction(plan)
+            if correction is not None:
+                messages.append({"role": "assistant", "content": correction})
+                continue
 
             record = self._begin_plan(plan)
             if record is None:

@@ -19,6 +19,12 @@ sessions_dir = "data/sessions"
 max_turns = 4
 max_tool_calls = 32
 max_recovery_attempts = 3
+# M2.16.UI.1: how many times one request may be asked again when the model picks
+# a tool that cannot serve the classified desktop intent. 0 = telemetry only.
+desktop_mismatch_corrections = 1
+# Narrow the presented tool set to the desktop family only at or above this
+# classifier confidence. Below it the normal widened set is used.
+desktop_focus_min_confidence = 0.6
 
 [memory]
 max_conversation_turns = 20
@@ -29,6 +35,9 @@ max_active_in_prompt = 8
 
 [tools]
 max_result_chars = 8000
+# Present every tool every turn. Off by default: the bounded tool-context selector
+# is what keeps a turn readable for a small model.
+full_context = false
 
 [context]
 max_tokens = 8000

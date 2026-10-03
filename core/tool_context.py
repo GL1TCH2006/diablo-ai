@@ -89,6 +89,37 @@ DIAGNOSTIC_TOOLS = (
     "git.snapshot.list",
 )
 
+
+#: Tools kept alongside a focused desktop family.
+#:
+#: Deliberately two, both read-only and both cheap. A focused turn should not be
+#: handed the whole core floor: measured against a real 8B model, presenting
+#: ``desktop.*`` alongside the unrelated filesystem/project/task surface made the
+#: model answer "I cannot interact with Notepad due to tool integration
+#: limitations" with every desktop tool sitting in its context. The floor exists so
+#: a turn can make progress; a confident desktop turn does not need it.
+DESKTOP_FOCUS_FLOOR = ("task.info", "system.info")
+
+
+def _tools_for_family(family: str) -> tuple[str, ...]:
+    """Resolve a desktop intent family name to the tools that can serve it.
+
+    A thin delegation to :mod:`core.desktop_intent` rather than a second copy of
+    the mapping. Two copies of "which tool answers this request" would drift, and
+    the drift would show up as the model being offered a tool that routing does not
+    expect - exactly the class of bug this milestone exists to remove.
+    """
+    from core.desktop_intent import DesktopIntentFamily, expected_tool_names
+
+    try:
+        key = DesktopIntentFamily(str(family))
+    except ValueError:
+        # An unrecognised family widens to the whole desktop surface. Guessing a
+        # narrow set from a name this module does not know would be the one
+        # failure mode that cannot be recovered from by the model.
+        return expected_tool_names(DesktopIntentFamily.NONE)
+    return expected_tool_names(key)
+
 #: Capability -> tools added when a signal selects that capability.
 CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "coding": ("code", "python", "terminal", "project", "filesystem", "system", "task"),
@@ -171,6 +202,8 @@ class ToolContextSelector:
         used_tool_names: Sequence[str] = (),
         capabilities: Sequence[str] = (),
         include: Sequence[str] = (),
+        families: Sequence[str] = (),
+        focus_families: bool = False,
         full: bool = False,
     ) -> ToolContextDecision:
         """Return the specs to present. Never raises."""
@@ -181,6 +214,8 @@ class ToolContextSelector:
                 used_tool_names=tuple(used_tool_names or ()),
                 capabilities=tuple(capabilities or ()),
                 include=tuple(include or ()),
+                families=tuple(families or ()),
+                focus_families=bool(focus_families),
                 full=bool(full),
             )
         except Exception as exc:  # pragma: no cover - the fail-safe path
@@ -221,6 +256,8 @@ class ToolContextSelector:
         used_tool_names: tuple[str, ...],
         capabilities: tuple[str, ...],
         include: tuple[str, ...],
+        families: tuple[str, ...],
+        focus_families: bool,
         full: bool,
     ) -> ToolContextDecision:
         all_specs = list(self._registry.all_specs())
@@ -246,6 +283,10 @@ class ToolContextSelector:
         # treated as a weak signal below, so a typo widens the tool set rather
         # than quietly narrowing it.
         unresolved: list[str] = []
+        # Families whose tools this registry does not carry. Kept separate from
+        # ``unresolved`` because a missing desktop capability runtime is a normal
+        # condition, not a caller typo.
+        unresolved_families: list[str] = []
         for capability in capabilities:
             key = str(capability)
             if key in by_cap:
@@ -287,6 +328,41 @@ class ToolContextSelector:
         if include:
             reasons.append("include")
 
+        # Signal 4 (M2.16.UI.1): a desktop intent family, already resolved by
+        # core.desktop_intent before this call.
+        #
+        # This is the signal that makes the desktop workflow tools reachable at
+        # all. Until now nothing could ever emit a desktop capability, so
+        # desktop.open/find/interact/read/verify - and applications.open - were
+        # never presented to the model under the default configuration. A tool the
+        # model cannot see is a tool it cannot select, which is the real reason
+        # real-model desktop selection measured 0/3.
+        #
+        # The selector receives a *resolved family name*, never user prose, so it
+        # still performs no inspection of user text. Classification happens in one
+        # auditable place (core.desktop_intent) and this module stays a presenter.
+        family_tools: list[str] = []
+        for family in families:
+            for name in _tools_for_family(family):
+                spec = by_name.get(name)
+                if spec is None:
+                    # A family naming a tool this registry does not have (the
+                    # desktop tools are absent without a capability runtime) must
+                    # widen, never silently narrow.
+                    unresolved_families.append(str(family))
+                    continue
+                # Only the *name* is added, never the capability. Adding the
+                # capability would pull in every tool sharing that namespace, and
+                # all five desktop tools share one - so a bounded launch family
+                # would silently widen to the whole desktop surface, which is the
+                # exact thing this signal exists to prevent.
+                tools.add(name)
+                family_tools.append(name)
+        if families:
+            reasons.append("family:" + ",".join(sorted(set(str(f) for f in families))))
+        if family_tools:
+            reasons.append(f"family-tools:{len(family_tools)}")
+
         def resolve() -> list[Any]:
             wanted_names = set(tools)
             for cap in caps:
@@ -298,7 +374,7 @@ class ToolContextSelector:
         # Uncertainty expands. If the structured signals said little, or the
         # result would be too small to be useful, widen rather than guess.
         weak_signal = (
-            not capabilities and not klass and not used_tool_names
+            not capabilities and not klass and not used_tool_names and not families
         ) or bool(unresolved)
         if weak_signal or len(selected) < self._min_tools:
             reasons.append(
@@ -307,6 +383,19 @@ class ToolContextSelector:
             )
             caps.update(log_caps)
             selected = resolve()
+
+        # M2.16.UI.1 focus mode. Applied last, after uncertainty-broadening, because
+        # the caller only sets it for a *confident* family classification - which is
+        # the one case where narrowing is the honest answer rather than a risk.
+        # The registry stays authoritative either way: a tool that is not presented
+        # can still be called and still passes through permission and verification.
+        if focus_families and family_tools:
+            narrowed = [spec for spec in all_specs
+                        if spec.name in set(family_tools) | set(DESKTOP_FOCUS_FLOOR)]
+            if narrowed:
+                reasons.append("focus-families:" + str(len(narrowed)))
+                selected = narrowed
+                caps = {spec.capability for spec in selected}
 
         selected_caps = tuple(sorted({spec.capability for spec in selected}))
         return ToolContextDecision(
@@ -317,6 +406,10 @@ class ToolContextSelector:
                 "used_capabilities": used_caps,
                 "requested_capabilities": list(capabilities),
                 "unresolved_capabilities": unresolved,
+                "requested_families": list(families),
+                "family_tools": list(family_tools),
+                "focus_families": bool(focus_families),
+                "unresolved_families": unresolved_families,
                 "weak_signal": weak_signal,
             },
             total_tools=total,

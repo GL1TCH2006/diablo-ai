@@ -127,7 +127,22 @@ def build_registry(
     registry.register(
         ToolSpec(
             name="applications.open",
-            description="Open a desktop application. Whitelisted apps launch automatically; other installed apps launch after confirmation.",
+            # M2.16.UI.1. Rewritten deliberately. The old text was "Open a desktop
+            # application. Whitelisted apps launch automatically; other installed
+            # apps launch after confirmation." - which reads as though this tool
+            # can also *operate* an application, and gave the model no reason to
+            # reach for desktop.* when a request needed interaction. This tool can
+            # only START a program; it cannot click, type, read or verify. The
+            # description now says so, and names the alternative.
+            description=(
+                "START (launch) a desktop application. This tool only launches a "
+                "program - it cannot click, type, press keys, read a window or "
+                "check a result. Use it when the whole request is just 'start this "
+                "program'. If you need to interact with the application (click a "
+                "button, press a key, type text, read or verify a control), use "
+                "desktop.open to launch and anchor to its window, then "
+                "desktop.find and desktop.interact."
+            ),
             parameters={"type": "object", "properties": {"app": {"type": "string"}}, "required": ["app"]},
             required=["app"],
             level=PermissionLevel.NORMAL,
@@ -137,6 +152,7 @@ def build_registry(
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: applications.open_app(kw["app"], settings),
             describe=lambda args: f"Open application: {args.get('app')}",
+            capabilities=("applications", "desktop"),
         )
     )
     registry.register(
