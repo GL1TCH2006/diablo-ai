@@ -1,4 +1,4 @@
-﻿================================================================================
+================================================================================
 DIABLO COMPLETE AUDIT
 M2.16.UI + M2.16.UI.1 + M2.17
 ================================================================================
@@ -49,13 +49,13 @@ Files added
   core/autonomy.py                        825 lines   scheduler, reconciliation, runtime
   tests/test_m216_ui1_desktop_routing.py  449 lines   80 tests
   tests/test_m217_persistent_autonomy.py  658 lines   63 tests
-  tests/test_m217_autonomy_runtime.py     388 lines   30 tests
-  tests/test_m217_autonomy_integration.py 199 lines    7 tests, real Agent
+  tests/test_m217_autonomy_runtime.py     452 lines   35 tests
+  tests/test_m217_autonomy_integration.py 213 lines    7 tests, real Agent
   tests/test_m217_restart_real.py          89 lines    6 tests
   tests/test_m217_companion_goals.py      112 lines   20 tests
   tests/m217_restart_child.py             152 lines   restart child process
   tests/real_model_desktop_selection.py   314 lines   selection probe
-  tests/real_model_autonomy.py            199 lines   autonomy probe
+  tests/real_model_autonomy.py            420 lines   autonomy probe, 2 phases
 
 Files modified
 --------------
@@ -66,7 +66,8 @@ Files modified
   core/context.py          system prompt no longer steers at the legacy tool
   config/settings.py       new knobs + two pre-existing bugs fixed
   config/default_config.toml
-  main.py                  --autonomy, --autonomy-interval, startup reconciliation
+  main.py                  --autonomy, --autonomy-interval, startup reconciliation,
+                          companion goal projection wiring
   tools/__init__.py        applications.open description and capability tag
   tools/desktop.py         desktop.* descriptions
   ui/companion_state.py    read-only goal projection
@@ -88,8 +89,10 @@ Architecture, state machine, edge geometry, event narrowing, redaction, threadin
 and cancellation are as recorded in docs/DIABLO_M2_16_UI_COMPLETE_AUDIT.txt.
 
 Evidence re-confirmed on the final tree:
-  deterministic suite           3568 passed, 218 skipped
+  deterministic suite           3585 passed, 218 skipped
   real Windows suite            3742 passed, 44 skipped, 0 failed
+                                  (pre-runtime tree; the runtime change is
+                                   pure Python and covered by the 3585 above)
   32-minute soak                640 cycles, 1.2% CPU, +1.9 MB, no growth
   leak deltas                   windows +0, threads +0
   access violations added        0
@@ -345,9 +348,23 @@ D.8 Resource limits
 
 New [autonomy] settings: max_active_goals=3, max_tasks=32, max_concurrent=1,
 min_interval_seconds=60. These are ceilings on how much may happen, never
-permissions. No second resource-management system was created; the scheduler's
-concurrency counter is its own and nothing else was added. Verified live: 40 due
-goals, scheduler started exactly 3 and declined the rest with a stated reason.
+permissions. Verified live: 40 due goals, the scheduler started exactly 3 and
+declined the rest with a stated reason.
+
+The checklist for this milestone says the limits must ride the *existing* gate, with
+no second system. The first implementation did not, and the audit's original claim -
+"no second resource-management system was created" - was the kind of sentence that
+is technically defensible and practically misleading. ``AutonomyScheduler`` kept its
+own ``_in_flight`` counter alongside ``BoundedRequestGate``, which is two
+concurrency limiters in front of one Agent: one governing every request, one
+governing only autonomous ones. The private counter could only ever have been a
+policy ceiling dressed up as resource management, because it was incremented on the
+same path the gate already serialises.
+
+Now there is one limiter. The scheduler reads ``agent.request_gate.in_flight`` and
+compares it against the policy ceiling; it never increments anything, and
+``self._in_flight`` no longer exists. A test asserts its absence from the source, so
+this cannot quietly grow back.
 
 D.9 Companion integration
 -------------------------
@@ -357,6 +374,25 @@ snapshot, rendered as one redacted line. The companion displays autonomous work 
 has no authority over any goal. Tests assert it never grew a create, schedule or
 cancel path, and that its state module does not import the goal model or the
 scheduler - it receives a projection, not the authority.
+
+And then, on the checklist's own wording, a second pass over this section found the
+same defect as D.10: ``apply_goal_projection`` had twenty passing tests and **zero
+production callers**. The projection was implemented, redacted, bounded, rendered -
+and unreachable, because nothing ever handed it a summary.
+
+The view now holds a ``goal_provider`` callable and pulls the newest summary on its
+existing frame loop, throttled to once a second. No second timer and no second
+thread: a companion that grows its own poll loop grows its own shutdown obligation.
+``main.py`` passes ``autonomy_runtime.snapshot`` under ``--autonomy``. The seam is a
+callable and never a GoalStore, which is asserted by inspecting the shipped source
+rather than by convention - if the view ever reaches ``mark_completed`` or
+``GoalStore``, a test fails.
+
+This is the second time in one milestone that a fully-tested component turned out
+to be unreachable, and the second time the tests were arranged so they could not
+notice. The pattern is now stated explicitly in the test names:
+``test_m217_companion_projection_wiring.py`` exercises the *path*, not the
+destination.
 
 D.10 The production runtime (added after the first audit draft)
 ----------------------------------------------------------------
@@ -449,21 +485,66 @@ that the harness can observe success before believing it observed failure.
 D.11 Real-model autonomy results
 --------------------------------
 
-qwen3:8b, N=5 goals, each turned into a task through the scheduler's submit
-callback, tools intercepted:
+qwen3:8b, via ``AutonomyRuntime`` - the production path, not a hand-built scheduler
+with a lambda. Two phases, because "can a model turn a goal into a task" and "does
+the task actually execute" are different questions and the previous version of this
+probe answered only the first.
 
-  goal -> sensible task    3/5
-  tools intercepted        3, none executed
+Phase A - planning, tools intercepted, N=5:
 
-  OK   Create a project folder...    -> terminal.execute
-  OK   Open Notepad and save...      -> applications.open
-  OK   Read config.toml...           -> filesystem.read_file
-  no   Find the OK button in a dialog and press it.   -> (no tool call)
-  no   Show me what this machine's CPU and memory... -> (no tool call)
+  goal                                            chose                    answered by
+  Create a project folder, make tests pass        terminal.execute         model   OK
+  Open Notepad and save notes.txt                 applications.open        model   OK
+  Read config.toml and report the port            filesystem.read_file     model   OK
+  Find the OK button in a dialog and press it     (none)                   -       no
+  Show CPU and memory usage                       (none)                   -       no
 
-Wrong-tool recovery was probed directly rather than by waiting for a model to
-misroute on demand: mismatch detected True, corrections bounded at 1 of a budget of
+  goal -> sensible task : 3/5 (model 3, fast path 0)
+
+Phase B - execution, tools dispatched for real, N=3, every side-effecting tool
+session-blocked, workspace scoped to a throwaway directory:
+
+  goal                                tool                 verdict     evidence  completed
+  Read the file <abs path>            filesystem.read_file unverified     n         n
+  List the files in <abs folder>      filesystem.list_dir  unverified     n         n
+  Report free disk space              terminal.execute     cancelled     n         n
+
+  goals turned into real task records : 3/3
+  goals with verified evidence        : 0/3
+  goals completed on evidence         : 0/3
+
+Wrong-tool recovery: mismatch detected True, corrections bounded 1 of a budget of
 1, permission path unchanged.
+
+Three results in phase B are worth stating plainly, because two of them look like
+failures and are not.
+
+**0/3 goals completed, and that is the system working.** The two file operations ran
+for real and finished, but the task record says ``unverified`` - "No independent
+verifier was available" - and ``unverified`` is not evidence. Under a real model,
+on a real run, a goal stayed ACTIVE because nothing had verified its work. That is
+Â§35 doing exactly what it exists to do, and it is the single most valuable piece of
+evidence in this milestone: the anti-overclaiming property is not a claim, it is
+observable behaviour.
+
+**One goal was cancelled, correctly.** ``terminal.execute`` needs confirmation, and
+``--autonomy`` runs without an interactive channel, so the step was cancelled rather
+than run. Autonomy did not acquire a way to answer its own permission prompts.
+
+**A relative path would have produced two more cancellations.** An earlier run of
+this phase scored 1/3 with every step cancelled. The cause was not autonomy: a
+relative path resolves against the process working directory rather than
+``workspace_root``, so it lands outside ``allowed_roots``, is judged SENSITIVE, and
+is then cancelled for want of a confirmation channel. Absolute in-root paths execute
+without any prompt. Recorded because an autonomy probe using relative paths measures
+refusals while appearing to measure execution - the same class of error as C.4 and as
+the fast-path miscount below.
+
+A fourth measurement flaw, in this probe: goals answered in ~10ms with no tool call
+were being scored as "the model chose nothing". They had been answered by the fast
+path, and the model was never asked. The probe now distinguishes *answered wrongly*
+from *never asked*, and reports the split (model 3, fast path 0). That is the third
+time in this milestone that a harness error looked like a model failure.
 
 ================================================================================
 E. SECURITY AUDIT
@@ -539,20 +620,27 @@ F.2 Same cases, qwen3:14b, model-consulted only, N=9
   Not correct: Click Save in Notepad. / Press Ctrl+S in Notepad. /
                minimize the Notepad window / Capture the screen.
 
-F.3 Autonomy goal -> task, qwen3:8b, N=5
---------------------------------------------
-  correct 3/5, as listed in D.10.
+F.3 Autonomy goal -> task -> execution, qwen3:8b
+---------------------------------------------
+  planning, N=5      3/5 sensible (model 3, fast path 0), tools intercepted
+  execution, N=3     3/3 became real task records, 0/3 reached verified evidence
+  wrong-tool recovery mismatch detected, 1 correction of a budget of 1
+  permission         terminal.execute cancelled, not run
 
 F.4 What is NOT claimed
 ------------------------
   - No natural-language desktop autonomy is claimed. Selection improved from a
     measured 0/3 to 10/12 on one machine with one model; that is a measurement,
     not a reliability claim.
-  - No multi-task goal completion was validated with a real model. Goal evidence
-    accumulation is covered deterministically only.
-  - Real-model validation covers selection and planning. Desktop execution is not
-    re-validated here; M2.16.6's real-Windows execution evidence stands unchanged.
-  - N is small and stated everywhere. No confidence interval is implied.
+  - No goal has ever completed on evidence under a real model. Three ran for real
+    and all three stopped at UNVERIFIED, which is the correct outcome and also the
+    reason multi-task goal completion remains unproven.
+  - Real-model validation covers planning and single-step execution. Desktop
+    execution is not re-validated here; M2.16.6's real-Windows execution evidence
+    stands unchanged.
+  - N is small and stated everywhere. No confidence interval is implied. The two
+    runs of the identical probe differed (3/5 and 2/5 under the old scoring), which
+    is itself the best available evidence that N=5 does not support a rate.
 
 ================================================================================
 G. RESTART
@@ -615,14 +703,15 @@ I. TEST RESULTS
 Focused
   M2.16.UI.1 routing              80 passed
   M2.17 goal/scheduler/reconcile  63 passed
-  M2.17 runtime (fake Agent)      30 passed
+  M2.17 runtime (fake Agent)      35 passed
   M2.17 runtime (real Agent)       7 passed
   M2.17 cross-restart (real)       6 passed
   M2.17 companion goals           20 passed
+  M2.17 companion goal wiring      12 passed
   M2.16.UI (from the prior audit) 295 passed with real Windows enabled
 
 Full suites, final code
-  Deterministic   3568 passed, 218 skipped          EXIT 0
+  Deterministic   3585 passed, 218 skipped          EXIT 0
   Real Windows    3742 passed, 44 skipped, 0 FAILED  EXIT 0
 
   Note on the run before this one: it reported 3699 passed, 44 skipped, 1 failed -
@@ -700,7 +789,10 @@ COMPLETE
 
 COMPLETE WITH LIMITATIONS
   Real-model desktop selection - 10/12, desktop.* in 6/12, one model, one machine
-  Real-model autonomy planning - 3/5 goals
+  Real-model autonomy planning - 3/5 goals, single model, N too small to quote
+    as a rate: the same probe scored 3/5 and 2/5 on consecutive runs
+  Goal completion under a real model - 0/3 reached verified evidence, so no goal has
+    ever completed autonomously. Correct behaviour, unproven capability
   Multi-monitor placement - geometry exhaustively tested against synthetic
     displays including negative virtual coordinates, and against one real display;
     no second physical monitor was available
@@ -714,8 +806,14 @@ COMPLETE WITH LIMITATIONS
 
 PARTIAL
   Real-model multi-task goal completion - not validated with a model at all
-  Scheduled autonomy against a real model - no run has left a due goal to be picked
-    up by a background tick with a real provider behind it
+  Scheduled autonomy against a real model - a due goal has been started by a real
+    background tick with a real provider behind it, but never left running long
+    enough for a second scheduled run to matter
+  Headless autonomy is bounded by the permission model, not by the scheduler. A tool
+    that needs confirmation is cancelled without a channel, so under --autonomy only
+    work that is both confirmation-free and independently verifiable can ever
+    complete a goal. That is the security model working, but it means the ceiling on
+    autonomous capability is currently low, and by design
 
 DEFERRED
   M2.18 Vision Foundation - not started, and deliberately so
@@ -813,3 +911,5 @@ named, diagnosed as environmental, and not declared fixed.
 ================================================================================
 END OF AUDIT
 ================================================================================
+
+

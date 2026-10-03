@@ -257,6 +257,7 @@ def build_edge_companion(
     speak: bool = False,
     display_layer: Any = None,
     root: Any = None,
+    goal_provider: Any = None,
 ) -> EdgeCompanionRuntime:
     """Construct the M2.16.UI edge companion against a real agent.
 
@@ -283,6 +284,7 @@ def build_edge_companion(
             edge=edge,
             speak=speak,
             root=root,
+            goal_provider=goal_provider,
         )
     except EdgeCompanionUnavailable:
         # Only tear down what this function created. A refused duplicate launch must

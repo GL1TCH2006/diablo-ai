@@ -50,6 +50,7 @@ model context, and is confined to :meth:`EdgeCompanionApp._apply_window_style`.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from core.logging_setup import get_logger
@@ -196,6 +197,8 @@ def launch_edge_companion(
     geometry: CompanionGeometry | None = None,
     speak: bool = False,
     root: Any = None,
+    goal_provider: Any = None,
+    goal_refresh_seconds: float = 1.0,
 ) -> "tuple[EdgeCompanionApp, bool]":
     """Create the companion window, or focus the one that already exists.
 
@@ -215,6 +218,8 @@ def launch_edge_companion(
         geometry=geometry,
         speak=speak,
         root=root,
+        goal_provider=goal_provider,
+        goal_refresh_seconds=goal_refresh_seconds,
     )
     return app, True
 
@@ -236,6 +241,8 @@ class EdgeCompanionApp:
         root: Any = None,
         poll_ms: int = _FRAME_MS,
         monitor_check_seconds: float = _MONITOR_CHECK_SECONDS,
+        goal_provider: Any = None,
+        goal_refresh_seconds: float = 1.0,
     ) -> None:
         self.controller = controller
         self._display_layer = display_layer
@@ -243,6 +250,13 @@ class EdgeCompanionApp:
         self._geometry = geometry or CompanionGeometry()
         self._poll_ms = max(16, int(poll_ms))
         self._monitor_check = max(0.5, float(monitor_check_seconds))
+        # A read-only callable returning goal summaries. It is a *projection source*,
+        # not an authority: the companion can display what it returns and can do
+        # nothing else to a goal. Passing the GoalStore here instead would be the
+        # mistake this milestone is built to avoid.
+        self._goal_provider = goal_provider if callable(goal_provider) else None
+        self._goal_refresh = max(0.25, float(goal_refresh_seconds))
+        self._last_goal_refresh = 0.0
 
         self._closed = False
         self._frame_job: str | None = None
@@ -806,6 +820,7 @@ class EdgeCompanionApp:
             return self.controller.snapshot()
         snapshot = self.controller.snapshot()
         try:
+            self._refresh_goal_projection()
             snapshot = self.controller.tick()
             self._check_monitor_change()
             self._render(snapshot)
@@ -819,6 +834,36 @@ class EdgeCompanionApp:
             return
         self.pump_once()
         self._frame_job = self.root.after(self._poll_ms, self._tick)
+
+    def _refresh_goal_projection(self, *, force: bool = False) -> bool:
+        """Pull the newest goal summary into the controller. Throttled, never raises.
+
+        On the existing frame loop rather than a thread of its own: a second timer
+        would be a second thing to shut down correctly, and the goal line does not
+        need 30 updates a second. A provider that raises, hangs or returns nonsense
+        costs one frame's worth of goal display and nothing else.
+        """
+        if self._closed or self._goal_provider is None:
+            return False
+        now = time.monotonic()
+        if not force and (now - self._last_goal_refresh) < self._goal_refresh:
+            return False
+        self._last_goal_refresh = now
+        try:
+            rows = self._goal_provider()
+        except Exception as exc:  # noqa: BLE001 - display must not depend on autonomy
+            log.warning("goal projection unavailable: %s", exc)
+            return False
+        summary: Any = None
+        if isinstance(rows, Mapping):
+            summary = rows
+        elif isinstance(rows, (list, tuple)) and rows:
+            summary = rows[0]
+        try:
+            return bool(self.controller.apply_goal_projection(summary))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("goal projection rejected: %s", exc)
+            return False
 
     def run(self) -> None:
         """Start the frame timer and hand the main thread to Tk."""

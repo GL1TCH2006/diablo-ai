@@ -191,14 +191,23 @@ class AutonomyScheduler:
         limits: SchedulerLimits | None = None,
         clock: Callable[[], str] | None = None,
         on_event: Callable[[str, dict], None] | None = None,
+        admission: Callable[[], int] | None = None,
     ) -> None:
         self._goals = goal_store
         self._submit = submit_task
         self._limits = limits or SchedulerLimits()
         self._clock = clock or _now
         self._on_event = on_event
+        # How many requests are already inside the shared Agent. This is a *read* of
+        # the existing ``BoundedRequestGate``, supplied by the runtime - not a second
+        # limiter. An earlier version of this class kept its own ``_in_flight`` counter,
+        # which meant two concurrency limiters existed in front of one Agent: one
+        # governing every request, and one governing only autonomous ones. Both were
+        # incremented on the same path, so the private counter could only ever have
+        # been a policy ceiling dressed up as resource management. Now the policy
+        # ceiling is compared against the real gate, and there is exactly one limiter.
+        self._admission = admission or (lambda: 0)
         self._lock = threading.Lock()
-        self._in_flight = 0
         self._tasks_started = 0
         self._stopped = False
 
@@ -215,8 +224,11 @@ class AutonomyScheduler:
 
     @property
     def in_flight(self) -> int:
-        with self._lock:
-            return self._in_flight
+        """Requests currently inside the shared Agent, per the existing gate."""
+        try:
+            return max(0, int(self._admission()))
+        except Exception:  # noqa: BLE001 - a broken probe must not stop a tick
+            return 0
 
     @property
     def stopped(self) -> bool:
@@ -305,10 +317,9 @@ class AutonomyScheduler:
                 continue
 
             with self._lock:
-                if self._in_flight >= self._limits.max_concurrent_autonomous:
+                if self.in_flight >= self._limits.max_concurrent_autonomous:
                     report.skipped[goal_id] = "concurrency limit reached"
                     continue
-                self._in_flight += 1
             try:
                 # Durability BEFORE submission.
                 goal.last_started_tick = tick_key
@@ -329,9 +340,6 @@ class AutonomyScheduler:
                 report.errors.append(f"{goal_id}: {type(exc).__name__}: {exc}")
                 self._emit("autonomy_goal_failed", goal_id=goal_id,
                            error=type(exc).__name__)
-            finally:
-                with self._lock:
-                    self._in_flight = max(0, self._in_flight - 1)
         return report
 
     def _decline_reason(self, goal: Goal, report: SchedulerReport) -> str:
@@ -632,6 +640,8 @@ class AutonomyRuntime:
             limits=self._limits,
             clock=self._clock,
             on_event=on_event,
+            # Read the one existing gate rather than keeping a second counter.
+            admission=self._gate_in_flight,
         )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -761,6 +771,21 @@ class AutonomyRuntime:
         if goal.next_action.strip():
             parts.append(goal.next_action.strip())
         return " ".join(p for p in parts if p)
+
+    def _gate_in_flight(self) -> int:
+        """Read ``BoundedRequestGate``'s own count. The single source of truth.
+
+        Autonomy submits through ``Agent.respond``, which already acquires that gate
+        for the whole request, so the gate is the only concurrency authority in the
+        process. This reads it; it never increments or decrements it.
+        """
+        gate = getattr(self._agent, "request_gate", None)
+        if gate is None:
+            return 0
+        try:
+            return max(0, int(getattr(gate, "in_flight", 0)))
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _current_task_id(self) -> str:
         """The task the Agent just created, read back from its own context."""

@@ -1,4 +1,4 @@
-﻿"""M2.17 - the production runtime: schedule, submit, observe, project, cancel.
+"""M2.17 - the production runtime: schedule, submit, observe, project, cancel.
 
 The goal layer shipped correct and unreachable. Nothing outside the tests imported
 ``core.goals`` or ``core.autonomy``, so a durable goal could be created and scheduled
@@ -510,4 +510,65 @@ def test_goal_outcome_is_serialisable() -> None:
     assert data["goal_id"] == "g"
     assert data["goal_completed"] is False
 
+
+
+
+class TestOneGateNotTwo:
+    """"Resource limits via the existing gate, no second system."
+
+    An earlier scheduler kept its own ``_in_flight`` counter, which meant two
+    concurrency limiters sat in front of one Agent. These tests pin the single-gate
+    arrangement so it cannot quietly grow back into two.
+    """
+
+    def test_scheduler_has_no_private_in_flight_counter(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "core" / "autonomy.py")
+        text = source.read_text(encoding="utf-8")
+        assert "self._in_flight" not in text, (
+            "the scheduler keeps a second concurrency counter; it must read "
+            "BoundedRequestGate instead")
+
+    def test_admission_is_read_from_the_agents_own_gate(self, tmp_path: Path) -> None:
+        class Gate:
+            def __init__(self) -> None:
+                self.in_flight = 0
+
+        agent = FakeAgent()
+        agent.request_gate = Gate()
+        runtime = _runtime(tmp_path, agent)
+        assert runtime.scheduler.in_flight == 0
+        agent.request_gate.in_flight = 1
+        assert runtime.scheduler.in_flight == 1
+        agent.request_gate.in_flight = 4
+        assert runtime.scheduler.in_flight == 4
+
+    def test_an_agent_without_a_gate_degrades_to_zero(self, tmp_path: Path) -> None:
+        runtime = _runtime(tmp_path, FakeAgent())
+        assert runtime.scheduler.in_flight == 0
+
+    def test_a_broken_gate_probe_does_not_stop_a_tick(self, tmp_path: Path) -> None:
+        class Hostile:
+            @property
+            def in_flight(self):
+                raise RuntimeError("no")
+
+        agent = FakeAgent()
+        agent.request_gate = Hostile()
+        runtime = _runtime(tmp_path, agent)
+        goal = _due_goal(runtime.goals)
+        report = runtime.tick()
+        assert report.started == [goal.goal_id]
+
+    def test_the_ceiling_is_a_policy_limit_not_a_lock(self, tmp_path: Path) -> None:
+        """At a ceiling of one, a busy Agent declines rather than queueing."""
+        agent = FakeAgent()
+        runtime = _runtime(tmp_path, agent)
+        _due_goal(runtime.goals)
+        agent.request_gate = type("G", (), {"in_flight": 1})()
+        runtime.scheduler._limits = SchedulerLimits(
+            max_active_goals=3, max_autonomous_tasks=8,
+            max_concurrent_autonomous=1, min_interval_seconds=60)
+        report = runtime.tick()
+        assert report.started == []
+        assert len(agent.calls) == 0
 

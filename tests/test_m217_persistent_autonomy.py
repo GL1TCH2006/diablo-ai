@@ -1,4 +1,4 @@
-﻿"""M2.17 - deterministic tests for persistent autonomy.
+"""M2.17 - deterministic tests for persistent autonomy.
 
 Covers the twenty-five cases the milestone lists, and is deliberately weighted
 towards the ways autonomy goes wrong: replaying a side effect that may already have

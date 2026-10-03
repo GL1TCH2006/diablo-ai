@@ -355,8 +355,14 @@ def main() -> int:
 
         agent.set_confirmer(confirm)
         try:
-            status = run_edge_companion(agent, bus, edge=args.edge,
-                                        speak=args.edge_speak)
+            # The companion displays autonomous work; it never owns it. A read-only
+            # projection callable is the whole contract - the view can show what this
+            # returns and can do nothing else to a goal.
+            status = run_edge_companion(
+                agent, bus, edge=args.edge, speak=args.edge_speak,
+                goal_provider=(autonomy_runtime.snapshot
+                               if autonomy_runtime is not None else None),
+            )
         except (EdgeCompanionUnavailable, CompanionUnavailable) as exc:
             reason = getattr(exc, "reason", "unavailable")
             log.warning("edge companion unavailable (%s); falling back to console UI", reason)

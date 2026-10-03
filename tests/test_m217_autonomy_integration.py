@@ -132,12 +132,19 @@ def test_a_due_goal_becomes_a_real_task_through_the_ordinary_path(
 
     record = agent._task_store.get(stored.current_task_id)
     assert record is not None
-    assert record.status in ("completed", "failed", "cancelled")
+    # "completed", not merely "terminal". An earlier version of this assertion
+    # accepted ("completed", "failed", "cancelled") and therefore proved nothing
+    # about execution: the same test was passing while every step was being
+    # *cancelled* for want of a confirmation channel.
+    assert record.status == "completed", (
+        f"the task did not complete: {record.status} "
+        f"({[s.detail for s in (record.plan.steps if record.plan else [])]})")
+    steps = record.plan.steps if record.plan else []
+    assert [s.status.value for s in steps] == ["done"]
 
     outcome = runtime.outcome(goal.goal_id)
     assert outcome.task_id == stored.current_task_id
-    assert outcome.verdict in ("verified", "unverified", "failed", "cancelled",
-                               "unknown")
+    assert outcome.verdict in ("verified", "unverified")
 
 
 def test_the_verdict_copied_onto_the_goal_is_the_tasks_own(

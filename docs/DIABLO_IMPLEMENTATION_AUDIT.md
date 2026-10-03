@@ -1181,14 +1181,23 @@ task completed".
 
 Two notes worth carrying forward. First, the goal layer shipped *unreachable*: no
 production module imported it, and the tests injected their own submit callback so
-they could never have noticed. Second, building the runtime exposed four defects
-that existed only on the real path - including a goal that could never complete and
-in-flight tasks that read as unreadable - plus one test that asserted `>= 0` and so
-could not fail. A layer exercised only through an injected seam has an unproven
-integration, whatever its own test count says.
+they could never have noticed. The companion's goal projection had the same defect -
+twenty passing tests, zero production callers - so both now have tests that exercise
+the *path* rather than the destination. Second, building the runtime exposed four
+defects that existed only on the real path - including a goal that could never
+complete and in-flight tasks that read as unreadable - plus one test that asserted
+`>= 0` and so could not fail. A layer exercised only through an injected seam has an
+unproven integration, whatever its own test count says.
+
+Third, and most useful for planning: **no goal has ever completed under a real
+model.** Three goals ran for real and all three stopped at UNVERIFIED, which is
+correct - unverified work is not evidence - but it means autonomous goal completion
+is unproven rather than working. The ceiling is the permission model, not the
+scheduler: under `--autonomy` only work that needs no confirmation and has an
+independent verifier can ever complete a goal.
 
 **Next milestone: M2.18a Vision Foundation** is now genuinely reachable, because
-the model can finally reach the desktop stack. M2.17's remaining limits - autonomy
-proven against a real Agent but never against a real model on a real schedule, and
-no real-model validation of multi-task goal completion - should be closed early in
-that milestone rather than left to accumulate.
+the model can finally reach the desktop stack. Before new surface is added, the cheap
+closures are: an independent verifier for ordinary file operations (without one, no
+goal can complete), and real-model goal completion measured at an N large enough to
+quote.
