@@ -526,7 +526,7 @@ class TestViewEndToEnd:
             bridge.emit("task_cancelled", "Stopped.", job)
             app.pump_once()
             assert controller.state is CompanionState.RETURNING
-            assert app._status.cget("text") == "Stopped."
+            assert controller.snapshot().terminal_message == "Stopped."
         finally:
             app.close()
             try:

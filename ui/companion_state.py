@@ -376,6 +376,12 @@ class CompanionController:
         self._worker: threading.Thread | None = None
         self._stopping = threading.Event()
         self._inflight = 0
+        #: Worker death flag, set when the submission thread exits for any reason
+        #: other than a clean shutdown sentinel. ``is_alive()`` alone is not enough:
+        #: a thread can report alive while it is unwinding from a ``BaseException``.
+        #: This flag is what makes a replacement worker get spawned instead of
+        #: queued work being stranded.
+        self._worker_gone = False
         # Deliberately *not* subscribed here. Construction must not have the side
         # effect of wiring the controller to a live backend: the caller decides when
         # the companion starts listening, which is what makes ``close()`` provably
@@ -388,40 +394,85 @@ class CompanionController:
 
         Idempotent: there is never more than one, which is what keeps a repeated
         activation from producing a second set of backend turns.
+
+        Worker creation and start happen inside the lock so two concurrent
+        callers cannot both spawn a worker. The RLock means the freshly started
+        worker simply blocks on the lock until we release it, which is safe.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._stopping.is_set():
                 return False
-            if self._worker is not None and self._worker.is_alive():
+            # ``is_alive()`` alone is not a health check: a thread can report
+            # alive while it is unwinding from a ``BaseException``. The death
+            # flag is what catches that case and forces a replacement.
+            if (self._worker is not None
+                    and self._worker.is_alive()
+                    and not self._worker_gone):
                 return True
-            self._stopping.clear()
             worker = threading.Thread(
                 target=self._worker_loop,
                 name=self.WORKER_NAME,
                 daemon=True,
             )
             self._worker = worker
-        worker.start()
-        return True
+            self._worker_gone = False
+            worker.start()
+            return True
 
     def _worker_loop(self) -> None:
-        while not self._stopping.is_set():
+        me = threading.current_thread()
+        try:
+            while not self._stopping.is_set():
+                try:
+                    item = self._work.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item is None:            # shutdown sentinel
+                    self._work.task_done()
+                    return
+                job_id, text = item
+                try:
+                    self._submit_to_backend(text, job_id)
+                except Exception as exc:  # noqa: BLE001 - the worker must never die
+                    self.fail(f"{type(exc).__name__}: {exc}")
+                finally:
+                    with self._lock:
+                        self._inflight = max(0, self._inflight - 1)
+                    self._work.task_done()
+        except BaseException:
+            # The worker died for a reason other than a clean shutdown sentinel
+            # (e.g. a ``BaseException`` from the backend). Mark it gone so the
+            # next submission spawns a replacement, and transition to ERROR so the
+            # companion shows the failure rather than staying stuck in THINKING.
+            with self._lock:
+                self._worker_gone = True
+                if self._worker is me:
+                    self._worker = None
+            # Report the failure so the state machine moves out of THINKING.
+            # The current task_id is marked terminal, so any late events for it
+            # are ignored. The next ``submit_task`` call will spawn a fresh worker.
             try:
-                item = self._work.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if item is None:            # shutdown sentinel
-                self._work.task_done()
-                break
-            job_id, text = item
-            try:
-                self._submit_to_backend(text, job_id)
-            except Exception as exc:  # noqa: BLE001 - the worker must never die
-                self.fail(f"{type(exc).__name__}: {exc}")
-            finally:
+                self.fail("submission worker died unexpectedly")
+            except Exception:  # noqa: BLE001 - never let a death handler crash
+                pass
+            # Drain any queue items left behind by the dead worker so that
+            # ``_inflight`` returns to 0 and ``wait_idle`` can complete.
+            while True:
+                try:
+                    item = self._work.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._work.task_done()
+                    break
                 with self._lock:
                     self._inflight = max(0, self._inflight - 1)
                 self._work.task_done()
+            raise
+        finally:
+            with self._lock:
+                if self._worker is me:
+                    self._worker = None
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """Block until every submitted task has been handed to the backend.
@@ -708,6 +759,10 @@ class CompanionController:
         with self._lock:
             self._inflight += 1
         self._work.put((job_id, clean))
+        # A worker may have died between the is_alive() check above and the
+        # queue put. Ensure a replacement is running for the work we just
+        # queued so nothing is stranded.
+        self._ensure_worker()
         return job_id
 
     def _submit_to_backend(self, text: str, job_id: str) -> None:

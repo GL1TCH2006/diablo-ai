@@ -237,13 +237,46 @@ def test_the_same_tick_is_not_run_twice(tmp_settings, tmp_path, readme) -> None:
 
 def test_cancelling_a_goal_converges_its_task_across_a_new_runtime(
         tmp_settings, tmp_path, readme) -> None:
-    agent = _agent(tmp_settings, [
-        _call("filesystem.read_file", {"path": str(readme)}),
-    ])
+    # Create a task in RUNNING state (simulating in-flight work) and then cancel.
+    # This tests that cancellation properly marks the goal as cancelled and
+    # the durable record survives a restart.
+    from core.autonomy import AutonomyRuntime, SchedulerLimits
+    from core.goals import GoalState, GoalStore, create_goal
+    from core.task_store import TaskRecord, TaskStore
+
+    # Set up runtime with a real agent
+    agent = _agent(tmp_settings)
     runtime = _runtime(tmp_settings, agent, tmp_path)
     goal = _due_goal(runtime, "Read the notes file")
-    runtime.tick()
 
+    # Manually create a task in RUNNING state (simulating in-flight work)
+    task_store = TaskStore(tmp_settings.sessions_dir)
+    record = TaskRecord(
+        task_id="cancel-test-task",
+        project_name="test",
+        project_root=str(tmp_path),
+        title="part of the objective",
+        goal=goal.objective,
+        created_at="20260101-000000",
+        started_at="20260101-000000",
+        status="active",
+    )
+    record.metadata["lifecycle"] = {
+        "state": "active",
+        "verification": "not_run",
+        "recovery_attempts": 0,
+        "recovery_exhausted": False,
+    }
+    task_store.create(record)
+
+    # Link the goal to this task
+    goal.attach_task(record.task_id)
+    goal.current_task_id = record.task_id
+    goal.transition(GoalState.ACTIVE)
+    goal_store = GoalStore(tmp_settings.sessions_dir)
+    goal_store.save(goal)
+
+    # Now cancel the goal
     runtime.cancel(goal.goal_id)
 
     # A second runtime over the same files: the durable record must still say

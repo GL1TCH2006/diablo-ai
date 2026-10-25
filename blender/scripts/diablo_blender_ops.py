@@ -376,7 +376,7 @@ def op_configure_light(params):
     }
     if light.type in ("AREA", "SPOT"):
         out["size"] = float(light.size)
-    elif light.type == "SUN":
+    elif light.type == "SPOT":
         out["angle"] = float(light.angle)
     return out
 
@@ -389,7 +389,10 @@ def op_execute_script(params):
     if not script.strip():
         raise ValueError("empty script")
     namespace = {"bpy": bpy, "__name__": "__diablo_blender_script__"}
-    exec(compile(script, "<diablo-blender-script>", "exec"), namespace)  # noqa: S102 - explicit Diablo escape hatch
+    try:
+        exec(compile(script, "<diablo-blender-script>", "exec"), namespace)  # noqa: S102 - explicit Diablo escape hatch
+    except Exception as exc:  # noqa: BLE001 - report script errors to caller
+        raise ValueError(str(exc)) from exc
     return {"executed": True}
 
 

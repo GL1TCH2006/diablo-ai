@@ -34,6 +34,12 @@ data/blender/
 # Project knowledge graphs are per-machine runtime databases, and a test run
 # creates one. Without this they show up as an untracked binary in every status.
 data/knowledge/
+# data/run_backups holds verbatim copies of files taken before an automated
+# edit, and data/run_reports holds generated markdown reports. Both contain
+# full copies of source and may contain machine-specific absolute paths, so
+# neither belongs in the baseline.
+data/run_backups/
+data/run_reports/
 # Output of `main.py --demo`; recreated by the demo itself.
 workspace/hello_world.py
 workspace/generated/

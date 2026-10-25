@@ -36,6 +36,7 @@ is spawned, and tests override it.
 
 import json
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -407,21 +408,41 @@ class BlenderRunner:
         return completed
 
     def _stop(self, proc, operation: str) -> bool:
-        """Terminate then kill the child, both bounded, and reap it.
+        """Terminate then kill the child process tree, both bounded, and reap it.
 
         Returns ``True`` only when the child is *confirmed* dead. A graceful
         terminate is attempted first so Blender can shut down; if it has not
         exited within the grace window it is killed. Either way the child is
         waited on so no orphan is left silently behind.
 
-        ``Popen.terminate``/``Popen.kill`` are used rather than
-        ``send_signal`` because they are the portable spelling: Windows has no
-        ``SIGKILL``, and a missing signal constant must never turn a kill
-        escalation into an ``AttributeError``.
+        On Windows, uses ``taskkill /T /F /PID`` to terminate the entire
+        process tree, which is necessary because Blender may spawn child
+        processes (e.g. via ``execute_script``).
         """
         if proc.poll() is not None:
             return True
         log.warning("terminating blender (pid=%s) for op %s", proc.pid, operation)
+
+        # First try: use taskkill to kill the entire process tree (Windows)
+        if sys.platform == "win32":
+            try:
+                log.debug("using taskkill /T /PID %d", proc.pid)
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=self.kill_grace,
+                )
+                # Wait a moment for reap
+                try:
+                    proc.wait(timeout=1.0)
+                    return True
+                except subprocess.TimeoutExpired:
+                    pass
+            except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+                pass
+
+        # Fallback: standard terminate/kill (works on Unix, limited on Windows)
+        log.warning("falling back to standard terminate/kill for blender operation (pid=%s)", proc.pid)
         for action, grace in (("terminate", self.terminate_grace), ("kill", self.kill_grace)):
             try:
                 getattr(proc, action)()

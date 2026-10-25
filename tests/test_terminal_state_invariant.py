@@ -75,6 +75,21 @@ OBSERVED_PASS = dict(subject_kind=VerificationSubject.TASK,
                      trust=EvidenceTrust.OBSERVED,
                      evidence={"tests_passed": "3", "exit_code": 0})
 
+#: Fixture content and the edit Scenario 3 applies to it.
+#:
+#: ``filesystem.write_file`` carries its own independent content verification
+#: (``tools/filesystem.py:57``), so routing the work through that tool would be
+#: genuinely ``PASSED`` and Scenario 3 would be unreachable. ``code.patch_file``
+#: really edits the file and really reports success, and
+#: ``tools/patches.py`` attaches no ``VerificationResult`` to it - so it is
+#: exactly "work ran, no independent verifier existed".
+PROJECT_README = "# proj\n\nA tiny calculator.\n"
+UNVERIFIED_README_EDIT = (
+    "=== README.md ===\n"
+    "insert_after A tiny calculator.\n"
+    "+Status: not tested.\n"
+)
+
 
 # ══════════════════════════════════════════ the invariant, as a table
 
@@ -407,10 +422,11 @@ class TestTheAgentEndsOnAdmissiblePairs:
             self, tmp_settings, tmp_path: Path):
         """Scenario 3: work ran, no independent verifier existed."""
         project = _write_project(tmp_path)
+        (project / "README.md").write_text(PROJECT_README, encoding="utf-8")
         agent, _ = _agent(tmp_settings, project, [
-            _response(_call("filesystem.write_file",
-                            path=str(project / "README.md"),
-                            content="# hello\n")),
+            _response(_call("code.patch_file",
+                            patch=UNVERIFIED_README_EDIT,
+                            workspace=str(project))),
             _response(text="wrote a file"),
         ])
         agent.respond("add a readme to the project")
@@ -425,6 +441,11 @@ class TestTheAgentEndsOnAdmissiblePairs:
         assert tasks.terminal_verdict() is TerminalVerdict.UNVERIFIED
         assert tasks.task_succeeded() is None
         assert tasks.terminal_violation() == ""
+        # The work really executed and really changed the file. Without this the
+        # test would also pass if the step had never run at all, which would
+        # make "no independent verifier existed" vacuous.
+        assert "Status: not tested." in (project / "README.md").read_text(encoding="utf-8")
+        assert tasks.ledger.latest_state is VerificationState.UNVERIFIED
 
     def test_execution_success_with_nothing_executed(
             self, tmp_settings, tmp_path: Path):

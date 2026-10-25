@@ -12,3 +12,11 @@ pywin32>=306; sys_platform == 'win32'
 # comtypes can reach it. Windows-only; without it uia_available() is False and
 # the uia_* operations are withheld.
 comtypes>=1.4.17; sys_platform == 'win32'
+
+# Phase 6: Voice capabilities
+# faster-whisper for local STT (CPU and GPU support via CTranslate2)
+faster-whisper>=1.0.0
+# sounddevice for microphone capture (Windows WASAPI support)
+sounddevice>=0.4.6
+# av for audio decoding (pin to version compatible with faster-whisper)
+av<12.0.0

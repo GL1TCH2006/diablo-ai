@@ -20,10 +20,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
+
+#: Repository root, i.e. the parent of ``tests/``. This file is run as a script by
+#: ``tests/test_m217_restart_real.py``, with ``cwd`` set to the repository root.
+#: That is not sufficient: CPython places the *script's* directory (``tests/``)
+#: on ``sys.path[0]``, never the working directory, so ``import core`` would look
+#: for ``tests/core`` and raise ``ModuleNotFoundError``.
+#:
+#: Setting ``os.environ["PYTHONPATH"]`` from inside ``main()`` cannot fix that
+#: either: the interpreter has already built ``sys.path`` before this module's
+#: ``main()`` is reached, and CPython does not re-read the variable afterwards.
+#: The path therefore has to be inserted here, before the first project import.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _agent(settings: Any) -> Any:
@@ -175,7 +188,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sessions = Path(args.sessions)
     sessions.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
+
+    # No PYTHONPATH is set here. The repository root is already on sys.path by
+    # this point (module import time, above), which is the only place it can be
+    # established for a child interpreter.
 
     if args.phase == "seed":
         result = _seed(sessions, args.kind)

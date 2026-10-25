@@ -1,0 +1,311 @@
+================================================================================
+DIABLO OVERNIGHT RELIABILITY REPORT
+================================================================================
+Timestamp: 2026-10-20
+Project: diablo-ai (C:\PROJECTS\jarvis like ai for my computer)
+Branch: reliability-batch-1
+HEAD: a74b53c
+Reference: DIABLO_COMPLETE_AUDIT_REPORT.txt (previous report)
+================================================================================
+
+SECTION A: ENVIRONMENT AND BASELINE
+================================================================================
+
+Repository path: C:\PROJECTS\jarvis like ai for my computer\diablo-ai
+Python: 3.14.6 (.venv at C:\PROJECTS\jarvis like ai for my computer\diablo-ai\.venv)
+Ollama: http://localhost:11434 - reachable
+Models: qwen3:8b (Q4_K_M, tools capable), qwen3:14b (tools capable)
+Branch: reliability-batch-1, HEAD a74b53c
+Working tree: dirty (24 modified files, 19 untracked files/dirs)
+Stashes: none
+
+Pre-existing modified files (preserved, not overwritten):
+  .gitignore, README.md, config/default_config.toml,
+  core/knowledge_graph.py, core/knowledge_ingest.py,
+  core/verification.py, core/verification_ledger.py,
+  docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt,
+  docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, main.py,
+  tests/m217_restart_child.py, tests/test_applications.py,
+  tests/test_knowledge_ingest.py, tests/test_m213_coding_workflow.py,
+  tests/test_m216_ui_companion.py, tests/test_m217_autonomy_integration.py,
+  tests/test_recovery_p10_repair.py, tests/test_s2_9_hardening.py,
+  tests/test_terminal_state_invariant.py, tools/__init__.py,
+  tools/applications.py, tools/filesystem.py,
+  ui/companion_state.py, ui/edge_companion.py
+
+Pre-existing untracked files (preserved):
+  AGENTS.md, DIABLO_COMPLETE_AUDIT_REPORT.txt, data/, personas/, scripts/,
+  tests/test_edge_companion_speech_probe.py,
+  tests/test_filesystem_delete_verification.py,
+  tests/test_m217_filesystem_verification.py,
+  tests/test_m217_real_model_autonomy.py,
+  tests/test_m217_windows_path_edges.py,
+  tests/test_m218_delete_containment.py,
+  tests/test_main_ui_entrypoints.py,
+  tests/test_orb_completed_strictness.py,
+  tests/test_orb_renderer.py, tests/test_orb_renderer_batch6.py,
+  tests/test_orb_state_map.py, tests/test_personas.py, ui/orb/
+
+New files from previous remediation (preserved):
+  tests/test_companion_worker_regression.py
+  tests/test_workspace_path_resolution.py
+
+Previous report findings (from DIABLO_COMPLETE_AUDIT_REPORT.txt):
+  - Companion worker race: FIXED (200/200 race iterations pass)
+  - Workspace-relative path resolution: FIXED (11/11 regression tests pass)
+  - Real-model autonomy: 2/3 passed, 1 failed on SHA-256 mismatch
+    (expected fa33b88a..., actual 0ec52c4b...)
+
+================================================================================
+
+SECTION B: REAL-MODEL FAILURE INVESTIGATION
+================================================================================
+
+FAILING TEST:
+  tests/test_m217_real_model_autonomy.py::
+  TestRealModelAutonomy.test_the_goal_completed_and_the_artifact_is_observed_independently
+
+FAILURE OUTPUT:
+  AssertionError: real_goal_artifact.txt exists but does not contain the
+  requested content (sha256 0ec52c4bf401f50c..., expected
+  fa33b88a8b97b116...)
+
+ROOT CAUSE: Category E — file-writing newline translation
+
+On Windows, Path.write_text() with default newline=None translates "\n" to
+"\r\n" (CRLF). The model was asked to write "diablo-real-model-autonomy-ok\n"
+(LF), but the file on disk contained "diablo-real-model-autonomy-ok\r\n" (CRLF).
+
+Evidence:
+  Expected bytes: b'diablo-real-model-autonomy-ok\n'
+  Expected sha256: fa33b88a8b97b116c0874cc5234ae3e69be3721ca5581813889ec63a73651ecf
+  Actual bytes:   b'diablo-real-model-autonomy-ok\r\n'
+  Actual sha256:  0ec52c4bf401f50c9f27ea372ca3b90427ff49f37412912e737c489ed9ed62d4
+  Match: False
+
+The verification pipeline (observe_file_content) read back with read_text()
+which translates CRLF→LF, so content_match was True and verification PASSED.
+But the test reads raw bytes with read_bytes(), which sees CRLF, so SHA-256
+doesn't match.
+
+This is a real system defect, not merely a model weakness. The write_file tool
+was silently modifying user data via platform-specific newline translation.
+
+CLASSIFICATION SUMMARY:
+  A. Model misunderstood task: NO - model called write_file correctly
+  B. Model generated incorrect content: NO - model requested exact payload
+  C. Tool schema unreliable: NO - schema carries content correctly
+  D. Execution layer transformed content: YES (category E below)
+  E. File-writing newline behavior changed bytes: YES - root cause
+  F. Test fixture incorrect: NO - test contract is valid
+  G. Verifier checks wrong artifact: NO - verifier checks correct file
+  H. Agent reports success before verification: NO - verification ran correctly
+  I. Another cause: N/A
+
+================================================================================
+
+SECTION C: FIXES IMPLEMENTED
+================================================================================
+
+Fix 1: Preserve exact bytes in write_file (tools/filesystem.py)
+----------------------------------------------------------------
+File: tools/filesystem.py
+Change: target.write_text(content, encoding="utf-8")
+        → target.write_text(content, encoding="utf-8", newline="")
+Reason: newline="" prevents Windows CRLF translation, so the file contains
+exactly the bytes the model requested.
+
+Fix 2: Preserve exact bytes in read_file (tools/filesystem.py)
+----------------------------------------------------------------
+File: tools/filesystem.py
+Change: target.read_text(encoding="utf-8")
+        → target.read_text(encoding="utf-8", newline="")
+Reason: newline="" prevents Windows CRLF→LF translation on read, so read_file
+returns exactly what's on disk.
+
+Fix 3: Preserve exact bytes in observe_file_content (core/verification.py)
+--------------------------------------------------------------------------
+File: core/verification.py
+Change: resolved.read_text(encoding="utf-8")
+        → resolved.read_text(encoding="utf-8", newline="")
+Reason: newline="" prevents Windows CRLF→LF translation on verification read,
+so the verifier compares exact bytes rather than translated text. Without this,
+the verifier would PASS on CRLF content while the test sees mismatched bytes.
+
+Fix 4: Test setup writes exact bytes (tests/test_m217_windows_path_edges.py)
+----------------------------------------------------------------------------
+File: tests/test_m217_windows_path_edges.py
+Change: open(stream, "w", encoding="utf-8")
+        → open(stream, "w", encoding="utf-8", newline="")
+Reason: The ADS test wrote "stream-payload\n" with default newline (CRLF on
+Windows), then expected observe_file_content to match "stream-payload\n".
+With exact-byte verification, the test must write exactly what it expects to
+verify. This fixes the test setup, not its expectations.
+
+No test expectations were changed. No production code was hardened to
+accommodate incorrect model output. The verification invariant is preserved:
+content must match exactly, byte for byte.
+
+================================================================================
+
+SECTION D: BEFORE/AFTER BEHAVIOR
+================================================================================
+
+Before fix:
+  write_file(path, "diablo-real-model-autonomy-ok\n")
+  → Disk contains: "diablo-real-model-autonomy-ok\r\n" (Windows CRLF)
+  → observe_file_content reads "diablo-real-model-autonomy-ok\n" (CRLF→LF)
+  → content_match: True → verification PASSED
+  → Test reads raw bytes: "diablo-real-model-autonomy-ok\r\n"
+  → SHA-256 mismatch → TEST FAILED
+
+After fix:
+  write_file(path, "diablo-real-model-autonomy-ok\n")
+  → Disk contains: "diablo-real-model-autonomy-ok\n" (exact bytes)
+  → observe_file_content reads "diablo-real-model-autonomy-ok\n" (exact bytes)
+  → content_match: True → verification PASSED
+  → Test reads raw bytes: "diablo-real-model-autonomy-ok\n"
+  → SHA-256 match → TEST PASSED
+
+================================================================================
+
+SECTION E: TEST RESULTS AND COMMANDS
+================================================================================
+
+Real-model autonomy (WITH fix):
+  Command: DIABLO_REAL_MODEL_TESTS=1 .\.venv\Scripts\python.exe -m pytest
+           -q --no-header -p no:cacheprovider tests/test_m217_real_model_autonomy.py -v
+  Result: 3 passed, 0 failed, 0 skipped in 102.80s
+  Tests:
+    PASS test_the_goal_completed_and_the_artifact_is_observed_independently
+    PASS test_the_run_stayed_within_its_tool_call_and_time_budgets
+    PASS test_a_goal_the_model_cannot_verify_does_not_report_completed
+
+Real-model autonomy (BEFORE fix, for reference):
+  Result: 2 passed, 1 failed in 150.89s
+
+Filesystem verification tests:
+  Command: .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_filesystem.py tests/test_workspace_path_resolution.py
+           tests/test_m217_filesystem_verification.py tests/test_m218_delete_containment.py
+  Result: 63 passed, 3 skipped, 0 failed in 0.74s
+
+Windows path edges tests:
+  Command: .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_m217_windows_path_edges.py
+  Result: 28 passed, 3 skipped, 1 xfailed, 0 failed in 3.56s
+
+Companion worker regression tests:
+  Command: .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_companion_worker_regression.py tests/test_m216_ui_companion.py
+  Result: 91 passed, 0 failed (includes 200-iteration race stress test)
+
+Agent/task/context tests:
+  Command: .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_agent.py tests/test_task_store.py tests/test_task_inspection.py
+           tests/test_context.py
+  Result: 48 passed, 0 failed in 1.54s
+
+Permissions/terminal/memory tests:
+  Command: .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_permissions.py tests/test_memory_rules.py
+           tests/test_memory_safety_and_rule_scope.py tests/test_terminal.py
+           tests/test_terminal_destructive_policy.py
+  Result: 253 passed, 0 failed in 4.49s
+
+Total deterministic tests run in this session: ~483 passed, 0 failed
+
+================================================================================
+
+SECTION F: SAFETY AND INVARIANT CHECKS
+================================================================================
+
+Verification ledger:
+  - PASSED requires OBSERVED trust and substantive evidence: PRESERVED
+  - Content mismatch → FAILED (not PASSED, not UNVERIFIED): PRESERVED
+  - "content_match" is an ASSERTION_KEY: PASSED + content_match=False → UNVERIFIED: PRESERVED
+  - Exact byte comparison (including newlines and whitespace): ENFORCED
+
+Permissions:
+  - SAFE/NORMAL/SENSITIVE/BLOCKED classifications: PRESERVED
+  - path_is_within() containment: PRESERVED
+  - Delete-before-unlink containment: PRESERVED
+  - Missing settings fail CLOSED: PRESERVED
+
+Filesystem tools:
+  - write_file: content verification against exact expected bytes: FIXED
+  - read_file: returns exact bytes on disk: FIXED
+  - observe_file_content: verifies exact bytes: FIXED
+  - delete_file: containment checked before unlink: PRESERVED
+
+Cancellation and recovery:
+  - Cancellation is not reported as success: PRESERVED
+  - Failed tasks do not corrupt state: PRESERVED
+  - Worker death recovery: PRESERVED (from previous fix)
+
+No security invariants were weakened. No permission defaults were changed.
+No evidence trust rules were modified.
+
+================================================================================
+
+SECTION G: ENVIRONMENTAL AND INTEGRATION LIMITATIONS
+================================================================================
+
+Real Windows UI Automation: NOT RUN - deferred per original audit, no real
+application integration tests executed.
+
+Real Blender execution: BLOCKED - no Blender installation detected in
+current environment.
+
+Web search: STUB - per original architecture, not part of this audit.
+
+Multi-monitor DPI: NOT TESTED.
+
+Audio input / STT / wake-word / VAD / barge-in: NOT IMPLEMENTED - pre-existing
+limitation, not addressed in this task.
+
+Python/subprocess execution: NOT SANDBOXED - runs with user privileges, subject
+to existing policy and path controls. Documented limitation, not a security
+boundary.
+
+Personas: exist (raphael.py, sage.py) but ZERO production callers integrate
+them into the agent reply path. Human decision needed.
+
+================================================================================
+
+SECTION H: REMAINING RISKS AND NEXT ACTIONS
+================================================================================
+
+Remaining risks:
+  1. Real Windows UIA not validated against real applications.
+  2. Real Blender execution not available in environment.
+  3. Personas not integrated into production callers.
+  4. Web search remains a stub.
+
+Prioritized next actions:
+  1. [P1] Validate personas integration decision (canonical names/default,
+     production callers).
+  2. [P1] Real Windows UIA validation if test application available.
+  3. [P2] Blender integration if Blender becomes available.
+  4. [P2] Reconcile any remaining test-report inconsistencies.
+
+================================================================================
+
+SECTION H: FINAL GIT STATE
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c
+Modified files (this session's changes highlighted):
+  tools/filesystem.py (NEW: newline="" in write_file/read_file)
+  core/verification.py (NEW: newline="" in observe_file_content)
+  tests/test_m217_windows_path_edges.py (NEW: newline="" in ADS test setup)
+  [21 other files with pre-existing modifications, preserved]
+
+Untracked files (new from this session): none
+Untracked files (pre-existing, preserved): AGENTS.md, data/, personas/,
+  scripts/, DIABLO_COMPLETE_AUDIT_REPORT.txt, tests/test_companion_worker_regression.py,
+  tests/test_workspace_path_resolution.py, and all test/orb files listed earlier.
+
+No commits, resets, cleans, stashes, pushes, or branch changes were made.
+================================================================================

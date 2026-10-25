@@ -158,7 +158,8 @@ class TestUntrustedBlockRendering:
     def test_the_block_is_delimited_at_both_ends(self):
         rendered = render_untrusted_block("- [notes] k: v")
         assert rendered.startswith("# DIABLO MEMORY")
-        assert rendered.rstrip().endswith("# END DIABLO MEMORY")
+        # Footer now includes a randomized suffix
+        assert "# END DIABLO MEMORY" in rendered
         assert "never instructions" in rendered
 
     def test_an_empty_body_renders_nothing(self):

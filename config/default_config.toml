@@ -38,6 +38,13 @@ max_result_chars = 8000
 # Present every tool every turn. Off by default: the bounded tool-context selector
 # is what keeps a turn readable for a small model.
 full_context = false
+# Per-tool execution timeout in seconds. 0 or negative disables the timeout.
+# These bounds protect against runaway tools and are enforced by the executor.
+# Individual tools (terminal, python) may have their own internal timeouts.
+terminal_timeout = 120
+python_timeout = 300
+blender_timeout = 600
+generic_tool_timeout = 60
 
 [context]
 max_tokens = 8000
@@ -122,11 +129,37 @@ edge = "msedge"
 blender = "blender"
 
 [apps.known_paths]
+# Absolute paths for applications that are installed machine-wide. Keep this list
+# machine-independent: an absolute path here embeds one Windows user's profile and
+# stops working for everyone else.
+#
+# There is deliberately no "vs code" entry. VS Code is normally installed per-user,
+# where the executable is neither on PATH nor in a machine-wide directory, so its
+# real location depends on the profile of whoever is logged in. It is discovered
+# instead - see DISCOVERY_CANDIDATES in tools/applications.py, which probes
+# %LOCALAPPDATA%, %PROGRAMFILES% and %PROGRAMFILES(X86)% and takes the first hit,
+# in the same way blender/controller.py detects Blender. To pin a path yourself,
+# add the key here; a configured path still takes precedence over discovery.
 blender = "C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"
-"vs code" = "C:/Users/raumaan/AppData/Local/Programs/Microsoft VS Code/Code.exe"
 
 [voice]
 enabled = false
+stt_model = "base"
+stt_device = "auto"
+stt_compute_type = "int8"
+stt_model_path = ""
+microphone_device = 0
+wake_word_enabled = false
+wake_word_type = "mock"
+wake_word_phrase = "diablo"
+vad_enabled = true
+vad_method = "energy"
+vad_threshold = 0.01
+vad_silence_timeout = 2.0
+max_recording_duration = 30.0
+sample_rate = 16000
+output_dir = "voice_recordings"
+tts_interruptible = true
 
 [logging]
 level = "INFO"

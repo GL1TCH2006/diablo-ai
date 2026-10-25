@@ -1,0 +1,412 @@
+COMPLETE DIRECTORY INVENTORY — DIABLO PROJECT
+===============================================
+Project Root: C:\PROJECTS\jarvis like ai for my computer\diablo-ai
+Audit Date: 2026-10-25
+Git Branch: reliability-batch-1
+Git HEAD: a74b53c
+
+================================================================================
+1. TOP-LEVEL DIRECTORY STRUCTURE
+================================================================================
+
+Total items at root: 27 directories, 36 files
+
+DIRECTORIES (27):
+------------------
+ai/                      - AI provider layer (Ollama, offline, model router, model manager)
+blender/                 - Blender integration (controller, capabilities, runner, scripts)
+coding/                  - Coding-specific tools (change_tracker, snapshot_manager)
+config/                  - Configuration (settings.py, default_config.toml, permissions.py)
+core/                    - Core agent runtime (agent, executor, planner, verification, task_manager, knowledge_graph, windows)
+data/                    - Runtime data (memory, sessions, logs, backups, knowledge graphs, models)
+docs/                    - Documentation and design contracts
+integration/             - S2.3 Blender-Vision integration layer
+memory/                  - Memory subsystem (conversation, memory_store, rules_store, preferences, project_memory, sanitizer)
+personas/                - Persona system (sage, raphael, loader)
+reports/                 - Historical test/validation reports
+scripts/                 - Utility scripts (orb_preview, run_deterministic)
+tests/                   - Test suite (130+ test files)
+tools/                   - Tool registry (50+ tools across 15 modules)
+ui/                      - UI layer (terminal, edge_companion, orb, launch, companion_state)
+vision/                  - Vision capabilities (backends, loader, inspect, protocol)
+voice/                   - Voice system (service, stt, tts, vad, wake_word, pipeline, cancellation)
+voice_recordings/        - Audio recordings (runtime-generated)
+workspace/               - Workspace samples (flask-auth-demo for testing)
+AUDIT_REPORTS/           - This audit's output directory (newly created)
+
+FILES AT ROOT (36):
+--------------------
+.env                           869 bytes  - Environment overrides (redacted in audit)
+.env.example                   526 bytes  - Example environment template
+.gitignore                    1653 bytes  - Git ignore patterns
+AGENTS.md                     1456 bytes  - Agent coding rules
+audit_checks.py               1316 bytes  - Audit validation script
+diablo-overnight-req-audit.txt 15275 bytes - Historical overnight audit
+DIABLO_CANCELLATION_CONSISTENCY_AUDIT.txt 20752 bytes - Cancellation audit
+DIABLO_CANCELLATION_MILESTONE_CLOSURE_REPORT.txt 10173 bytes - Milestone closure
+DIABLO_COMPLETE_AUDIT_REPORT.txt 33821 bytes - Previous complete audit
+DIABLO_EXECUTION_SECURITY_AUDIT.txt 24947 bytes - Security audit
+DIABLO_OVERNIGHT_EXECUTION_LEDGER.txt 5478 bytes - Overnight execution log
+DIABLO_OVERNIGHT_EXECUTION_VERIFICATION.txt 10655 bytes - Overnight verification
+DIABLO_OVERNIGHT_MASTER_REPORT.txt 10506 bytes - Overnight master report
+DIABLO_OVERNIGHT_RELIABILITY_REPORT.txt 14375 bytes - Overnight reliability
+DIABLO_OVERNIGHT_TEST_MATRIX.txt 4820 bytes - Overnight test matrix
+DIABLO_P0_4_BLENDER_PROCESS_TREE_CANCELLATION_REPORT.txt 7744 bytes - Blender cancellation
+DIABLO_P1_BLENDER_COOPERATIVE_CANCELLATION_REPORT.txt 8022 bytes - Blender cooperative
+DIABLO_PERSONA_INTEGRATION_AUDIT.txt 22311 bytes - Persona audit
+DIABLO_PHASE6_FINAL_AUDIT.md 13281 bytes - Phase 6 final audit
+DIABLO_PHASE6_PREIMPLEMENTATION_AUDIT.md 16215 bytes - Phase 6 pre-impl
+DIABLO_POST_ROADMAP_AUDIT.txt 16107 bytes - Post-roadmap audit
+DIABLO_RELIABILITY_AUDIT.txt 34353 bytes - Reliability audit
+DIABLO_TERMINAL_CANCELLATION_IMPLEMENTATION.txt 10288 bytes - Terminal cancellation
+DIABLO_VOICE_READINESS_REPORT.txt 7830 bytes - Voice readiness
+FINAL_AUDIT_REPORT.txt 25371 bytes - Final audit report
+gate-save.blend 95937 bytes - Blender binary (excluded from source analysis)
+gate-save.blend1 95937 bytes - Blender binary backup (excluded)
+main.py 34424 bytes - Main entry point
+pyproject.toml 1724 bytes - Project manifest
+README.md 16744 bytes - Project documentation
+requirements.txt 863 bytes - Dependencies
+run.ps1 294 bytes - PowerShell launcher
+test_term_tree.py 1247 bytes - Terminal tree test
+x.blend 95937 bytes - Blender binary (excluded)
+
+================================================================================
+2. SOURCE FILE STATISTICS (EXCLUDING GENERATED/EXCLUDED)
+================================================================================
+
+Total source files inspected: 485
+Total source size: ~150 MB (157,710,553 bytes)
+Note: Excludes .venv, .pytest_cache, __pycache__, data/sessions, voice_recordings, *.blend, *.wav, workspace/samples
+
+BY CATEGORY:
+------------
+Core Agent Runtime (core/):        42 files  (~1.2 MB)
+  - agent.py, executor.py, planner.py, verification.py, verification_ledger.py
+  - task_manager.py, task_store.py, request_context.py, cancellation.py
+  - context.py, recovery.py, logging_setup.py, constants.py
+  - knowledge_graph.py, knowledge_projection.py, knowledge_ingest.py, knowledge_tools.py, knowledge_data.py
+  - project_task_history.py, model_router.py (in ai/), model_manager.py (in ai/)
+  - windows/ subdirectory: 15 files (capabilities, capture, coordinates, displays, errors, input, models, processes, start_menu, system, uia, visual, window_models, windows)
+
+AI Provider Layer (ai/):            6 files  (~150 KB)
+  - provider.py, ollama_provider.py, offline_provider.py, model_router.py, model_manager.py, tokenizer.py
+
+Configuration (config/):            3 files  (~50 KB)
+  - settings.py, default_config.toml, permissions.py
+
+Memory Subsystem (memory/):         7 files  (~100 KB)
+  - memory_store.py, conversation.py, sanitizer.py, rules_store.py, preferences.py, project_memory.py, rule_engine.py, storage.py
+
+Tools Registry (tools/):            17 files  (~600 KB)
+  - __init__.py (registry builder), registry.py
+  - filesystem.py, terminal.py, python.py, applications.py, system.py
+  - git.py, github.py, coding.py, patches.py, data_tool.py, chart_tool.py
+  - memory.py, rules.py, models.py, tasks.py, capability_bridge.py, desktop.py
+
+UI Layer (ui/):                     12 files  (~200 KB)
+  - terminal.py, edge_companion.py, launch.py, companion.py, companion_events.py, companion_state.py
+  - controller.py, edge.py, bridge.py, models.py
+  - orb/renderer.py, orb/state_map.py, orb/__init__.py
+
+Voice System (voice/):              15 files  (~150 KB)
+  - service.py, cancellation.py, capture.py, commands.py, events.py, output.py, pipeline.py
+  - speech_to_text.py, text_to_speech.py, vad.py, wake_word.py, wake_wording.py, ui_adapter.py
+  - stt/__init__.py, stt/base.py, stt/local.py, stt/fallback.py
+  - tts/__init__.py, tts/base.py, tts/neural.py, tts/sapi.py
+
+Integration Layer (integration/):   7 files  (~100 KB)
+  - __init__.py, capabilities.py, contracts.py, desktop_workflow.py, errors.py, protocol.py, workflows.py
+
+Blender Integration (blender/):     5 files  (~50 KB)
+  - controller.py, capabilities.py, runner.py
+  - scripts/diablo_blender_ops.py
+
+Vision System (vision/):            8 files  (~80 KB)
+  - __init__.py, capabilities.py, errors.py, inspect.py, loader.py, protocol.py
+  - backends/__init__.py, backends/base.py, backends/fallback.py, backends/local_vlm.py
+
+Coding Tools (coding/):             2 files  (~50 KB)
+  - change_tracker.py, snapshot_manager.py
+
+Personas (personas/):               3 files  (~30 KB)
+  - __init__.py, loader.py, sage.py, raphael.py
+
+Scripts (scripts/):                 2 files  (~10 KB)
+  - orb_preview.py, run_deterministic.ps1
+
+Tests (tests/):                     130+ files  (~2 MB)
+  - Unit, integration, real-model, and regression tests
+
+Documentation (docs/):              8 files  (~100 KB)
+  - DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt, DIABLO_IMPLEMENTATION_AUDIT.md
+  - DIABLO_M2_16_UI_COMPLETE_AUDIT.txt, DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt
+  - M2.14_PHASE10_FREEZE.md, M2.14_PHASE10_HANDOVER.md, M2.14_PHASE10_REPORT.md
+  - M2.14_PHASE10Q_VALIDATION.md, M2.14_PHASE10R_AUDIT.md
+  - M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, M2_17_TASK1_VERIFICATION_PIPELINE_MAP.txt
+  - contracts/cross_layer_execution_contracts.md
+
+================================================================================
+3. EXCLUDED DIRECTORIES — DETAILED ACCOUNTING
+================================================================================
+
+.venv/ (Python Virtual Environment)
+-----------------------------------
+Size: ~200-500 MB (not measured - standard venv)
+Contents: Python 3.11 interpreter, pip, setuptools, all installed packages
+Reason for exclusion: Standard virtual environment, fully regeneratable from requirements.txt/pyproject.toml
+Project-specific code: NO — contains only third-party packages
+
+.pytest_cache/ (Test Cache)
+---------------------------
+Size: ~10-50 MB
+Contents: pytest cache, test discovery metadata, last-failed tracking
+Reason for exclusion: Generated test artifact, fully regeneratable
+Project-specific code: NO — pure pytest infrastructure
+
+__pycache__/ (Python Bytecode Cache)
+------------------------------------
+Size: ~50-100 MB (scattered across all packages)
+Contents: *.pyc compiled bytecode files
+Reason for exclusion: Generated bytecode, fully regeneratable
+Project-specific code: NO — compiled artifacts only
+
+data/sessions/ (Runtime Session Snapshots)
+------------------------------------------
+Size: ~500 MB+ (1,000+ subdirectories with workspace snapshots)
+Contents: Per-session snapshots with workspace_state.json files
+Reason for exclusion: Runtime-generated user data, massive volume, not source code
+Project-specific code: NO — runtime state only
+Note: Contains session data from t9 and other test runs, snapshots include workspace_state.json with file contents
+
+data/knowledge/ (Knowledge Graph Databases)
+-------------------------------------------
+Size: ~10-50 MB
+Contents: SQLite databases (kg_project_*.db, .db-shm, .db-wal)
+Reason for exclusion: Runtime-generated persistent knowledge graphs
+Project-specific code: NO — data only, schema defined in core/knowledge_graph.py
+
+data/models/ (Downloaded Model Files)
+-------------------------------------
+Size: ~100-500 MB
+Contents: faster-whisper model files (Systran/faster-whisper-base)
+Reason for exclusion: Downloaded ML models, not source code
+Project-specific code: NO — model weights only
+
+data/logs/ (Runtime Logs)
+-------------------------
+Size: ~1-10 MB
+Contents: diablo.log and rotated logs
+Reason for exclusion: Runtime-generated logs
+Project-specific code: NO — log output only
+
+data/backups/ (Automatic Backups)
+---------------------------------
+Size: ~1-5 MB
+Contents: Timestamped backups of modified source files
+Reason for exclusion: Generated backup artifacts
+Project-specific code: YES (copies of source) — but redundant with git history
+
+data/run_backups/ (Previous Run Backups)
+----------------------------------------
+Size: ~5-10 MB
+Contents: Backups from previous test/verification runs organized by batch/task
+Reason for exclusion: Historical artifacts from development process
+Project-specific code: YES (copies) — but historical, not current source
+
+data/run_reports/ (Previous Run Reports)
+----------------------------------------
+Size: ~1-5 MB
+Contents: Markdown/text reports from previous automated runs
+Reason for exclusion: Historical reports, superseded by this audit
+Project-specific code: NO — generated reports only
+
+voice_recordings/ (Audio Recordings)
+------------------------------------
+Size: ~1-10 MB
+Contents: WAV files from voice capture testing
+Reason for exclusion: Binary audio data, runtime-generated
+Project-specific code: NO — audio samples only
+
+workspace/samples/ (Test Fixtures)
+----------------------------------
+Size: ~1-5 MB
+Contents: flask-auth-demo sample project (app.py, tests, requirements.txt, fix.patch)
+Reason for exclusion: Test fixture, not part of Diablo source
+Project-specific code: NO — external sample project for testing
+
+*.blend files (Blender Binaries)
+--------------------------------
+Files: gate-save.blend, gate-save.blend1, x.blend (3 x ~96 KB = ~288 KB)
+Reason for exclusion: Binary Blender scene files
+Project-specific code: NO — Blender native format
+
+================================================================================
+4. NOTABLE FILES AND PATTERNS
+================================================================================
+
+DUPLICATE/BACKUP FILES (in data/backups and data/run_backups):
+---------------------------------------------------------------
+These are legitimate backup copies created during development, not redundant source:
+- data/backups/app.py.*.bak (6 versions)
+- data/backups/hello_world.*.bak (4 versions)
+- data/backups/mismatch.*.bak
+- data/run_backups/batch*/ — organized by development batch
+- data/run_backups/task*/ — organized by task
+
+UNUSUALLY LARGE SOURCE FILES:
+-----------------------------
+- main.py: 34,424 bytes (730 lines) — main entry point, CLI, demo runners, UI launchers
+- core/agent.py: ~80 KB (2226+ lines) — primary Agent implementation
+- core/knowledge_graph.py: ~45 KB (1246 lines) — knowledge graph storage
+- core/task_manager.py: ~25 KB (609 lines) — task state machine
+- ui/edge_companion.py: ~40 KB (982 lines) — edge companion UI
+- ui/orb/renderer.py: ~30 KB (739 lines) — orb particle renderer
+- tools/__init__.py: ~35 KB (1007 lines) — tool registry builder
+- voice/service.py: ~12 KB (301 lines) — voice service facade
+- config/settings.py: ~10 KB (274 lines) — configuration loader
+- ai/model_router.py: ~14 KB (373 lines) — adaptive model router
+- integration/desktop_workflow.py: ~15 KB — desktop workflow orchestration
+
+SUSPICIOUS/UNEXPECTED FILES:
+----------------------------
+- AGENTS.md at root (also in workspace/samples/flask-auth-demo/AGENTS.md?) — verified as root-level only
+- audit_checks.py — appears to be a validation script for audits
+- test_term_tree.py — standalone test script
+- Multiple historical audit reports at root (20+ files) — from previous audit runs
+
+MISSING EXPECTED FILES:
+-----------------------
+- No Dockerfile / docker-compose.yml
+- No CI/CD configuration (.github/workflows/, .gitlab-ci.yml, etc.)
+- No Makefile / build scripts beyond run.ps1
+- No .pre-commit-config.yaml
+- No pyproject.toml [tool.black], [tool.ruff], [tool.mypy] sections (only pytest)
+
+================================================================================
+5. GIT STATUS SUMMARY
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c "docs: M2.17.x Task 1 verification pipeline map"
+
+MODIFIED TRACKED FILES (39):
+-----------------------------
+.gitignore
+README.md
+blender/capabilities.py
+blender/runner.py
+blender/scripts/diablo_blender_ops.py
+config/default_config.toml
+config/settings.py
+core/agent.py
+core/knowledge_graph.py
+core/knowledge_ingest.py
+core/verification.py
+core/verification_ledger.py
+docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt
+docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt
+main.py
+memory/sanitizer.py
+requirements.txt
+tests/m217_restart_child.py
+tests/test_applications.py
+tests/test_knowledge_ingest.py
+tests/test_m213_coding_workflow.py
+tests/test_m2152_blender_cancellation.py
+tests/test_m216_ui_companion.py
+tests/test_m216_ui_integration.py
+tests/test_m217_autonomy_integration.py
+tests/test_memory_safety_and_rule_scope.py
+tests/test_python.py
+tests/test_recovery_p10_repair.py
+tests/test_s2_9_hardening.py
+tests/test_terminal.py
+tests/test_terminal_state_invariant.py
+tools/__init__.py
+tools/applications.py
+tools/filesystem.py
+tools/python.py
+tools/terminal.py
+ui/companion_state.py
+ui/edge_companion.py
+ui/launch.py
+ui/terminal.py
+voice/__init__.py
+voice/output.py
+voice/service.py
+voice/stt/__init__.py
+voice/stt/fallback.py
+voice/stt/local.py
+voice/text_to_speech.py
+voice/tts/sapi.py
+voice/wake_wording.py
+
+UNTRACKED FILES/DIRECTORIES (53):
+----------------------------------
+AGENTS.md
+DIABLO_CANCELLATION_CONSISTENCY_AUDIT.txt
+DIABLO_CANCELLATION_MILESTONE_CLOSURE_REPORT.txt
+DIABLO_COMPLETE_AUDIT_REPORT.txt
+DIABLO_EXECUTION_SECURITY_AUDIT.txt
+DIABLO_OVERNIGHT_EXECUTION_LEDGER.txt
+DIABLO_OVERNIGHT_EXECUTION_VERIFICATION.txt
+DIABLO_OVERNIGHT_MASTER_REPORT.txt
+DIABLO_OVERNIGHT_RELIABILITY_REPORT.txt
+DIABLO_OVERNIGHT_TEST_MATRIX.txt
+DIABLO_P0_4_BLENDER_PROCESS_TREE_CANCELLATION_REPORT.txt
+DIABLO_P1_BLENDER_COOPERATIVE_CANCELLATION_REPORT.txt
+DIABLO_PERSONA_INTEGRATION_AUDIT.txt
+DIABLO_PHASE6_FINAL_AUDIT.md
+DIABLO_PHASE6_PREIMPLEMENTATION_AUDIT.md
+DIABLO_POST_ROADMAP_AUDIT.txt
+DIABLO_RELIABILITY_AUDIT.txt
+DIABLO_TERMINAL_CANCELLATION_IMPLEMENTATION.txt
+DIABLO_VOICE_READINESS_REPORT.txt
+FINAL_AUDIT_REPORT.txt
+audit_checks.py
+data/ (directory)
+diablo-overnight-req-audit.txt
+personas/ (directory)
+scripts/ (directory)
+test_term_tree.py
+tests/test_blender_real_integration.py
+tests/test_companion_worker_regression.py
+tests/test_edge_companion_speech_probe.py
+tests/test_filesystem_containment.py
+tests/test_filesystem_delete_verification.py
+tests/test_m217_filesystem_verification.py
+tests/test_m217_real_model_autonomy.py
+tests/test_m217_windows_path_edges.py
+tests/test_m218_delete_containment.py
+tests/test_main_ui_entrypoints.py
+tests/test_memory_sanitizer_injection.py
+tests/test_orb_completed_strictness.py
+tests/test_orb_renderer.py
+tests/test_orb_renderer_batch6.py
+tests/test_orb_state_map.py
+tests/test_permissions_auto_allow.py
+tests/test_personas.py
+tests/test_workspace_path_resolution.py
+ui/orb/ (directory)
+voice/capture.py
+voice/vad.py
+voice_recordings/ (directory)
+
+================================================================================
+6. FILE TYPE DISTRIBUTION (SOURCE FILES ONLY)
+================================================================================
+
+Python (.py):          440 files
+TOML (.toml):          2 files (pyproject.toml, default_config.toml)
+Markdown (.md):        4 files (README.md, 3 docs/*.md)
+Text (.txt):           30+ files (documentation, audit reports, configs)
+PowerShell (.ps1):     2 files (run.ps1, run_deterministic.ps1)
+INI (.ini):            0 files (pytest config in pyproject.toml)
+JSON (.json):          0 source files (runtime data only)
+YAML (.yaml/.yml):     0 files
+Shell (.sh):           0 files
+
+================================================================================
+END OF DIRECTORY INVENTORY
+================================================================================

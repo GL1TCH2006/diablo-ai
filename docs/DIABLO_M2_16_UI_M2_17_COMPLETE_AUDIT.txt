@@ -1,4 +1,50 @@
 ================================================================================
+CORRECTION NOTE - added 2026-10-17 by unattended reliability batch 4
+================================================================================
+
+Preserved verbatim; not rewritten. One line in this file is wrong and is load-
+bearing for anyone reading it as evidence.
+
+  Line ~708, section: "M2.17 cross-restart (real)   6 passed"
+
+  THIS WAS NOT TRUE WHEN WRITTEN. tests/test_m217_restart_real.py contained six
+  tests, and all six FAILED on every run from the commit that introduced them
+  (989aaa5, 2026-09-30) until 2026-10-16. The harness defect: the child
+  interpreter set PYTHONPATH from inside main(), after the interpreter had already
+  built sys.path, so `import core` raised ModuleNotFoundError and the seed phase
+  exited non-zero. Proof of the failure as it actually was:
+
+    ModuleNotFoundError: No module named 'core'
+      File "tests/m217_restart_child.py", line 68, in _seed
+        from core.goals import GoalState, GoalStore, create_goal
+    6 failed in 1.49s
+
+  Fixed on 2026-10-16 by putting the repository root on sys.path at module import
+  time in tests/m217_restart_child.py. After the fix: 6 passed in 32.76s, and the
+  safety property it guards is genuinely exercised - a step left RUNNING by a
+  process death with a side-effecting tool is refused, not replayed:
+
+    "action": "blocked",
+    "reason": "refusing to replay steps whose side effects are uncertain: s2"
+
+  So "6 passed" is true of the tree as it stands now, and was false of the tree
+  this audit describes. Both facts matter; neither is edited here.
+
+ALSO NOTE: the surrounding "Deterministic suite" figures in this file were not
+reproducible at the audited tree - see the correction note at the top of
+docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, item 1, for the detail.
+
+Everything else in this document - the milestone-by-milestone roadmap state, the
+"COMPLETE WITH LIMITATIONS" verdicts, the stated limitations, and the conclusion
+that no future milestone was marked complete or invented - stands as written.
+
+Full re-measurements live in data/run_reports/; start with FINAL4.md.
+
+================================================================================
+END OF CORRECTION NOTE - original text follows, unaltered
+================================================================================
+================================================================================
+================================================================================
 DIABLO COMPLETE AUDIT
 M2.16.UI + M2.16.UI.1 + M2.17
 ================================================================================

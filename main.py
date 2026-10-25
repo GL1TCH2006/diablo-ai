@@ -306,6 +306,43 @@ def main() -> int:
     agent = make_agent(None)
     project_label = f"{active_project.name} @ {active_project.path}" if active_project else "(none)"
 
+    # Voice service integration
+    voice_service = None
+    if settings.voice_enabled:
+        try:
+            from voice.service import VoiceService
+            from ui.bridge import CoreEventBusBridge
+            
+            # Create a proper bridge for the voice service
+            voice_bridge = CoreEventBusBridge(
+                bus,
+                submitter=lambda text, task_id="": agent.respond(text),
+                canceler=lambda task_id="": agent.cancel_current_task() if hasattr(agent, 'cancel_current_task') else False,
+            )
+            
+            voice_service = VoiceService(
+                bridge=voice_bridge,
+                stt_model=settings.voice_stt_model,
+                stt_device=settings.voice_stt_device,
+                stt_compute_type=settings.voice_stt_compute_type,
+                stt_model_path=settings.voice_stt_model_path,
+                wake_word_type=settings.voice_wake_word_type,
+                wake_word_phrase=settings.voice_wake_word_phrase,
+                vad_method=settings.voice_vad_method,
+                vad_threshold=settings.voice_vad_threshold,
+                max_recording_duration=settings.voice_max_recording_duration,
+                silence_timeout=settings.voice_vad_silence_timeout,
+                microphone_device=settings.voice_microphone_device,
+                sample_rate=settings.voice_sample_rate,
+                output_dir=settings.voice_output_dir,
+                voice_tts_interruptible=settings.voice_tts_interruptible,
+            )
+            voice_service.start_listening()
+            log.info("Voice service started")
+        except Exception as exc:
+            log.warning("Voice service unavailable: %s", exc)
+            voice_service = None
+
     # M2.17: the goal layer is opt-in and shares this one Agent. Without this block
     # nothing in the application imported core.goals or core.autonomy, so a durable
     # goal could only be created and scheduled by hand from a test.
@@ -339,11 +376,19 @@ def main() -> int:
 
         atexit.register(autonomy_runtime.stop)
 
-    # M2.16.UI: the edge companion is a second *presentation* of the same Agent, not
-    # a second backend. It gets the same Agent and the same EventBus, so there is
-    # still exactly one TaskManager, one Executor and one permission path.
-    if args.edge_companion:
-        from ui.launch import run_edge_companion
+    def close_capabilities():
+        if voice_service is not None:
+            try:
+                voice_service.close()
+            except Exception as exc:
+                log.warning("Voice service close failed: %s", exc)
+        # The desktop workflow is closed first: it holds references to the Windows
+        # capability and its task-scoped cancellation tokens, and both outlive the
+        # registry it was reached through.
+        close_registered_desktop_workflow(capability_registry)
+        close_capability_runtime(capability_workflow, capability_integration,
+                                 capability_blender, capability_windows)
+        from ui.launch import CompanionUnavailable, run_edge_companion
         from ui.edge_companion import EdgeCompanionUnavailable
 
         def confirm(tool, description):
@@ -354,12 +399,30 @@ def main() -> int:
                 return False
 
         agent.set_confirmer(confirm)
+        # M2.16.UI: the edge companion places itself from real display topology.
+        # Without a display layer ``_list_displays`` returns []
+        # (``ui/edge_companion.py:473``), ``_refresh_display`` returns None
+        # (:502), and ``_apply_placement`` (:544) returns before applying
+        # anything - so the window would stay at 0,0 at full size and ``--edge``
+        # would be a no-op. ``DisplayLayer`` is the same read-only layer the
+        # capability runtime already builds (``core/windows/displays.py:600``)
+        # and is what the companion's own real-Windows tests inject.
+        display_layer = None
+        if capability_windows is not None:
+            try:
+                from core.windows import DisplayLayer, displays_available
+
+                if displays_available():
+                    display_layer = DisplayLayer()
+            except Exception as exc:  # noqa: BLE001 - no placement is not fatal
+                log.warning("edge companion display layer unavailable: %s", exc)
         try:
             # The companion displays autonomous work; it never owns it. A read-only
             # projection callable is the whole contract - the view can show what this
             # returns and can do nothing else to a goal.
             status = run_edge_companion(
                 agent, bus, edge=args.edge, speak=args.edge_speak,
+                display_layer=display_layer,
                 goal_provider=(autonomy_runtime.snapshot
                                if autonomy_runtime is not None else None),
             )
@@ -367,6 +430,8 @@ def main() -> int:
             reason = getattr(exc, "reason", "unavailable")
             log.warning("edge companion unavailable (%s); falling back to console UI", reason)
             print(f"[edge companion unavailable: {reason}] {exc}")
+            if display_layer is not None:
+                display_layer.close()
         else:
             close_capabilities()
             return status

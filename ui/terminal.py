@@ -12,6 +12,7 @@ from config.permissions import PermissionLevel
 from core.constants import APP_NAME, APP_VERSION
 from core.events import EventBus
 from core.logging_setup import get_logger
+from personas import DEFAULT_PERSONA, format_status, load_persona, select_persona
 
 log = get_logger("ui")
 
@@ -38,6 +39,8 @@ class TerminalUI:
         bus.subscribe("tool", self._on_tool)
         bus.subscribe("status", self._on_status)
         bus.subscribe("task_done", self._on_task_done)
+        # Persona mode: "auto", "sage", "raphael", "off"
+        self._persona_mode: str = "auto"
 
     def _on_tool(self, data: dict) -> None:
         status = data.get("status")
@@ -72,6 +75,58 @@ class TerminalUI:
                 continue
             self._answer(command)
 
+    def _handle_persona_command(self, arg: str) -> None:
+        arg = arg.strip().lower()
+        valid_modes = ("sage", "raphael", "auto", "off")
+        if not arg:
+            self._console.print(f"Current persona mode: {self._persona_mode}")
+            self._console.print(f"Valid modes: {', '.join(valid_modes)}")
+            return
+        if arg not in valid_modes:
+            self._console.print(f"[red]Unknown persona mode: {arg}[/]")
+            self._console.print(f"Valid modes: {', '.join(valid_modes)}")
+            return
+        self._persona_mode = arg
+        self._console.print(f"[green]Persona mode set to: {arg}[/]")
+
+    def _determine_outcome(self) -> str:
+        """Determine the authoritative outcome from the agent's task state."""
+        task = getattr(self._agent, "_tasks", None)
+        if task is None:
+            return "unverified"
+        state = getattr(task, "state", None)
+        verification = getattr(task, "verification", None)
+        from core.task_manager import TaskState
+        from core.verification import VerificationState
+        if state is TaskState.COMPLETED:
+            if verification is VerificationState.PASSED:
+                return "completed"
+            return "unverified"
+        if state is TaskState.FAILED:
+            return "failed"
+        if state is TaskState.CANCELLED:
+            return "cancelled"
+        if state is TaskState.AWAITING_PERMISSION:
+            return "approval_required"
+        return "unverified"
+
+    def _apply_persona_formatting(self, reply: str, outcome: str) -> str:
+        if self._persona_mode == "off":
+            return reply
+        if self._persona_mode == "auto":
+            # Use selector on the original user input to detect explicit persona request
+            # This is a best-effort; if no alias matched, format_status will use DEFAULT_PERSONA
+            persona = select_persona("")
+        else:
+            try:
+                persona = load_persona(self._persona_mode)
+            except Exception:
+                return reply
+        try:
+            return format_status(persona, outcome, reply)
+        except Exception:
+            return reply
+
     def _answer(self, text: str) -> None:
         self._console.print(f"[bold]You:[/] {text}")
         try:
@@ -79,9 +134,11 @@ class TerminalUI:
         except Exception as exc:
             log.error("Agent response failed: %s", exc, exc_info=True)
             reply = f"Diablo hit an internal error: {exc}"
-        self._console.print(Text(f"{APP_NAME}: {reply}", style="bold bright_green"))
+        outcome = self._determine_outcome()
+        formatted_reply = self._apply_persona_formatting(reply, outcome)
+        self._console.print(Text(f"{APP_NAME}: {formatted_reply}", style="bold bright_green"))
         if self._voice_enabled:
-            self._speak(reply)
+            self._speak(formatted_reply)
 
     def _speak(self, reply: str) -> None:
         """Speak a reply, if TTS is genuinely available.
@@ -127,7 +184,7 @@ class TerminalUI:
 
     def _help_short(self) -> None:
         self._console.print(
-            "[dim]Type a message for Diablo, or a command: :model  :memory  :prefs  :projects  :wipe  :help  :quit[/]",
+            "[dim]Type a message for Diablo, or a command: :model  :memory  :prefs  :projects  :wipe  :help  :persona  :quit[/]",
         )
 
     def confirmer(self, tool: str, description: str) -> str:
@@ -158,6 +215,9 @@ class TerminalUI:
             return True
         if cmd == ":help":
             self._help_text()
+            return False
+        if cmd == ":persona":
+            self._handle_persona_command(rest.strip())
             return False
         if cmd in (":memory", ":mem"):
             store = getattr(self._agent, "_conversation", None)
@@ -246,6 +306,7 @@ class TerminalUI:
                     ":gitdiff   show uncommitted changes in the active project",
                     ":rules     show active restrict-only rules + conflicts",
                     ":why       explain the last permission decision",
+                    ":persona   set response style: sage, raphael, auto, off",
                     ":quit      exit Diablo",
                 ]
             )

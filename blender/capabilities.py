@@ -24,6 +24,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+from core.cancellation import cancellation_requested
 from core.logging_setup import get_logger
 
 from .errors import (
@@ -270,6 +271,12 @@ class BlenderCapabilityLayer:
                 },
             )
             token = self._cancel_token()
+            # Pre-flight cancellation check
+            if token is not None and cancellation_requested(token):
+                raise BlenderCancelledError(
+                    operation=operation,
+                    message="request cancelled before blender started",
+                )
             run_kwargs: dict = {"timeout": timeout or self.timeout,
                                 "scene_file": self.session_file}
             if token is not None and self._runner_accepts_cancellation():
@@ -556,9 +563,16 @@ class BlenderCapabilityLayer:
 
     # --------------------------------------------------------------- script
 
-    def execute_script(self, script: str) -> dict:
-        """Execute arbitrary Blender Python inside the session context."""
-        return self._run("execute_script", {"script": script})
+    def execute_script(self, script: str, _tool_context: Any = None, timeout: float | None = None) -> dict:
+        """Execute arbitrary Blender Python inside the session context.
+
+        Cancellation is supported via the ``_tool_context`` parameter which
+        carries a cancellation token. When cancellation is requested, the
+        Blender process is terminated (with a bounded kill fallback) and reaped.
+        """
+        token = getattr(_tool_context, "cancellation_token", None) if _tool_context else None
+        with self.cancellation_scope(token):
+            return self._run("execute_script", {"script": script}, timeout=timeout)
 
     # ---------------------------------------------------------- save / export
 

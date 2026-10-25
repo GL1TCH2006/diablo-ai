@@ -1,0 +1,90 @@
+================================================================================
+DIABLO OVERNIGHT TEST MATRIX
+================================================================================
+Timestamp: 2026-10-20
+Branch: reliability-batch-1, HEAD a74b53c
+================================================================================
+
+GROUP 1: Real-model autonomy (gated, real integration)
+--------------------------------------------------------------------------------
+Command:   DIABLO_REAL_MODEL_TESTS=1 .\.venv\Scripts\python.exe -m pytest -q
+           --no-header -p no:cacheprovider tests/test_m217_real_model_autonomy.py -v
+Model:     qwen3:8b (Ollama, tools capable)
+Start:     2026-10-20 (overnight session)
+Result:    3 passed, 0 failed, 0 skipped in 102.80s
+           PASS test_the_goal_completed_and_the_artifact_is_observed_independently
+           PASS test_the_run_stayed_within_its_tool_call_and_time_budgets
+           PASS test_a_goal_the_model_cannot_verify_does_not_report_completed
+Type:      REAL INTEGRATION (real model, real filesystem, real verification)
+Note:      Previously 2 passed, 1 failed (SHA-256 mismatch due to Windows
+           CRLF translation). Fixed by adding newline="" to write_text/read_text
+           calls in tools/filesystem.py and core/verification.py.
+
+GROUP 2: Filesystem verification and path resolution (deterministic, unit)
+--------------------------------------------------------------------------------
+Command:   .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_filesystem.py tests/test_workspace_path_resolution.py
+           tests/test_m217_filesystem_verification.py tests/test_m218_delete_containment.py
+Result:    63 passed, 3 skipped, 0 failed in 0.74s
+Type:      DETERMINISTIC / UNIT
+Note:      Workspace-relative path fix (newline="" also applied to read_file,
+           write_file, observe_file_content). No regressions.
+
+GROUP 3: Windows path edges (deterministic, unit)
+--------------------------------------------------------------------------------
+Command:   .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_m217_windows_path_edges.py
+Result:    28 passed, 3 skipped, 1 xfailed, 0 failed in 3.56s
+Type:      DETERMINISTIC / UNIT
+Note:      ADS test setup fixed (newline="" on open() call) to match exact-byte
+           verification. All other Windows path edge tests pass.
+
+GROUP 4: Companion worker lifecycle regression (deterministic, unit + stress)
+--------------------------------------------------------------------------------
+Command:   .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_companion_worker_regression.py tests/test_m216_ui_companion.py
+Result:    91 passed, 0 failed in 7.67s
+           Includes test_race_stress_200_iterations: 200 sequential runs,
+           all passed (worker death recovery, no stranded queue, no duplicate
+           workers, shutdown terminal).
+Type:      DETERMINISTIC / UNIT + STRESS
+
+GROUP 5: Agent / task store / task inspection / context (deterministic, unit)
+--------------------------------------------------------------------------------
+Command:   .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_agent.py tests/test_task_store.py tests/test_task_inspection.py
+           tests/test_context.py
+Result:    48 passed, 0 failed in 1.54s
+Type:      DETERMINISTIC / UNIT
+Note:      No regressions from newline change.
+
+GROUP 6: Permissions / terminal / memory rules (deterministic, unit)
+--------------------------------------------------------------------------------
+Command:   .\.venv\Scripts\python.exe -m pytest -q --no-header -p no:cacheprovider
+           tests/test_permissions.py tests/test_memory_rules.py
+           tests/test_memory_safety_and_rule_scope.py tests/test_terminal.py
+           tests/test_terminal_destructive_policy.py
+Result:    253 passed, 0 failed in 4.49s
+Type:      DETERMINISTIC / UNIT
+Note:      Permission containment, terminal policy, delete-before-unlink all
+           preserved.
+
+TOTALS
+--------------------------------------------------------------------------------
+Passed:    ~483
+Failed:    0
+Skipped:   6
+Xfailed:   1
+Duration:  ~122 seconds (real-model test ~103s of that)
+
+Real integration tests run: 1 group (real-model autonomy, 3 tests, all passed)
+Mock/unit tests run: 5 groups (~480 tests, all passed)
+
+NOT RUN:
+  - Real Windows UI Automation (no test application, deferred per audit)
+  - Real Blender execution (no Blender installation)
+  - Web search (stub, not part of this audit)
+
+================================================================================
+END OF TEST MATRIX
+================================================================================

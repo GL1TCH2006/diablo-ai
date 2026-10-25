@@ -54,6 +54,22 @@ class Settings:
     scratch_dir: Path = BASE_DIR / "workspace"
     sessions_dir: Path = BASE_DIR / "data" / "sessions"
     voice_enabled: bool = False
+    voice_stt_model: str = "base"
+    voice_stt_device: str = "auto"
+    voice_stt_compute_type: str = "int8"
+    voice_stt_model_path: str = ""
+    voice_wake_word_enabled: bool = False
+    voice_wake_word_type: str = "mock"
+    voice_wake_word_phrase: str = "diablo"
+    voice_vad_enabled: bool = True
+    voice_vad_method: str = "energy"
+    voice_vad_threshold: float = 0.01
+    voice_vad_silence_timeout: float = 2.0
+    voice_max_recording_duration: float = 30.0
+    voice_microphone_device: str = ""
+    voice_sample_rate: int = 16000
+    voice_output_dir: str = "voice_recordings"
+    voice_tts_interruptible: bool = True
     log_level: str = "INFO"
     max_turns: int = 4
     max_tool_calls: int = 32
@@ -103,6 +119,11 @@ class Settings:
     #: is *shown* - permissions, dispatch and verification are unaffected - so
     #: this exists as an escape hatch and a way to A/B the two behaviours.
     tools_full_context: bool = False
+    # Tool execution timeouts (seconds). 0 or negative disables timeout.
+    tool_terminal_timeout: float = 120.0
+    tool_python_timeout: float = 300.0
+    tool_blender_timeout: float = 600.0
+    tool_generic_timeout: float = 60.0
     git_push_policy: str = "blocked"
     git_restore_policy: str = "blocked"
     git_branch_policy: str = "blocked"
@@ -145,6 +166,22 @@ def load_settings() -> Settings:
         scratch_dir=BASE_DIR / "workspace",
         sessions_dir=sessions_dir,
         voice_enabled=_as_bool(env.get("VOICE_ENABLED"), _bool(toml, ["voice", "enabled"], False)),
+        voice_stt_model=_str(toml, ["voice", "stt_model"], "base"),
+        voice_stt_device=_str(toml, ["voice", "stt_device"], "auto"),
+        voice_stt_compute_type=_str(toml, ["voice", "stt_compute_type"], "int8"),
+        voice_stt_model_path=env.get("VOICE_STT_MODEL_PATH", _str(toml, ["voice", "stt_model_path"], "")),
+        voice_wake_word_enabled=_as_bool(env.get("VOICE_WAKE_WORD_ENABLED"), _bool(toml, ["voice", "wake_word_enabled"], False)),
+        voice_wake_word_type=_str(toml, ["voice", "wake_word_type"], "mock"),
+        voice_wake_word_phrase=_str(toml, ["voice", "wake_word_phrase"], "diablo"),
+        voice_vad_enabled=_as_bool(env.get("VOICE_VAD_ENABLED"), _bool(toml, ["voice", "vad_enabled"], True)),
+        voice_vad_method=_str(toml, ["voice", "vad_method"], "energy"),
+        voice_vad_threshold=_float(toml, ["voice", "vad_threshold"], 0.01),
+        voice_vad_silence_timeout=_float(toml, ["voice", "vad_silence_timeout"], 2.0),
+        voice_max_recording_duration=_float(toml, ["voice", "max_recording_duration"], 30.0),
+        voice_microphone_device=int(env.get("VOICE_MICROPHONE_DEVICE", _int(toml, ["voice", "microphone_device"], 0))),
+        voice_sample_rate=int(_int(toml, ["voice", "sample_rate"], 16000)),
+        voice_output_dir=_str(toml, ["voice", "output_dir"], "voice_recordings"),
+        voice_tts_interruptible=_as_bool(env.get("VOICE_TTS_INTERRUPTIBLE"), _bool(toml, ["voice", "tts_interruptible"], True)),
         log_level=env.get("LOG_LEVEL", _str(toml, ["logging", "level"], "INFO")).upper(),
         max_turns=int(_int(toml, ["agent", "max_turns"], 4)),
         max_tool_calls=int(_int(toml, ["agent", "max_tool_calls"], 32)),
@@ -163,6 +200,10 @@ def load_settings() -> Settings:
         app_known_paths=_dict(toml, ["apps", "known_paths"]),
         preferred_models=_list(toml, ["ollama", "preferred_models"]),
         max_result_chars=int(_int(toml, ["tools", "max_result_chars"], 8000)),
+        tool_terminal_timeout=_float(toml, ["tools", "terminal_timeout"], 120.0),
+        tool_python_timeout=_float(toml, ["tools", "python_timeout"], 300.0),
+        tool_blender_timeout=_float(toml, ["tools", "blender_timeout"], 600.0),
+        tool_generic_timeout=_float(toml, ["tools", "generic_tool_timeout"], 60.0),
         context_max_tokens=int(_int(toml, ["context", "max_tokens"], 8000)),
         context_relevant_files=int(_int(toml, ["context", "relevant_files"], 8)),
         context_excerpt_lines=int(_int(toml, ["context", "excerpt_lines"], 200)),
@@ -177,16 +218,6 @@ def load_settings() -> Settings:
         models_max_attempts_before_escalate=int(_int(toml, ["models", "max_attempts_before_escalate"], 1)),
         models_max_escalations=int(_int(toml, ["models", "max_escalations"], 1)),
         resource_check_enabled=_as_bool(env.get("RESOURCE_CHECK"), _bool(toml, ["resources", "check_enabled"], False)),
-        # M2.16.UI.1 fix. These two previously passed a *string* default through
-        # ``_str(...)``, and ``_as_bool`` returns its default unchanged when the env
-        # var is absent - so both settings were the truthy string "false".
-        #
-        # The consequence was not cosmetic: ``tools_full_context`` truthy made
-        # Agent._tool_context call ``select(full=True)`` on every turn, so the whole
-        # M2.13.0 tool-context selector was dead in production and the model was
-        # handed all 74 tools every turn. ``resource_check_enabled`` truthy turned
-        # the model resource guard permanently on. Both now take a real bool default,
-        # matching allow_remote_ollama and voice_enabled above.
         tools_full_context=_as_bool(env.get("TOOLS_FULL_CONTEXT"), _bool(toml, ["tools", "full_context"], False)),
         git_push_policy=_str(toml, ["git", "push"], "blocked"),
         git_restore_policy=_str(toml, ["git", "restore"], "blocked"),

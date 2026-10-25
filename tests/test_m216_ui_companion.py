@@ -16,6 +16,7 @@ deterministic instead of flaky on a loaded CI box.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -174,6 +175,40 @@ def _drive_to_listening(controller: CompanionController, clock: FakeClock) -> No
     controller.tick()
 
 
+#: How long a submission may take to settle before a test calls it stuck.
+#:
+#: Generous on purpose. The hand-off is a daemon-thread wake-up: sub-millisecond on
+#: a quiet machine, but seconds of delay when a full suite has hundreds of threads
+#: running. The previous fixed 5 s budget produced failures **only** inside the full
+#: cross-file run - this test passed 82/82 in isolation every time - which is a
+#: timing budget that was tuned to an idle machine, not a logic bug. The assertion
+#: is unchanged: the submission must settle. Only the deadline moved.
+#:
+#: ``ui/companion_state.wait_idle`` already polls rather than sleeping once; this
+#: helper re-arms it against a single overall deadline so the total wait is
+#: explicit and bounded.
+SETTLE_TIMEOUT = float(os.environ.get("DIABLO_COMPANION_SETTLE_TIMEOUT", "30"))
+_SETTLE_POLL = 0.05
+
+
+def _wait_settled(controller: CompanionController,
+                  timeout: float = SETTLE_TIMEOUT) -> bool:
+    """Poll until every submission has settled, or the deadline passes.
+
+    Returns False only if the deadline passed with work still outstanding, so the
+    caller's assertion keeps exactly its original strength.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if controller.wait_idle(0.25):
+            return True
+        if time.monotonic() >= deadline:
+            # One last look, so the result reflects the state at the deadline
+            # rather than the state a quarter-second earlier.
+            return controller.wait_idle(0.0)
+        time.sleep(_SETTLE_POLL)
+
+
 def _submit_and_settle(controller: CompanionController, text: str) -> str:
     """Submit and wait for the backend worker to finish with the turn.
 
@@ -182,7 +217,7 @@ def _submit_and_settle(controller: CompanionController, text: str) -> str:
     that only care about the state machine do not need this.
     """
     job = controller.submit_task(text)
-    assert controller.wait_idle(5.0), "backend submission never settled"
+    assert _wait_settled(controller), "backend submission never settled"
     return job
 
 
@@ -478,7 +513,7 @@ class TestTaskSubmission:
         controller, _, clock = _make_controller(bridge)
         _drive_to_listening(controller, clock)
         controller.submit_task("delete everything")
-        assert controller.wait_idle(5.0)
+        assert _wait_settled(controller)
         assert controller.state is CompanionState.ERROR
         assert "permission denied" in controller.snapshot().terminal_message
 
@@ -779,7 +814,7 @@ class TestSubmissionThreading:
             assert controller.wait_idle(0.3) is False, (
                 "wait_idle reported idle while the backend was still blocked")
             gate.set()
-            assert controller.wait_idle(5.0)
+            assert _wait_settled(controller)
         finally:
             gate.set()
             controller.close()
@@ -810,7 +845,7 @@ class TestSubmissionThreading:
                 controller.retract()
                 _drive_to_listening(controller, clock)
                 controller.submit_task("task")
-            assert controller.wait_idle(5.0)
+            assert _wait_settled(controller)
             workers = [t for t in threading.enumerate()
                        if t.name == CompanionController.WORKER_NAME]
             assert len(workers) == 1, f"{len(workers)} submission workers exist"
@@ -821,7 +856,7 @@ class TestSubmissionThreading:
         controller, _, clock = _make_controller()
         _drive_to_listening(controller, clock)
         controller.submit_task("task")
-        assert controller.wait_idle(5.0)
+        assert _wait_settled(controller)
         assert controller.worker_alive is True
         controller.close()
         assert controller.worker_alive is False
@@ -877,7 +912,7 @@ class TestSubmissionThreading:
         try:
             _drive_to_listening(controller, clock)
             controller.submit_task("task")
-            assert controller.wait_idle(5.0), "inflight was never released"
+            assert _wait_settled(controller), "inflight was never released"
 
             # The next submission must work regardless of whether the worker survived.
             controller.retract()

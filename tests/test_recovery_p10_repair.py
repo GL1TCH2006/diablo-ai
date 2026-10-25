@@ -149,6 +149,67 @@ def _run_pytest(project: Path) -> subprocess.CompletedProcess:
         capture_output=True, text=True, timeout=300, cwd=str(project))
 
 
+# ── Batch 6 Task 4b: guaranteed cleanup of nested pytest children ─────────────
+# This module runs pytest as a SUBPROCESS (see _run_pytest and the direct
+# subprocess.run calls in TestVerifierIsNotFooledByAStaleBytecodeCache). On
+# 2026-10-18 an audit showed those nested ``-m pytest`` processes outliving the
+# chunk that spawned them: ``taskkill /T`` cannot reach a grandchild whose own
+# parent has already exited, so seven separate chunk timeouts each left one
+# behind. Batch 4 froze for ten hours on exactly this shape.
+#
+# The fixture below records every process this module spawns and force-kills
+# whatever is still alive on teardown, then ASSERTS none survived. It changes no
+# assertion and no production code - it wraps subprocess.Popen exactly as the
+# module's own helpers already use subprocess, and monkeypatch restores it.
+def _force_kill_tree(pid: int) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    import os as _os
+    if _os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return True
+    import signal as _signal
+    try:
+        _os.kill(pid, _signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _reap_nested_pytest(monkeypatch):
+    """Every nested pytest this module starts is reaped before the test ends."""
+    import time as _time
+
+    real_popen = subprocess.Popen
+    created: list = []
+
+    def factory(cmd, *args, **kwargs):
+        proc = real_popen(cmd, *args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", factory)
+    try:
+        yield created
+    finally:
+        leaked = [p for p in created if p.poll() is None]
+        for proc in leaked:
+            _force_kill_tree(proc.pid)
+        deadline = _time.monotonic() + 15.0
+        for proc in created:
+            while proc.poll() is None and _time.monotonic() < deadline:
+                _time.sleep(0.05)
+        still = [p.pid for p in created if p.poll() is None]
+        assert not still, (
+            f"nested subprocesses outlived the test: {still}. These would have "
+            f"been orphaned into the rest of the run.")
+
+
 def _agent(settings, project: Path, responses, events: list | None = None,
            confirmer=None, catalog=None):
     prefs = PreferencesStore(settings.memory_dir)

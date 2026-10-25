@@ -1,0 +1,188 @@
+DIABLO VOICE READINESS REPORT
+==============================
+
+Generated: 2025-10-21
+Project: diablo-ai
+Branch: reliability-batch-1
+HEAD: a74b53c
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+Voice capabilities in Diablo are PARTIALLY IMPLEMENTED. Only Text-to-Speech (Windows SAPI)
+is functional. Speech-to-Text, Wake Word detection, Voice Activity Detection, and Barge-in
+are NOT IMPLEMENTED and are scheduled for Phase 6 per the project roadmap.
+
+================================================================================
+CAPABILITY MATRIX
+================================================================================
+
+| Component | State | Implementation Details |
+|-----------|-------|------------------------|
+| Text-to-Speech (SAPI) | ✅ IMPLEMENTED | voice/tts.py uses Windows SAPI via comtypes. Works, off by default (VOICE_ENABLED=false) |
+| Speech-to-Text | ❌ NOT IMPLEMENTED | voice/stt.py - every backend raises SpeechToTextUnavailable |
+| Wake Word Detection | ❌ NOT IMPLEMENTED (Audio) | voice/wake_word.py - prefix match over text only, no microphone capture |
+| Voice Activity Detection | ❌ NOT IMPLEMENTED | No VAD implementation |
+| Barge-In | ❌ NOT IMPLEMENTED | TTS playback cannot be interrupted; no microphone for STOP command |
+| Voice Cancellation | ✅ IMPLEMENTED | voice/cancellation.py - cancellation token propagation for voice commands |
+
+================================================================================
+DETAILED FINDINGS
+================================================================================
+
+### 1. Text-to-Speech (SAPI) - WORKING
+**File**: voice/tts.py
+**Status**: Implemented and tested
+**Details**:
+- Uses Windows SAPI via comtypes
+- speak() method queues utterances
+- stop() method cancels current speech
+- Integrated with edge companion via --edge-speak flag
+- Test: test_voice_interruption.py (33 passed)
+
+### 2. Speech-to-Text - NOT IMPLEMENTED
+**File**: voice/stt.py
+**Status**: Stub only
+**Details**:
+- All backends raise SpeechToTextUnavailable
+- No microphone capture implemented
+- No audio processing pipeline
+- No local STT model integration (faster-whisper, etc.)
+
+### 3. Wake Word Detection - NOT IMPLEMENTED (Audio)
+**File**: voice/wake_word.py
+**Status**: Text-based prefix match only
+**Details**:
+- wake_word_match() does prefix matching on text input
+- No audio capture or real-time audio processing
+- Not a true wake word detector - requires text input first
+
+### 4. Voice Activity Detection - NOT IMPLEMENTED
+**Status**: No implementation
+**Details**:
+- No VAD module exists
+- No voice activity detection for speech endpointing
+
+### 5. Barge-In - NOT IMPLEMENTED
+**Status**: No implementation
+**Details**:
+- TTS playback (SAPI) cannot be programmatically stopped mid-utterance
+- No microphone to receive voice commands during playback
+- Voice cancellation exists but requires text input (not voice)
+
+### 6. Voice Cancellation - IMPLEMENTED
+**File**: voice/cancellation.py
+**Status**: Implemented
+**Details**:
+- CancellationToken propagation for voice commands
+- Integrates with agent cancellation system
+- Test: test_voice_interruption.py passes
+
+================================================================================
+ARCHITECTURE ASSESSMENT
+================================================================================
+
+Current voice architecture (voice/capabilities.py) honestly reports:
+- TTS: "implemented", works, off by default
+- STT: "not implemented - every backend raises SpeechToTextUnavailable"
+- Wake word: "not implemented as audio - a prefix match over text that already exists, not a microphone"
+- Barge-in: "not implemented - no microphone, and playing audio cannot be stopped"
+- Task cancellation: "implemented and real"
+
+No voice.* capability is registered with the model, so nothing model-facing claims speech exists.
+
+================================================================================
+FEASIBILITY ANALYSIS FOR LOCAL STT
+================================================================================
+
+### Python Compatibility
+- Python 3.11+ (developed on 3.14) - compatible with faster-whisper
+- Requires: torch, transformers, faster-whisper
+
+### Windows Compatibility
+- faster-whisper supports Windows via CTranslate2
+- Requires CUDA for GPU acceleration or CPU fallback
+- Windows audio capture: pyaudio, sounddevice, or Windows WASAPI
+
+### Resource Requirements
+| Model | VRAM (GPU) | RAM (CPU) | Disk |
+|-------|------------|-----------|------|
+| tiny | ~1 GB | ~1 GB | ~75 MB |
+| base | ~1 GB | ~1 GB | ~150 MB |
+| small | ~2 GB | ~2 GB | ~500 MB |
+| medium | ~5 GB | ~5 GB | ~1.5 GB |
+| large-v3 | ~10 GB | ~10 GB | ~3 GB |
+
+### Dependency Constraints
+- Current requirements.txt: rich, httpx, Pillow, numpy, matplotlib, pywin32, comtypes
+- Adding faster-whisper would require: torch, transformers, faster-whisper, ctranslate2
+- No system Python replacement needed
+- Can use existing .venv
+
+### Integration Points
+1. Voice/capabilities.py - would need to register STT capability
+2. Voice/stt.py - implement actual backends
+3. Voice/wake_word.py - implement audio-based wake word (porcupine, etc.)
+4. UI/companion - add microphone activation button
+5. Agent - integrate voice commands through existing cancellation system
+
+================================================================================
+RECOMMENDED IMPLEMENTATION APPROACH
+================================================================================
+
+If implementing local STT (Phase 6):
+
+1. **Use faster-whisper** for local STT:
+   - CPU and GPU support
+   - Good accuracy/speed tradeoff
+   - No cloud dependency
+
+2. **Use pvporcupine** for wake word:
+   - Lightweight, efficient
+   - Requires access key (free tier available)
+   - Cross-platform
+
+3. **Use sounddevice or pyaudio** for microphone capture:
+   - sounddevice: simpler API, good Windows support
+   - pyaudio: more mature, lower latency
+
+4. **Implement with explicit user control**:
+   - Microphone activation via UI button (not always-on)
+   - Bounded recording duration
+   - Clear visual indicator when recording
+   - No persistent audio retention
+
+5. **Integration with existing architecture**:
+   - Voice commands route through existing cancellation system
+   - STT results treated as text input to agent
+   - No changes to agent core needed
+
+================================================================================
+BLOCKERS AND RISKS
+================================================================================
+
+| Blocker | Severity | Mitigation |
+|---------|----------|------------|
+| No microphone capture | High | Add sounddevice dependency |
+| No STT model | High | Add faster-whisper, download model |
+| No wake word audio | Medium | Add pvporcupine or similar |
+| TTS cannot be interrupted | Medium | SAPI limitation; would need alternative TTS |
+| No VAD | Medium | Implement simple energy-based VAD |
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Voice readiness: **NOT READY FOR PRODUCTION VOICE USE**
+
+Only TTS works. STT, Wake Word, VAD, and Barge-in require significant implementation
+work (estimated 2-3 weeks for basic local STT + wake word). This aligns with the
+project roadmap placing voice development in Phase 6.
+
+No compatibility blockers for local STT implementation - Python 3.14, Windows, and
+existing dependencies are compatible with faster-whisper and pvporcupine.
+
+================================================================================
+END OF REPORT
+================================================================================

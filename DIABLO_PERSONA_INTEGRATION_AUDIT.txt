@@ -1,0 +1,464 @@
+================================================================================
+DIABLO PERSONA INTEGRATION AUDIT
+================================================================================
+Timestamp: 2026-10-20
+Branch: reliability-batch-1
+HEAD: a74b53c
+Repository: C:\PROJECTS\jarvis like ai for my computer\diablo-ai
+================================================================================
+
+SECTION A: BASELINE AND REPOSITORY STATE
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c
+Working tree: dirty (24 modified, 20 untracked)
+Stashes: none
+
+Modified (pre-existing, preserved):
+  .gitignore, README.md, config/default_config.toml,
+  core/knowledge_graph.py, core/knowledge_ingest.py,
+  core/verification.py, core/verification_ledger.py,
+  docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt,
+  docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, main.py,
+  tests/m217_restart_child.py, tests/test_applications.py,
+  tests/test_knowledge_ingest.py, tests/test_m213_coding_workflow.py,
+  tests/test_m216_ui_companion.py, tests/test_m217_autonomy_integration.py,
+  tests/test_recovery_p10_repair.py, tests/test_s2_9_hardening.py,
+  tests/test_terminal_state_invariant.py, tools/__init__.py,
+  tools/applications.py, tools/filesystem.py,
+  ui/companion_state.py, ui/edge_companion.py
+
+Untracked (pre-existing, preserved):
+  AGENTS.md, DIABLO_COMPLETE_AUDIT_REPORT.txt,
+  DIABLO_OVERNIGHT_RELIABILITY_REPORT.txt,
+  DIABLO_OVERNIGHT_TEST_MATRIX.txt, data/, personas/, scripts/,
+  tests/test_companion_worker_regression.py,
+  tests/test_edge_companion_speech_probe.py,
+  tests/test_filesystem_delete_verification.py,
+  tests/test_m217_filesystem_verification.py,
+  tests/test_m217_real_model_autonomy.py,
+  tests/test_m217_windows_path_edges.py,
+  tests/test_m218_delete_containment.py,
+  tests/test_main_ui_entrypoints.py,
+  tests/test_orb_completed_strictness.py,
+  tests/test_orb_renderer.py, tests/test_orb_renderer_batch6.py,
+  tests/test_orb_state_map.py, tests/test_personas.py,
+  tests/test_workspace_path_resolution.py, ui/orb/
+
+================================================================================
+
+SECTION B: PRODUCTION REPLY FLOW — EXACT CALL GRAPH
+================================================================================
+
+1. APPLICATION ENTRY POINTS
+----------------------------
+Terminal UI: ui/terminal.py → TerminalUI._answer() → Agent.respond()
+Edge Companion: ui/edge_companion.py → EdgeCompanionApp._on_submit() → CompanionController.submit_task() → bridge.submit_message() → Agent.respond()
+
+2. USER MESSAGE → AGENT EXECUTION PATH
+---------------------------------------
+Agent.respond(user_input)
+  └─ _respond(user_input)
+      ├─ _begin_request_context()          # Fresh RequestContext per turn
+      ├─ _tasks.begin_task(user_input)     # Creates TaskRecord
+      ├─ _capture_plan_goal(user_input)    # Stores pending goal
+      ├─ _create_run_record()              # Persists TaskRecord
+      ├─ _planner.matches_greeting()       # Fast path
+      │   └─ greet_response() → GREETING   # "Hello. Diablo is online."
+      ├─ _planner.fast_intent()            # Desktop intent (open_app, etc.)
+      │   └─ _run_intent() → intent-specific reply
+      └─ _llm_loop()                       # Full LLM planning + execution
+          ├─ build_system_prompt()         # Core system prompt
+          ├─ _reference_sections()         # Memory, rules, project context
+          ├─ _messages (conversation)      # Prior turns
+          ├─ _select_model()               # Model router
+          ├─ _chat_with_fallback()         # Provider call with fallback
+          ├─ ExecutionPlan.from_tool_calls()  # Plan from tool calls
+          ├─ _desktop_mismatch_correction()   # Wrong-tool recovery
+          ├─ _begin_plan()                 # Persist plan
+          ├─ _execute_step() → _executor.execute() → ToolRegistry → ToolSpec.fn()
+          ├─ _record_verification()        # VerificationLedger
+          └─ Returns reply text (str)
+
+3. SYSTEM PROMPT ASSEMBLY
+--------------------------
+build_system_prompt(model_label, project, workspace_root) → str
+  Returns: system prompt text (core/constants.py, core/context.py)
+  Includes: model identity, project context, workspace root, tool descriptions
+  Persona influence: NONE (personas not wired into agent)
+
+4. MODEL SELECTION
+-------------------
+_select_model(user_input) → core/agent.py
+  Uses ModelRouter (ai/model_router.py) with catalog, mode (fast/strong), fallbacks
+  Persona influence: NONE
+
+5. FINAL ASSISTANT RESPONSE PRODUCTION
+----------------------------------------
+Returns from _llm_loop(), _run_intent(), greet_response(), or intent handlers
+All return plain str → TerminalUI._answer() prints: "DIABLO: {reply}"
+Edge Companion: reply goes through bridge → CompanionController → UI snapshot
+
+6. INTERACTION WITH SAFETY SYSTEMS
+-----------------------------------
+- Permissions: PermissionManager.evaluate() before tool dispatch (config/permissions.py)
+- Verification: _record_verification() → VerificationLedger.adjudicate() (core/verification_ledger.py)
+- Cancellation: CancellationToken checked in _llm_loop(), _execute_step()
+- Memory: _reference_sections() includes conversation, rules, project memory
+- Tool permissions: ToolSpec.level, ToolSpec.level_for() evaluated per call
+- None of these import or reference personas
+
+7. PERSONA CANNOT OVERRIDE SAFETY
+---------------------------------
+- No import of personas in config/permissions.py (proven by test_personas.py:332-341)
+- No import of personas in core/executor.py or core/verification_ledger.py
+- Persona module is strictly presentation data with fail-closed loader
+
+================================================================================
+
+SECTION C: PERSONA MODULES AUDIT
+================================================================================
+
+FILE: personas/raphael.py
+--------------------------
+Canonical name: "raphael"
+Description: "Formal and precise. States the verification status of a result before its substance, names confidence and residual risk explicitly, and never implies certainty it does not have."
+Aliases: ["raphael", "rafi", "raf", "the formal one", "precise"]
+Replies: Mapping for all 5 OUTCOMES (completed, failed, unverified, approval_required, cancelled)
+  Templates include: {details}, {detail}, {risk}, {confidence}, {outcome_label}
+  Completed: "Completed and independently verified. {details} Confidence: {confidence}. Residual risk: {risk}."
+  Failed: "This did not complete. {details} I am reporting the failure rather than a partial result. Residual risk: {risk}."
+  Unverified: "This finished, but it was not independently verified, so I am not calling it a success. {details} Confidence: {confidence}. Residual risk: {risk}."
+  Approval_required: "I am holding. {details} Your decision is required before I proceed; nothing has been changed yet. Residual risk: {risk}."
+  Cancelled: "Stopped on your instruction. {details} Nothing further was attempted. Residual risk: {risk}."
+Orb palette: "gold"
+Voice: enabled_by_default=False, rate=-1, pitch=0, voice_hint="Prefer a measured delivery..."
+Risk policy: always_state_risk=True, confidence_wording="explicit"
+
+FILE: personas/sage.py
+-----------------------
+Canonical name: "sage"
+Description: "Plain and minimal. Says what happened in as few words as will be accurate, names the risk once, and adds nothing that is not asked."
+Aliases: ["sage", "sol", "sag", "the quiet one", "minimal", "plain"]
+Replies: Same 5 OUTCOMES, shorter phrasing
+  Completed: "Done and verified. {details} Confidence: {confidence}. Risk: {risk}."
+  Failed: "Failed. {details} Risk: {risk}."
+  Unverified: "Finished, not verified. {details} Confidence: {confidence}. Risk: {risk}."
+  Approval_required: "Waiting on you. {details} Nothing changed yet. Risk: {risk}."
+  Cancelled: "Stopped. {details} Risk: {risk}."
+Orb palette: "dull_gold"
+Voice: enabled_by_default=False, rate=-1, pitch=0, voice_hint="Plain, unhurried delivery."
+Risk policy: always_state_risk=True, confidence_wording="explicit"
+
+LOADER: personas/loader.py
+---------------------------
+Purpose: Strict loading and validation. Fail closed.
+Key constants:
+  OUTCOMES = ("completed", "failed", "unverified", "approval_required", "cancelled")
+  COMPLETED_REQUIRES_VERIFIED = "completed"
+  DEFAULT_PERSONA = "sage"
+
+Validation rules (fail closed):
+- persona: required non-empty string
+- description: required non-empty string
+- orb_palette_key: must exist in ui.orb.PALETTES
+- replies: must cover ALL 5 OUTCOMES, each non-empty string
+- aliases: list of non-empty strings, case-insensitive, no reserved words
+- voice/risk_policy: optional mappings, unknown keys tolerated
+- Unknown outcome in format_status() → falls back to "unverified" (never success)
+
+Caching: _cache dict, failures stay failed (no retry-by-accident)
+Alias index: deterministic (sorted by name, longest alias first)
+Select_persona(): Matches aliases on word boundaries, leading wake words stripped
+
+SELECTOR: Not a separate file; select_persona() in loader.py
+  Resolution order:
+  1. Alias as whole word sequence in text (longest first)
+  2. Alias equals normalized text
+  3. DEFAULT_PERSONA ("sage")
+
+FORMAT_STATUS: loader.py:291-332
+  - Normalizes outcome, falls back to "unverified" for unknown
+  - Truncates details to 400 chars
+  - Substitutes {details}, {detail}, {risk}, {confidence}, {outcome_label}
+  - confidence="high" for completed/failed, else "low"
+  - risk="none observed" for completed, else "as described above"
+
+CURRENT USAGE
+--------------
+- Not imported by Agent, Executor, TerminalUI, EdgeCompanion, main.py
+- Only imported in tests/test_personas.py and personas/__init__.py demo
+- personas/__init__.py docstring explicitly states: "It is **not wired into the agent**"
+
+TESTS: tests/test_personas.py
+------------------------------
+Key tests proving isolation:
+- test_a_persona_cannot_change_any_permission_decision(): runs PermissionManager under both personas → identical decisions
+- test_persona_loading_does_not_import_into_the_permission_layer(): config/permissions.py source contains no "personas"
+- test_formatting_a_status_touches_no_permission_state(): format_status() has no side effects on PermissionManager
+
+CONFLICTS / DUPLICATION
+------------------------
+- No policy duplication: both define tone only, no tool policies, no permissions
+- Aliases are unique across personas (test_personas.py:214-221)
+- No hard-coded names elsewhere
+- No configuration outside the module
+- No API for selecting persona in production code
+
+MALFORMED / MISSING HANDLING
+-----------------------------
+- load_persona() raises PersonaError on any validation failure
+- load_all() skips failed personas, does NOT promote them to default
+- load_persona() caches failures (no retry-by-accident)
+- format_status() falls back to "unverified" for unknown outcomes
+- select_persona() falls back to DEFAULT_PERSONA on no match
+
+================================================================================
+
+SECTION D: THREE DESIGN OPTIONS COMPARED
+================================================================================
+
+DESIGN A: PERSONAS REMAIN UNUSED REFERENCE PROFILES
+----------------------------------------------------
+Implementation: None (current state)
+Backward compatibility: Perfect (no change)
+User experience: None (no persona influence)
+Configuration: None
+Test requirements: None beyond existing
+Safety risk: Zero (proven by test_personas.py)
+Breaking risk: Zero
+Disable/replace: N/A
+
+DESIGN B: OPT-IN PRESENTATION STYLES (RECOMMENDED)
+---------------------------------------------------
+Implementation scope:
+1. Add optional persona selection to TerminalUI._answer() and EdgeCompanion bridge
+2. Resolve persona once per request: select_persona(user_input) or explicit config
+3. Pass persona to Agent.respond() or format reply after Agent returns
+4. Apply format_status(persona, outcome, details) to final reply text
+5. Map persona.orb_palette_key in ui/orb/state_map.py
+5. Add optional config: config.default_config.toml → persona = "sage" | "raphael" | "auto"
+6. Add :persona command to TerminalUI for runtime switching
+
+Backward compatibility: Full (default behavior unchanged unless explicitly configured)
+User experience: Opt-in; user types "raphael, do X" or sets config; neutral default ("sage")
+Configuration: Optional TOML setting; runtime command; word-boundary alias matching
+Test requirements:
+- Neutral default renders correctly
+- Explicit alias in request selects persona
+- Unknown persona → default (fail closed)
+- Malformed persona → error, not silent fallback
+- Tool calls, permissions, verification unchanged
+- :persona command works and persists per session
+
+Safety risk: LOW — persona only wraps final reply text; all safety boundaries remain in Agent/Executor/Verifier
+Breaking risk: LOW — only affects final string rendering
+Disable/replace: Trivial — set default="sage" or disable feature flag
+
+DESIGN C: SINGLE CANONICAL DEFAULT PERSONA INTEGRATED
+------------------------------------------------------
+Implementation: Same as B but default persona always applied
+Backward compatibility: Partial — changes default reply wording for all users
+User experience: All users get persona wording by default
+Configuration: Required to disable
+Test requirements: Same as B plus default behavior tests
+Safety risk: LOW (same boundaries) but harder to audit "always on"
+Breaking risk: LOW but user-visible change by default
+Disable/replace: Requires config flag
+
+================================================================================
+
+SECTION E: RECOMMENDED DESIGN — OPT-IN PRESENTATION STYLES (B)
+================================================================================
+
+RATIONALE
+----------
+1. Personas are explicitly documented as "presentation only" and "not wired into the agent"
+2. The loader/selector already exists with fail-closed validation
+3. Design B respects the documented architecture: personas are opt-in styling, not authority
+4. DEFAULT_PERSONA = "sage" is already the documented default (loader.py:69)
+5. Design B keeps the safety invariant: core policy, task instructions, and presentation remain separate
+6. Design A wastes working code; Design C forces a choice the docs say is undecided
+7. Test_personas.py already proves isolation; Design B extends that to runtime without crossing boundaries
+
+IMPLEMENTATION SCOPE (SMALLEST EFFECTIVE CHANGE)
+-------------------------------------------------
+
+Files to change (minimal set):
+1. core/agent.py: Add optional persona parameter to _respond() and _llm_loop() — OR wrap reply at the end of _respond()
+   Recommendation: Wrap at end of _respond() — keeps Agent unaware of personas, only TerminalUI/Companion know
+
+2. ui/terminal.py: TerminalUI._answer()
+   - Resolve persona: persona = select_persona(text)  # from user input aliases
+   - After Agent.respond(): reply = format_status(persona, outcome, details)
+   - Need to determine "outcome" from task state (verification, task status)
+
+3. ui/edge_companion.py: EdgeCompanionApp._on_submit() or bridge
+   - Resolve persona from user input
+   - Pass persona to bridge → format_status on reply
+
+4. config/default_config.toml: Add optional [persona] section
+   default = "sage"  # or "auto" for alias-matching from request
+
+5. ui/orb/state_map.py: Map persona.orb_palette_key → PALETTES for visual state
+
+SAFETY BOUNDARIES (MUST PRESERVE)
+---------------------------------
+✓ Persona never imported in config/permissions.py, core/executor.py, core/verification_ledger.py
+✓ Persona only wraps final reply text via format_status()
+✓ format_status() outcome must come from TaskState/VerificationState, never from persona
+✓ format_status() falls back to "unverified" for unknown outcomes
+✓ select_persona() falls back to DEFAULT_PERSONA ("sage") on no match
+✓ Persona never grants tool access, bypasses approval, suppresses failures
+✓ Persona templates never say "completed" for unverified outcomes (loader enforces this)
+✓ Persona cannot inject unbounded content (details truncated to 400 chars)
+✓ User explicit instructions always take precedence (persona is presentation only)
+
+PROPOSED CONFIGURATION / API
+-----------------------------
+config/default_config.toml:
+  [persona]
+  # "auto" = match aliases from user input; "sage" | "raphael" = force; "none" = disable
+  default = "auto"
+
+Terminal command:
+  :persona sage        # set session persona
+  :persona raphael
+  :persona auto        # resume alias matching
+  :persona off         # disable, use raw agent reply
+
+API for caller:
+  from personas import select_persona, format_status
+  persona = select_persona(user_text)  # or explicit name
+  outcome = task.verification.value  # "completed", "failed", "unverified", etc.
+  details = task.progress_summary
+  reply = format_status(persona, outcome, details)
+
+================================================================================
+
+SECTION F: TEST PLAN
+================================================================================
+
+EXISTING TESTS TO PRESERVE
+---------------------------
+- All tests in tests/test_personas.py (37 tests covering loader, selector, formatting, isolation)
+- All existing Agent, TerminalUI, EdgeCompanion tests
+
+NEW TESTS REQUIRED
+-------------------
+
+1. NEUTRAL DEFAULT BEHAVIOR
+   - TerminalUI with config persona="sage" → reply uses sage wording
+   - TerminalUI with config persona="none" → reply uses raw agent text
+   - EdgeCompanion with no persona → raw agent text
+
+2. EXPLICIT PERSONA SELECTION
+   - User types "raphael, status" → reply uses raphael templates
+   - User types "sol, do X" → reply uses sage templates
+   - Alias matching on word boundaries (not substrings)
+
+3. UNKNOWN / MALFORMED PERSONA HANDLING
+   - Unknown alias in request → falls back to DEFAULT_PERSONA
+   - Missing persona file → error logged, default used
+   - Malformed persona module → loader refuses, default used
+
+4. PERSONA PERSISTENCE (if session persistence proposed)
+   - :persona raphael persists for session
+   - :persona auto resumes alias matching
+   - :persona off disables formatting
+
+5. TOOL-CALL BEHAVIOR UNCHANGED
+   - Permission decisions identical under all personas (extend existing test)
+   - Verification outcomes identical
+   - Cancellation behavior identical
+
+6. PERMISSION AND APPROVAL POLICIES UNCHANGED
+   - Run permission cases under each persona → identical decisions
+   - Approval prompts unchanged
+
+7. TASK VERIFICATION AND HONEST FAILURE REPORTING
+   - "completed" only rendered when verification == PASSED
+   - "unverified" rendered when verification != PASSED
+   - Unknown outcome → "unverified" wording
+
+8. USER INSTRUCTIONS TAKE PRECEDENCE
+   - Persona never overrides explicit user command
+   - Task outcome determined by Agent, not persona
+
+9. REGRESSION OF EXISTING AGENT/PROMPT TESTS
+   - All existing Agent tests pass
+   - All TerminalUI tests pass
+   - All EdgeCompanion tests pass
+
+IMPLEMENTATION TEST COMMAND
+---------------------------
+  .\.venv\Scripts\python.exe -m pytest -q tests/test_personas.py
+  .\.venv\Scripts\python.exe -m pytest -q tests/test_terminal.py
+  .\.venv\Scripts\python.exe -m pytest -q tests/test_m216_ui_companion.py
+  .\.venv\Scripts\python.exe -m pytest -q tests/test_agent.py
+
+================================================================================
+
+SECTION G: FILES THAT WOULD NEED TO CHANGE (IF AUTHORIZED)
+================================================================================
+
+1. core/agent.py: +1 optional persona parameter to _respond() or wrap at end of _respond()
+2. ui/terminal.py: TerminalUI._answer() — resolve persona, format reply
+3. ui/edge_companion.py: EdgeCompanionApp — resolve persona, format reply, map orb palette
+4. config/default_config.toml: Add [persona] section
+5. ui/orb/state_map.py: Map persona.orb_palette_key → PALETTES
+6. docs: Update AGENTS.md or add persona docs
+
+Files that MUST NOT change:
+- config/permissions.py
+- core/executor.py
+- core/verification_ledger.py
+- core/task_manager.py
+- Any file in core/ that enforces safety boundaries
+
+================================================================================
+
+SECTION H: UNRESOLVED QUESTIONS REQUIRING HUMAN DECISION
+================================================================================
+
+1. CANONICAL NAMES: Are "raphael" and "sage" the final names, or should they be
+   more descriptive (e.g., "formal" / "minimal")? Aliases allow both.
+
+2. ALIAS MATCHING SCOPE: Currently matches whole-word sequences anywhere in text.
+   Should it only match at start of message? (Current: "raphael, run tests" works;
+   "run tests raphael" also works.)
+
+3. DEFAULT PERSONA: loader.py sets DEFAULT_PERSONA = "sage". Should this be
+   configurable, or is "sage" the permanent neutral default?
+
+4. SESSION PERSISTENCE: Should :persona selection persist across restarts?
+   (Currently no persistence; would require config write.)
+
+5. VOICE INTEGRATION: voice.enabled_by_default=False in both personas.
+   If TTS is enabled, should voice hints be applied? (Currently not wired.)
+
+6. ORB PALETTE MAPPING: Both personas define orb_palette_key ("gold", "dull_gold").
+   Requires ui/orb/state_map.py changes to apply.
+
+7. CONFIGURATION PRECEDENCE: Config file default vs. runtime :persona command
+   vs. alias in request. Proposed: alias in request > :persona > config > DEFAULT_PERSONA.
+
+8. MULTI-WORD ALIASES: "the formal one" is currently allowed. Keep or restrict?
+
+================================================================================
+
+SECTION I: FINAL GIT STATE
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c
+Working tree: dirty (pre-existing modifications + 3 overnight fix files)
+No commits, resets, cleans, stashes, pushes, rebases, merges, or branch changes.
+All user changes preserved.
+No new dependencies added.
+
+================================================================================
+
+END OF AUDIT
+================================================================================

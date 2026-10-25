@@ -316,3 +316,78 @@ class TestMultipleProjects:
         # Project 1 nodes should not be in project 2
         assert g2.get_node(canonical_file_key(g2.project_id, "src/a.py")) is None
         assert g1.get_node(canonical_file_key(g1.project_id, "src/b.py")) is None
+
+class TestIngestContainmentGate:
+    """The per-file containment gate, pinned on both sides of ``settings``.
+
+    Containment here is FAIL CLOSED. With ``settings=None`` there is no
+    allowed-roots set, so there is nothing to check a path against, and "could
+    not check" is not permission: every file is refused.
+
+    The gate used to be written as ``if not _is_within_allowed(...) if settings
+    else True:``, which Python parses as ``(not _is_within_allowed) if settings
+    else True``. That also skipped everything when settings was absent, but for
+    the wrong reason and by accident - the ``else True`` was a parsing accident,
+    not a policy, and nothing documented that it was deliberate. It is now an
+    explicit ``(settings is None) or (not _is_within_allowed(...))`` so the
+    intent is stated rather than inferred from operator precedence.
+
+    Both branches are asserted here so neither can drift again.
+    """
+
+    def test_without_settings_files_are_skipped(self, graph: KnowledgeGraph,
+                                                temp_project: Path):
+        """No policy means no admission: a missing config never widens access."""
+        stats = ingest_project_structure(graph, temp_project, "no-settings", None)
+
+        assert stats["files"] == 0, (
+            f"files were ingested with no containment policy in force: {stats}")
+        assert stats["skipped_files"] >= 4, (
+            f"fail-closed did not refuse the files it should have: {stats}")
+        assert graph.get_node(canonical_file_key(graph.project_id, "src/main.py")) is None, (
+            "src/main.py reached the graph without a containment policy")
+        # Directories are still discovered: only file admission is gated.
+        assert stats["directories"] >= 2, (
+            f"the walk stopped entirely instead of refusing each file: {stats}")
+
+    def test_with_settings_files_outside_the_allowed_roots_are_still_skipped(
+            self, graph: KnowledgeGraph, temp_project: Path, settings, monkeypatch):
+        """The gate must stay closed when a policy *does* exist.
+
+        A walked entry can only land outside ``allowed_roots`` by escaping it -
+        through a symlink or junction - and creating one on Windows needs a
+        privilege this host may not hold, so the boundary is exercised directly
+        instead of through the filesystem. The root gate still passes; every
+        *file* the walk offers is reported as outside and none may reach the graph.
+        """
+        import core.knowledge_ingest as knowledge_ingest
+
+        real_check = knowledge_ingest._is_within_allowed
+        project_root = temp_project.resolve()
+
+        def only_the_root_is_allowed(path, candidate_settings):
+            if Path(path).resolve() == project_root:
+                return real_check(path, candidate_settings)
+            return False
+
+        monkeypatch.setattr(knowledge_ingest, "_is_within_allowed", only_the_root_is_allowed)
+
+        stats = ingest_project_structure(graph, temp_project, "closed", settings)
+
+        assert stats["files"] == 0, f"a refused file was ingested anyway: {stats}"
+        assert stats["skipped_files"] >= 4, (
+            f"the containment gate did not count the files it refused: {stats}")
+        assert graph.get_node(canonical_file_key(graph.project_id, "src/main.py")) is None, (
+            "a file outside allowed_roots reached the graph")
+
+    def test_the_root_gate_is_unaffected(self, graph: KnowledgeGraph, temp_dir: Path):
+        """The root gate must keep refusing an unauthorised root."""
+        outsider = temp_dir / "not-authorized"
+        outsider.mkdir()
+        (outsider / "a.py").write_text("# a\n")
+
+        class NarrowSettings:
+            allowed_roots = [temp_dir / "somewhere-else"]
+
+        with pytest.raises(ValueError, match="outside allowed workspace roots"):
+            ingest_project_structure(graph, outsider, "outsider", NarrowSettings())

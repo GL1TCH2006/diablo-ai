@@ -36,9 +36,9 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
-            fn=lambda **kw: filesystem.read_file(kw["path"]),
+            fn=lambda **kw: filesystem.read_file(kw["path"], settings),
             describe=lambda args: f"Read file: {args.get('path')}",
         )
     )
@@ -51,9 +51,9 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
-            fn=lambda **kw: filesystem.list_dir(kw["path"]),
+            fn=lambda **kw: filesystem.list_dir(kw["path"], settings),
             describe=lambda args: f"List directory: {args.get('path')}",
         )
     )
@@ -70,7 +70,7 @@ def build_registry(
             level=PermissionLevel.SENSITIVE,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: filesystem.write_file(kw["path"], kw.get("content", ""), settings),
             describe=lambda args: f"Write file: {args.get('path')}",
@@ -107,7 +107,9 @@ def build_registry(
             name="python.run_script",
             description=(
                 "Run a Python script and return stdout/stderr. NOT a sandbox - a script has Diablo's "
-                "privileges, so execution is gated by permissions and working-directory restrictions."
+                "privileges, so execution is gated by permissions and working-directory restrictions. "
+                "Cancellation is supported: when a cancellation token is present (via _tool_context), "
+                "the script process will be terminated with a bounded kill fallback."
             ),
             parameters={
                 "type": "object",
@@ -118,10 +120,13 @@ def build_registry(
             level=PermissionLevel.SENSITIVE,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("script")), settings.allowed_roots)
+                if path_is_within(_p(args.get("script"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
-            fn=lambda **kw: python_tool.run_script(kw["script"], kw.get("args"), int(kw.get("timeout", 120) or 120)),
+            fn=lambda **kw: python_tool.run_script(
+                kw["script"], kw.get("args"), int(kw.get("timeout", 120) or 120), _tool_context=kw.get("_tool_context")
+            ),
             describe=lambda args: f"Run Python script: {args.get('script')}",
+            wants_context=True,
         )
     )
     registry.register(
@@ -234,7 +239,7 @@ def build_registry(
             level=PermissionLevel.SENSITIVE,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: coding_tool.project_verify(kw["path"], settings),
             describe=lambda args: f"Run project tests: {args.get('path')}",
@@ -249,7 +254,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: coding_tool.project_info(kw["path"], settings),
             describe=lambda args: f"Analyse project: {args.get('path')}",
@@ -272,7 +277,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: coding_tool.project_files(kw["root"], kw.get("pattern", ""), kw.get("folder", ""), settings),
             describe=lambda args: f"List project files: {args.get('root')}",
@@ -291,7 +296,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: coding_tool.project_grep(kw["root"], kw["pattern"], settings),
             describe=lambda args: f"Grep project {args.get('root')} for {args.get('pattern')}",
@@ -307,7 +312,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_status(kw["root"]),
             describe=lambda args: f"Git status in {args.get('root')}",
@@ -326,7 +331,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_diff(kw["root"], include_staged=False, stat=bool(kw.get("stat", False))),
             describe=lambda args: f"Git diff in {args.get('root')}",
@@ -341,7 +346,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_log(kw["root"]),
             describe=lambda args: f"Git log in {args.get('root')}",
@@ -374,7 +379,7 @@ def build_registry(
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("workspace") or ""), settings.allowed_roots)
+                if path_is_within(_p(args.get("workspace") or "", settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: patches_tool.patch_file(kw["patch"], bool(kw.get("dry_run", False)), kw.get("workspace", ""), settings),
             describe=lambda args: f"Patch code files ({'dry run' if args.get('dry_run') else 'apply'})",
@@ -390,7 +395,7 @@ def build_registry(
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_stage(kw["root"], kw.get("paths"), bool(kw.get("all", False))),
             describe=lambda args: f"git add in {args.get('root')}",
@@ -405,7 +410,7 @@ def build_registry(
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_commit(kw["root"], kw["message"]),
             describe=lambda args: f"git commit in {args.get('root')}: {args.get('message')[:80]}",
@@ -462,7 +467,7 @@ def build_registry(
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_pull(kw["root"], kw.get("remote", "origin"), kw.get("branch", "")),
             describe=lambda args: f"git pull in {args.get('root')}",
@@ -491,7 +496,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_fetch(kw["root"], kw.get("remote", "origin")),
             describe=lambda args: f"git fetch in {args.get('root')}",
@@ -506,7 +511,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_branch(kw["root"]),
             describe=lambda args: f"git current branch in {args.get('root')}",
@@ -521,7 +526,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_branch_list(kw["root"]),
             describe=lambda args: f"git list branches in {args.get('root')}",
@@ -573,7 +578,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("root")), settings.allowed_roots)
+                if path_is_within(_p(args.get("root"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: git_tool.git_snapshot(
                 kw["root"], kw["task_id"], kw["label"], settings, kw.get("creation_reason", "manual")
@@ -677,7 +682,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}, "state": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["root"]},
             required=["root"],
             level=PermissionLevel.SAFE,
-            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_issue_list(kw["root"], kw.get("state", "open"), int(kw.get("limit", 20))),
             describe=lambda args: f"List issues in {args.get('root')}",
         )
@@ -689,7 +694,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}, "state": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["root"]},
             required=["root"],
             level=PermissionLevel.SAFE,
-            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_pr_list(kw["root"], kw.get("state", "open"), int(kw.get("limit", 20))),
             describe=lambda args: f"List PRs in {args.get('root')}",
         )
@@ -701,7 +706,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}}, "required": ["root"]},
             required=["root"],
             level=PermissionLevel.SAFE,
-            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.SAFE if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_repo_view(kw["root"]),
             describe=lambda args: f"View repo in {args.get('root')}",
         )
@@ -713,7 +718,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["root", "title"]},
             required=["root", "title"],
             level=PermissionLevel.SENSITIVE,
-            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_issue_create(kw["root"], kw["title"], kw.get("body", "")),
             describe=lambda args: f"Create GitHub issue: {args.get('title')[:80]}",
         )
@@ -725,7 +730,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}, "title": {"type": "string"}, "head": {"type": "string"}, "base": {"type": "string"}, "body": {"type": "string"}}, "required": ["root", "title"]},
             required=["root", "title"],
             level=PermissionLevel.SENSITIVE,
-            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_pr_create(kw["root"], kw["title"], kw.get("head", ""), kw.get("base", ""), kw.get("body", "")),
             describe=lambda args: f"Create PR: {args.get('title')[:80]}",
         )
@@ -737,7 +742,7 @@ def build_registry(
             parameters={"type": "object", "properties": {"root": {"type": "string"}, "tag": {"type": "string"}, "title": {"type": "string"}}, "required": ["root", "tag"]},
             required=["root", "tag"],
             level=PermissionLevel.SENSITIVE,
-            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root")), settings.allowed_roots) else PermissionLevel.SENSITIVE),
+            level_for=lambda args: (PermissionLevel.NORMAL if path_is_within(_p(args.get("root"), settings), settings.allowed_roots) else PermissionLevel.SENSITIVE),
             fn=lambda **kw: gh_tool.gh_release_create(kw["root"], kw["tag"], kw.get("title", "")),
             describe=lambda args: f"Create release {args.get('tag')}",
         )
@@ -753,7 +758,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: data_tool.load_csv(kw["path"], settings),
             describe=lambda args: f"Load CSV: {args.get('path')}",
@@ -768,7 +773,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: data_tool.load_json(kw["path"], settings),
             describe=lambda args: f"Load JSON: {args.get('path')}",
@@ -783,7 +788,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: data_tool.inspect_data(kw["path"], settings),
             describe=lambda args: f"Inspect data: {args.get('path')}",
@@ -810,7 +815,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: data_tool.analyze_data(
                 kw["path"], settings, kw["operation"],
@@ -853,7 +858,7 @@ def build_registry(
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("output_path") or ""), settings.allowed_roots)
+                if path_is_within(_p(args.get("output_path") or "", settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: chart_tool.generate_chart(kw.get("chart_type", ""), settings, **{k: v for k, v in kw.items() if k != "chart_type"}),
             describe=lambda args: f"Generate {args.get('chart_type')} chart: {args.get('data_path') or 'inline data'}",
@@ -868,7 +873,7 @@ def build_registry(
             level=PermissionLevel.SAFE,
             level_for=lambda args: (
                 PermissionLevel.SAFE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: chart_tool.verify_chart(kw["path"], settings),
             describe=lambda args: f"Verify chart: {args.get('path')}",
@@ -893,7 +898,7 @@ def build_registry(
             level=PermissionLevel.SENSITIVE,
             level_for=lambda args: (
                 PermissionLevel.SENSITIVE
-                if path_is_within(_p(args.get("path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: chart_tool.delete_chart(kw["path"], settings),
             describe=lambda args: f"Delete chart: {args.get('path')}",
@@ -1018,7 +1023,7 @@ def _knowledge_tools(settings: Settings) -> list[ToolSpec]:
             level=PermissionLevel.NORMAL,
             level_for=lambda args: (
                 PermissionLevel.NORMAL
-                if path_is_within(_p(args.get("project_path")), settings.allowed_roots)
+                if path_is_within(_p(args.get("project_path"), settings), settings.allowed_roots)
                 else PermissionLevel.SENSITIVE),
             fn=lambda **kw: knowledge_index(
                 project_path=kw["project_path"],
@@ -1212,19 +1217,29 @@ def _rules_tools(settings: Settings) -> list[ToolSpec]:
 def _git_policy_level(settings: Settings, policy: str, path: str) -> PermissionLevel:
     if policy not in ("allow", "confirm"):
         return PermissionLevel.BLOCKED
-    if not path_is_within(_p(path), settings.allowed_roots):
+    if not path_is_within(_p(path, settings), settings.allowed_roots):
         return PermissionLevel.SENSITIVE
     if policy == "confirm":
         return PermissionLevel.SENSITIVE
     return PermissionLevel.NORMAL
 
 
-def _p(value: str):
+def _p(value: str, settings: Settings | None = None):
+    """Resolve a path against the configured workspace root when relative.
+
+    A relative path is resolved against ``settings.workspace_root`` so that
+    permission classification is consistent regardless of the process working
+    directory. An absolute path is returned unchanged. Without ``settings``
+    (or with an absolute value) this behaves as before.
+    """
     from pathlib import Path
     try:
-        return Path(value)
+        result = Path(value)
     except TypeError:
         return Path("")
+    if settings is not None and not result.is_absolute():
+        result = settings.workspace_root / result
+    return result
 
 
 def _in_whitelist(app: str, settings: Settings) -> bool:

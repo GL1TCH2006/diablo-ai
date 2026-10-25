@@ -54,8 +54,9 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 from core.logging_setup import get_logger
+from personas import DEFAULT_PERSONA, format_status, load_persona, select_persona
 
-from .companion_state import CompanionController, CompanionSnapshot, CompanionState
+from .companion_state import CompanionController, CompanionEventKind, CompanionSnapshot, CompanionState
 from .edge import CompanionGeometry, DockPlacement, place_at_edge, select_monitor
 
 log = get_logger("ui.edge_companion")
@@ -199,6 +200,7 @@ def launch_edge_companion(
     root: Any = None,
     goal_provider: Any = None,
     goal_refresh_seconds: float = 1.0,
+    persona_mode: str = "auto",
 ) -> "tuple[EdgeCompanionApp, bool]":
     """Create the companion window, or focus the one that already exists.
 
@@ -220,6 +222,7 @@ def launch_edge_companion(
         root=root,
         goal_provider=goal_provider,
         goal_refresh_seconds=goal_refresh_seconds,
+        persona_mode=persona_mode,
     )
     return app, True
 
@@ -243,6 +246,7 @@ class EdgeCompanionApp:
         monitor_check_seconds: float = _MONITOR_CHECK_SECONDS,
         goal_provider: Any = None,
         goal_refresh_seconds: float = 1.0,
+        persona_mode: str = "auto",
     ) -> None:
         self.controller = controller
         self._display_layer = display_layer
@@ -269,6 +273,8 @@ class EdgeCompanionApp:
         self._speak_enabled = bool(speak)
         self._sleeping_style_applied: bool | None = None
         self._display: Any = None
+        # Persona mode for response formatting: "auto", "sage", "raphael", "off"
+        self._persona_mode: str = persona_mode
 
         try:
             import tkinter as tk
@@ -581,6 +587,44 @@ class EdgeCompanionApp:
             log.info("companion re-docking to display %s", previous or "unknown")
             self._apply_placement()
 
+    def _determine_outcome(self, snapshot: CompanionSnapshot) -> str:
+        """Determine the authoritative outcome from the snapshot state."""
+        state = snapshot.state
+        if state is CompanionState.RETURNING:
+            # Check if cancellation was requested
+            if snapshot.cancellation_requested:
+                return "cancelled"
+            # Check events for verification outcome
+            for event in snapshot.events:
+                kind = getattr(event, "kind", None)
+                if kind is CompanionEventKind.VERIFICATION:
+                    passed = getattr(event, "passed", None)
+                    outcome = getattr(event, "outcome", None)
+                    if passed is True or (outcome is not None and str(outcome).lower() in ("passed", "verified")):
+                        return "completed"
+                    if passed is False or (outcome is not None and str(outcome).lower() in ("failed", "error")):
+                        return "failed"
+            return "unverified"
+        if state is CompanionState.ERROR:
+            return "failed"
+        return "unverified"
+
+    def _format_with_persona(self, text: str, outcome: str) -> str:
+        """Format text with the current persona mode."""
+        if self._persona_mode == "off":
+            return text
+        if self._persona_mode == "auto":
+            persona = select_persona("")
+        else:
+            try:
+                persona = load_persona(self._persona_mode)
+            except Exception:
+                return text
+        try:
+            return format_status(persona, outcome, text)
+        except Exception:
+            return text
+
     # ── rendering ─────────────────────────────────────────────────────
 
     def _render(self, snapshot: CompanionSnapshot) -> None:
@@ -622,7 +666,8 @@ class EdgeCompanionApp:
             status = "Stopping..."
         elif snapshot.terminal_message and state in (
                 CompanionState.RETURNING, CompanionState.ERROR, CompanionState.LISTENING):
-            status = snapshot.terminal_message
+            outcome = self._determine_outcome(snapshot)
+            status = self._format_with_persona(snapshot.terminal_message, outcome)
         self._status.configure(
             text=status, fg=_ERROR if state is CompanionState.ERROR else _MUTED)
 
@@ -711,6 +756,14 @@ class EdgeCompanionApp:
         """
         if not getattr(self, "_speak_enabled", False):
             return
+        # Probe once, exactly as ui/terminal.py:86 does. Without this the
+        # companion called text_to_speech.speak() unconditionally, so on a host
+        # with no SAPI voices every state change spawned a PowerShell process
+        # that failed - three wasted subprocesses per transition cycle, with the
+        # failure only visible at debug level. The probe answers "is there a
+        # backend at all" without launching anything.
+        if not self._tts_available():
+            return
         state = snapshot.state
         if state is self._last_spoken_state:
             return
@@ -730,6 +783,26 @@ class EdgeCompanionApp:
             text_to_speech.speak(text)
         except Exception as exc:  # noqa: BLE001 - speech is optional by design
             log.debug("companion TTS unavailable: %s", exc)
+
+    def _tts_available(self) -> bool:
+        """Whether a text-to-speech backend actually exists here. Cached.
+
+        Mirrors ``TerminalUI._voice_status`` (ui/terminal.py:104). A negative is
+        cached too: unlike a missing application, a missing SAPI voice will not
+        appear while the process is running, and re-probing on every frame would
+        put a probe back on the hot path that the check was added to leave.
+        """
+        cached = getattr(self, "_tts_available_cache", None)
+        if cached is None:
+            try:
+                from voice.capabilities import voice_status
+
+                cached = bool(voice_status().tts_available)
+            except Exception as exc:  # noqa: BLE001 - a broken voice stack is not fatal
+                log.debug("companion voice probe failed: %s", exc)
+                cached = False
+            self._tts_available_cache = cached
+        return cached
 
     # ── interaction ───────────────────────────────────────────────────
 

@@ -49,6 +49,11 @@ class Executor:
         before_execute=None,
         state_listener=None,
         event_context=None,
+        # Tool execution timeouts (seconds). 0 or negative disables timeout.
+        tool_terminal_timeout: float = 120.0,
+        tool_python_timeout: float = 300.0,
+        tool_blender_timeout: float = 600.0,
+        tool_generic_timeout: float = 60.0,
     ):
         self._registry = registry
         self._permissions = permissions
@@ -59,6 +64,13 @@ class Executor:
         self._state_listener = state_listener
         self._event_context = event_context
         self._task_provider = None
+        # Tool-specific timeouts
+        self._tool_timeouts = {
+            "terminal.execute": tool_terminal_timeout,
+            "python.run_script": tool_python_timeout,
+            "blender.": tool_blender_timeout,  # prefix match for blender tools
+        }
+        self._default_tool_timeout = tool_generic_timeout
 
     def set_task_provider(self, provider=None) -> None:
         """Register a callable returning the authoritative task id.
@@ -85,6 +97,17 @@ class Executor:
             return str(provider() or "")
         except Exception:  # noqa: BLE001 - a task-id probe must never block a call
             return ""
+
+    def _get_tool_timeout(self, tool: str) -> float:
+        """Get the configured timeout for a specific tool."""
+        # Exact match first
+        if tool in self._tool_timeouts:
+            return self._tool_timeouts[tool]
+        # Prefix match for tool families (e.g., "blender." matches "blender.run")
+        for prefix, timeout in self._tool_timeouts.items():
+            if prefix.endswith(".") and tool.startswith(prefix):
+                return timeout
+        return self._default_tool_timeout
 
     _RESULT_TAIL = 600
 
@@ -298,6 +321,11 @@ class Executor:
                     task_id=str(context.get("task_id") or "") or None,
                     cancellation_token=cancellation_token,
                 )
+            # Inject tool-specific timeout if the tool accepts a timeout parameter
+            if "timeout" not in call_args:
+                timeout = self._get_tool_timeout(tool)
+                if timeout and timeout > 0:
+                    call_args["timeout"] = int(timeout)
             result = spec.fn(**call_args)
             outcome.success = bool(result and result.success)
             outcome.cancelled = bool(result and getattr(result, "cancelled", False))

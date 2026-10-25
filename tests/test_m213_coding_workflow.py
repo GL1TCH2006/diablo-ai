@@ -97,6 +97,45 @@ def _scaffold_calls(root: Path, test_src: str = TEST_SRC):
     )
 
 
+def _seed_project(root: Path, test_src: str = TEST_SRC):
+    """Put the scaffold on disk directly, without routing through a tool.
+
+    ``filesystem.write_file`` now carries its own independent content
+    verification (``tools/filesystem.py:57`` calls
+    ``Verifier.observe_file_content``), so a scaffold emitted through that tool
+    is genuinely adjudicated ``PASSED`` and the task can no longer reach the
+    "nothing was verified" state.
+
+    Three tests below are specifically about work that is *not* independently
+    verified. They still need the project to exist, so the fixture writes the
+    files itself. This is setup, not a shortcut past an assertion: nothing here
+    touches the production code under test, and the assertions that follow are
+    unchanged.
+    """
+    (root / "greet.py").write_text(MODULE_SRC, encoding="utf-8")
+    (root / "test_greet.py").write_text(test_src, encoding="utf-8")
+    (root / "README.md").write_text(README_SRC, encoding="utf-8")
+    (root / "run.py").write_text(ENTRY_SRC, encoding="utf-8")
+
+
+#: A real edit expressed as an anchored patch. ``tools/patches.py`` returns a
+#: plain ``ToolResult(True, ...)`` with no ``VerificationResult`` attached, so
+#: this is genuine work that nothing independently adjudicates - the exact shape
+#: "work ran, no independent verifier existed".
+_UNVERIFIED_EDIT = (
+    "=== README.md ===\n"
+    "insert_after A tiny greeter.\n"
+    "+Status: not tested.\n"
+)
+
+
+def _unverified_edit(root: Path):
+    """One scripted model turn that does real, unadjudicated work."""
+    return _response(
+        _call("code.patch_file", patch=_UNVERIFIED_EDIT, workspace=str(root))
+    )
+
+
 def _lifecycle(agent):
     record = agent._task_store.get(agent._tasks.task_id)
     assert record is not None
@@ -605,8 +644,12 @@ def test_case_d_syntax_error_is_a_failure_not_a_pass(tmp_settings):
 
 def test_case_g_final_verification_failure_never_reads_as_success(tmp_settings):
     root = _project(tmp_settings)
+    # The project exists with a deliberately broken test file. The model then
+    # edits it through a tool that has no independent verifier, and claims
+    # success without ever running project.verify.
+    _seed_project(root, test_src=BROKEN_TEST_SRC)
     agent = _agent(tmp_settings, [
-        _scaffold_calls(root, test_src=BROKEN_TEST_SRC),
+        _unverified_edit(root),
         _response(text="I am confident the tests pass."),
     ])
     reply = agent.respond(f"Create a project in {root} with tests and tell me when it is done.")
@@ -615,6 +658,14 @@ def test_case_g_final_verification_failure_never_reads_as_success(tmp_settings):
     assert "confident" in reply
     assert agent._tasks.verification is not VerificationState.PASSED
     assert agent._tasks.task_succeeded() is not True
+    # The unverified work really executed, so this is not a vacuous pass: the
+    # patch landed on disk even though nothing adjudicated it.
+    assert "Status: not tested." in (root / "README.md").read_text(encoding="utf-8")
+    assert agent._tasks.ledger.latest_state is VerificationState.UNVERIFIED
+    # The project's own test is still the broken one the fixture installed, which
+    # is what makes the model's "the tests pass" claim false rather than merely
+    # unverified.
+    assert "== 'Hello, Alice'" in (root / "test_greet.py").read_text(encoding="utf-8")
 
 
 # ==========================================================================
@@ -657,11 +708,13 @@ def test_verified_work_is_not_reported_as_failed_when_the_turn_budget_runs_out(t
 def test_turn_budget_still_fails_a_task_that_was_never_verified(tmp_settings):
     """The turn-limit fix must not turn unfinished work into success."""
     root = _project(tmp_settings)
-    # One turn is not enough to scaffold *and* verify, so the budget runs out
-    # with nothing adjudicated.
+    # One turn is not enough to edit *and* verify, so the budget runs out
+    # with nothing adjudicated. The edit is real work, but it is routed through
+    # a tool with no independent verifier, so it produces no verdict at all.
     tmp_settings.max_turns = 1
+    _seed_project(root)
     agent = _agent(tmp_settings, [
-        _scaffold_calls(root),
+        _unverified_edit(root),
         _response(_call("project.verify", path=str(root))),
         _response(text="done"),
     ])
@@ -671,6 +724,9 @@ def test_turn_budget_still_fails_a_task_that_was_never_verified(tmp_settings):
     assert agent._tasks.verification is not VerificationState.PASSED
     assert agent._tasks.task_succeeded() is not True
     assert "reasoning turns" in reply.lower()
+    # The work happened; it simply was never verified. Without this the test
+    # would also pass if the step had silently never run.
+    assert "Status: not tested." in (root / "README.md").read_text(encoding="utf-8")
 
 
 def test_writing_into_a_project_subdirectory_is_allowed(tmp_settings):

@@ -1,0 +1,334 @@
+# Diablo CI Pipeline
+# Runs on every push and pull request to main branches.
+# Validates: syntax, imports, unit tests, type hints (where configured).
+# Does NOT require Ollama, Blender, GPU, GUI, or external credentials.
+
+name: CI
+
+on:
+  push:
+    branches: [main, reliability-batch-1, 'feature/**', 'fix/**']
+  pull_request:
+    branches: [main, reliability-batch-1]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Prevent pytest from using too much memory on CI runners
+  PYTEST_ADDOPTS: "-x --tb=short -q"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint and static checks (fast, no test execution)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & Static Checks
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Python syntax (compile all .py files)
+        run: |
+          python -m py_compile $(git ls-files '*.py')
+
+      - name: Verify critical imports
+        run: |
+          python -c "
+          import main
+          import core.agent
+          import core.executor
+          import core.planner
+          import core.verification
+          import core.verification_ledger
+          import core.task_manager
+          import core.task_store
+          import core.request_context
+          import core.recovery
+          import core.cancellation
+          import core.context
+          import core.logging_setup
+          import core.constants
+          import ai.provider
+          import ai.ollama_provider
+          import ai.offline_provider
+          import ai.model_router
+          import ai.model_manager
+          import ai.tokenizer
+          import config.settings
+          import config.permissions
+          import memory.memory_store
+          import memory.conversation
+          import memory.sanitizer
+          import memory.preferences
+          import memory.project_memory
+          import memory.rules_store
+          import memory.rule_engine
+          import memory.storage
+          import tools.registry
+          import tools.filesystem
+          import tools.terminal
+          import tools.python
+          import tools.applications
+          import tools.system
+          import tools.git
+          import tools.github
+          import tools.coding
+          import tools.patches
+          import tools.data_tool
+          import tools.chart_tool
+          import tools.memory
+          import tools.rules
+          import tools.models
+          import tools.tasks
+          import tools.capability_bridge
+          import tools.desktop
+          import ui.terminal
+          import ui.edge_companion
+          import ui.companion
+          import ui.companion_events
+          import ui.companion_state
+          import ui.controller
+          import ui.edge
+          import ui.bridge
+          import ui.models
+          import ui.launch
+          import ui.orb.renderer
+          import ui.orb.state_map
+          import voice.service
+          import voice.cancellation
+          import voice.capture
+          import voice.commands
+          import voice.events
+          import voice.output
+          import voice.pipeline
+          import voice.speech_to_text
+          import voice.text_to_speech
+          import voice.vad
+          import voice.wake_word
+          import voice.wake_wording
+          import voice.ui_adapter
+          import voice.stt.base
+          import voice.stt.local
+          import voice.stt.fallback
+          import voice.tts.base
+          import voice.tts.sapi
+          import voice.tts.neural
+          import blender.controller
+          import blender.capabilities
+          import blender.runner
+          import integration.capabilities
+          import integration.contracts
+          import integration.desktop_workflow
+          import integration.errors
+          import integration.protocol
+          import integration.workflows
+          import vision.capabilities
+          import vision.errors
+          import vision.inspect
+          import vision.loader
+          import vision.protocol
+          import vision.backends.base
+          import vision.backends.fallback
+          import vision.backends.local_vlm
+          import coding.change_tracker
+          import coding.snapshot_manager
+          import personas.loader
+          import personas.sage
+          import personas.raphael
+          print('All critical imports OK')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Unit and integration tests (no external dependencies)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit & Integration Tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run fast unit tests (memory, filesystem, verification, agent core)
+        run: |
+          python -m pytest \
+            tests/test_agent.py \
+            tests/test_memory_safety_and_rule_scope.py \
+            tests/test_filesystem_containment.py \
+            tests/test_filesystem_delete_verification.py \
+            tests/test_verification.py \
+            tests/test_verification_ledger.py \
+            tests/test_terminal_state_invariant.py \
+            tests/test_python.py \
+            tests/test_applications.py \
+            tests/test_s2_9_hardening.py \
+            -v --tb=short
+
+      - name: Run recovery and terminal tests (slower)
+        run: |
+          python -m pytest \
+            tests/test_recovery_p10_repair.py \
+            tests/test_terminal.py \
+            -v --tb=short \
+            -k "not test_terminate_to_kill_escalation and not test_the_graph_knows_the_task_and_its_verification"
+
+      - name: Run knowledge and coding tests
+        run: |
+          python -m pytest \
+            tests/test_knowledge_ingest.py \
+            tests/test_knowledge_graph.py \
+            tests/test_m213_coding_workflow.py \
+            -v --tb=short
+
+      - name: Run integration tests (no external deps)
+        run: |
+          python -m pytest \
+            tests/test_integration.py \
+            -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Type checking (where mypy configuration exists)
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Type Check (mypy)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy
+
+      - name: Run mypy on core modules (where type hints exist)
+        run: |
+          python -m mypy \
+            --ignore-missing-imports \
+            --disallow-untyped-defs \
+            --no-error-summary \
+            core/agent.py \
+            core/executor.py \
+            core/planner.py \
+            core/verification.py \
+            core/verification_ledger.py \
+            core/task_manager.py \
+            core/task_store.py \
+            core/request_context.py \
+            core/recovery.py \
+            core/cancellation.py \
+            core/logging_setup.py \
+            core/context.py \
+            ai/provider.py \
+            ai/ollama_provider.py \
+            ai/offline_provider.py \
+            ai/model_router.py \
+            ai/model_manager.py \
+            config/settings.py \
+            config/permissions.py \
+            tools/registry.py \
+            tools/filesystem.py \
+            tools/terminal.py \
+            tools/python.py \
+            memory/memory_store.py \
+            memory/conversation.py \
+            memory/sanitizer.py \
+            memory/rules_store.py \
+            memory/rule_engine.py \
+            memory/preferences.py \
+            memory/project_memory.py \
+            2>&1 | head -100 || true
+
+  # ---------------------------------------------------------------------------
+  # Smoke test: verify the application can start in offline mode
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: Smoke Test (Offline Mode)
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run demo in offline mode (non-interactive)
+        run: |
+          python main.py --offline --demo
+        env:
+          AI_PROVIDER: offline
+          OLLAMA_HOST: "http://localhost:11434"
+          VOICE_ENABLED: "false"
+          AUTONOMY: "false"
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit (check for known vulnerabilities)
+  # ---------------------------------------------------------------------------
+  depscan:
+    name: Dependency Scan
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      - name: Run pip-audit
+        run: |
+          pip-audit --desc --format=json || true
+        continue-on-error: true

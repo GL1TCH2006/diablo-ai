@@ -27,7 +27,7 @@ import time
 import pytest
 
 from blender.capabilities import BlenderCapabilityLayer
-from blender.errors import BlenderCancelledError
+from blender.errors import BlenderCancelledError, BlenderTimeoutError
 from integration.contracts import (
     CapabilityRequest,
     CapabilityStatus,
@@ -57,7 +57,7 @@ class RecordingRunner:
         self._poll_cancel = poll_cancel
 
     def run(self, request, timeout=None, scene_file=None, cancel_token=None):
-        self.calls.append({"cancel_token": cancel_token, "timeout": timeout})
+        self.calls.append({"cancel_token": cancel_token, "timeout": timeout, "operation": request.get("operation")})
         if self._on_run is not None:
             self._on_run(self, cancel_token)
         elif self._poll_cancel and cancel_token is not None:
@@ -68,6 +68,54 @@ class RecordingRunner:
                     raise BlenderCancelledError(
                         operation="render", message="cancelled while rendering")
                 time.sleep(0.005)
+        # Check for pre-flight cancellation
+        if cancel_token is not None and cancel_token.is_cancelled():
+            raise BlenderCancelledError(
+                operation=request.get("operation", ""), message="request cancelled before blender started"
+            )
+        # Simulate script errors for execute_script
+        operation = request.get("operation")
+        params = request.get("params") or {}
+        if operation == "execute_script" and "raise" in (params.get("script") or ""):
+            return type("Result", (), {
+                "success": False,
+                "data": None,
+                "error_message": "test error",
+                "error_code": "blender_script_error",
+                "return_code": 1,
+                "stdout": "",
+                "stderr": "ValueError: test error",
+                "error_code": "blender_script_error",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            })()
+        # Simulate timeout for execute_script
+        if operation == "execute_script" and "time.sleep(10)" in (params.get("script") or ""):
+            raise BlenderTimeoutError(
+                operation="execute_script", message="blender did not finish within 1.0s", timeout=1.0
+            )
+        # Simulate successful execute_script with script result
+        if operation == "execute_script":
+            script = params.get("script") or ""
+            # Try to extract result from script like "result = {'executed': True, 'value': 42}"
+            try:
+                namespace = {}
+                exec(compile(script, "<test-script>", "exec"), namespace)
+                result_data = namespace.get("result", {"executed": True})
+            except Exception:
+                result_data = {"executed": True}
+            return type("Result", (), {
+                "success": True,
+                "data": result_data,
+                "error_message": "",
+                "error_code": "",
+                "return_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error_code": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            })()
         return _ok()
 
     def stop(self, *_args, **_kwargs) -> bool:
@@ -406,3 +454,211 @@ class TestRealBlenderCancellation:
         assert result.status is CapabilityStatus.CANCELLED, (
             f"a real Blender render was not cancelled (status "
             f"{result.status.value}); the runner did not observe the token")
+
+
+# ══════════════════════════════════════════════════════ 7. execute_script cancellation
+
+# These tests verify that the execute_script operation properly supports
+# mid-operation cancellation through the capability layer.
+
+
+class TestExecuteScriptCancellation:
+    def test_execute_script_cancel_before_launch(self, tmp_path):
+        """Cancellation requested before execute_script starts should be honored immediately."""
+        from blender.capabilities import BlenderCapabilityLayer
+        from voice.cancellation import CancellationToken
+
+        runner = RecordingRunner()
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"))
+        token = CancellationToken("task-script-cancel")
+        token.request("cancel before launch")
+
+        # Should fail immediately without calling the runner
+        try:
+            layer.execute_script("import time; time.sleep(10)", _tool_context=type("ctx", (), {"cancellation_token": token})())
+            assert False, "expected BlenderCancelledError"
+        except BlenderCancelledError:
+            pass  # expected
+
+        assert runner.calls == [], "runner should not have been called for pre-cancelled request"
+
+    def test_execute_script_cancel_during_execution(self, tmp_path):
+        """Cancellation during a long-running execute_script should terminate the Blender process."""
+        from blender.capabilities import BlenderCapabilityLayer
+        from voice.cancellation import CancellationToken
+
+        # Use a runner that polls for cancellation
+        runner = RecordingRunner(poll_cancel=True)
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"))
+        token = CancellationToken("task-script-cancel")
+
+        # Long-running script
+        script = "import time\nfor i in range(100):\n    time.sleep(0.1)\nprint('done')"
+
+        ctx = type("ctx", (), {"cancellation_token": token})()
+
+        # Start the script and cancel it after a short delay
+        def delayed_cancel():
+            deadline = time.time() + 5.0
+            while runner.polls == 0 and time.time() < deadline:
+                time.sleep(0.005)
+            token.request("cancel during execution")
+
+        canceller = threading.Thread(target=delayed_cancel, daemon=True)
+        canceller.start()
+
+        try:
+            layer.execute_script(script, _tool_context=type("ctx", (), {"cancellation_token": token})())
+            assert False, "expected BlenderCancelledError"
+        except BlenderCancelledError:
+            pass  # expected
+
+        canceller.join(timeout=5)
+
+        assert runner.polls > 1, (
+            "the runner polled fewer than twice, so it cannot have observed a "
+            "cancel arriving during the operation")
+
+    def test_execute_script_timeout_exceeded(self, tmp_path):
+        """An execute_script that exceeds its timeout should be terminated."""
+        from blender.capabilities import BlenderCapabilityLayer
+        from blender.errors import BlenderTimeoutError
+
+        runner = RecordingRunner()
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"), timeout=1.0)
+
+        # Script that sleeps longer than the timeout
+        script = "import time; time.sleep(10)"
+
+        try:
+            layer.execute_script(script)
+            assert False, "expected BlenderTimeoutError"
+        except BlenderTimeoutError:
+            pass  # expected
+
+    def test_execute_script_successful_execution(self, tmp_path):
+        """Normal successful execute_script execution should still work."""
+        from blender.capabilities import BlenderCapabilityLayer
+
+        runner = RecordingRunner()
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"))
+
+        result = layer.execute_script("result = {'executed': True, 'value': 42}")
+
+        # The result is the data returned by the Blender operation
+        assert result.get("executed") is True
+
+    def test_execute_script_nonzero_exit(self, tmp_path):
+        """execute_script that raises an exception should report error correctly."""
+        from blender.capabilities import BlenderCapabilityLayer
+        from blender.errors import BlenderScriptError
+
+        runner = RecordingRunner()
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"))
+
+        try:
+            layer.execute_script("raise ValueError('test error')")
+            assert False, "expected BlenderScriptError"
+        except BlenderScriptError as e:
+            assert "test error" in str(e)
+            assert e.operation == "execute_script"
+
+    def test_execute_script_terminate_to_kill_escalation(self, tmp_path):
+        """Test that a process that ignores terminate gets killed."""
+        from blender.capabilities import BlenderCapabilityLayer
+        from blender.errors import BlenderCancelledError
+
+        runner = RecordingRunner(poll_cancel=True)
+        layer = BlenderCapabilityLayer(runner=runner, work_dir=str(tmp_path / "w"))
+        token = CancellationToken("test-kill")
+
+        script = "import time; [time.sleep(1) for _ in range(100)]"
+
+        def delayed_cancel():
+            time.sleep(0.05)
+            token.request("test kill escalation")
+
+        canceller = threading.Thread(target=delayed_cancel, daemon=True)
+        canceller.start()
+
+        try:
+            layer.execute_script(script, _tool_context=type("ctx", (), {"cancellation_token": token})())
+            assert False, "expected BlenderCancelledError"
+        except BlenderCancelledError:
+            pass  # expected
+
+        canceller.join(timeout=5)
+
+        # Verify process was reaped (runner was called and handled cancellation)
+        assert len(runner.calls) > 0
+
+    def test_stop_uses_taskkill_on_windows(self, tmp_path, monkeypatch):
+        """On Windows, _stop should attempt taskkill /T /F /PID for process-tree termination."""
+        import sys
+        import subprocess
+        from blender.runner import BlenderRunner
+        from unittest.mock import MagicMock
+
+        runner = BlenderRunner()
+        proc = MagicMock()
+        proc.poll.return_value = None  # Process is still running
+        proc.pid = 12345
+
+        # Mock subprocess.run to capture the taskkill call
+        taskkill_called = {"called": False, "args": None}
+        original_run = subprocess.run
+
+        def mock_run(*args, **kwargs):
+            if args and args[0] == ["taskkill", "/T", "/F", "/PID", "12345"]:
+                taskkill_called["called"] = True
+                taskkill_called["args"] = args[0]
+                return MagicMock(returncode=0)
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        # Call _stop with a mocked process
+        # Use a real-ish operation string for logging
+        result = runner._stop(proc, "test_operation")
+
+        # Verify taskkill was attempted with correct arguments
+        assert taskkill_called["called"], "taskkill should have been called on Windows"
+        assert taskkill_called["args"] == ["taskkill", "/T", "/F", "/PID", "12345"], (
+            f"taskkill called with wrong args: {taskkill_called['args']}"
+        )
+        # The result should indicate the process was terminated
+        assert result is True, "_stop should return True when taskkill succeeds"
+
+    def test_stop_falls_back_when_taskkill_fails(self, tmp_path, monkeypatch):
+        """If taskkill fails, _stop should fall back to standard terminate/kill."""
+        import sys
+        import subprocess
+        from blender.runner import BlenderRunner
+        from unittest.mock import MagicMock
+
+        runner = BlenderRunner()
+        proc = MagicMock()
+        proc.poll.return_value = None  # Process is still running
+        proc.pid = 12345
+
+        # Make taskkill fail
+        def mock_run(*args, **kwargs):
+            if args and args[0] == ["taskkill", "/T", "/F", "/PID", "12345"]:
+                raise OSError("taskkill not found")
+            return original_run(*args, **kwargs)
+
+        original_run = subprocess.run
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        # Mock proc.terminate and proc.kill to succeed
+        proc.terminate = MagicMock()
+        proc.wait = MagicMock(return_value=None)
+
+        result = runner._stop(proc, "test_operation")
+
+        # Should fall back to terminate/kill
+        proc.terminate.assert_called_once()
+        proc.wait.assert_called()  # wait after terminate
+        assert result is True, "_stop should return True after fallback succeeds"

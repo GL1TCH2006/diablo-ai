@@ -960,7 +960,30 @@ class KnowledgeGraph:
     # Bulk / transaction helpers
 
     def transaction(self):
-        """Context manager for explicit transactions."""
+        """Return the shared SQLite connection, for explicit transaction control.
+
+        NOT a context manager, despite the name. The previous docstring said it
+        was one, which was wrong: entering it with ``with`` would bind the
+        connection object, not start or commit a transaction, so a caller reading
+        the old docstring would believe they had atomicity they did not have.
+
+        What it actually returns is ``self._get_conn()`` - the same shared
+        connection every other method here uses. To get a real transaction, drive
+        it explicitly::
+
+            conn = graph.transaction()
+            try:
+                conn.execute("BEGIN")
+                ...
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        Note this method is currently unreferenced anywhere in the repository,
+        production or tests. It is kept because the capability is real and the
+        corrected contract is now honest; nothing depends on the old, wrong one.
+        """
         return self._get_conn()
 
     def stats(self) -> dict[str, int]:

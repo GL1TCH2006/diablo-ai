@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -16,6 +17,71 @@ log = get_logger("applications")
 
 _CONFIRM_PROCESS_EXES = ("calc", "notepad", "chrome", "msedge", "code", "explorer", "blender", "mspaint", "cmd")
 _DYNAMIC_LOOKUP_TIMEOUT = 15
+
+#: Candidate install locations for applications that are commonly installed
+#: per-user, where the executable is therefore not on PATH and not in a
+#: machine-wide directory.
+#:
+#: **Discovered, not configured.** A configured absolute path is specific to one
+#: machine *and* one Windows username, so it stops working for everyone else and
+#: leaks the author's account name into shared configuration. This is the same
+#: shape as Blender detection in ``blender/controller.py:37``: probe an ordered
+#: list of candidate roots and take the first that exists, rather than pinning one
+#: path in the TOML.
+#:
+#: ``%VAR%`` placeholders are expanded against this process's environment, so a
+#: user with a relocated profile is found without a config change. A variable that
+#: is not set leaves the candidate unexpanded and therefore non-existent, which
+#: simply skips it.
+_DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "vs code": (
+        r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+        r"%PROGRAMFILES%\Microsoft VS Code\Code.exe",
+        r"%PROGRAMFILES(X86)%\Microsoft VS Code\Code.exe",
+    ),
+    "blender": (
+        r"%PROGRAMFILES%\Blender Foundation\Blender*\blender.exe",
+    ),
+}
+
+#: Discovery results, cached per alias. A miss is not cached: an application may
+#: be installed while the process is running, and a stale negative would be worse
+#: than a second probe.
+_DISCOVERY_CACHE: dict[str, str] = {}
+
+
+def discover_app_path(alias: str) -> str | None:
+    """First existing candidate install location for ``alias``, or None.
+
+    Public because it is the behaviour worth testing directly: given a candidate
+    list and a filesystem, it picks the first real executable and does not care
+    which Windows user is asking.
+    """
+    key = str(alias or "").strip().lower()
+    if key in _DISCOVERY_CACHE:
+        return _DISCOVERY_CACHE[key]
+    for template in _DISCOVERY_CANDIDATES.get(key, ()):
+        expanded = os.path.expandvars(template)
+        try:
+            if "*" in expanded or "?" in expanded:
+                # Newest first, so a machine with several Blender versions uses
+                # the highest, matching Blender detection's reverse-sorted glob.
+                # glob.glob is used rather than Path.glob because the wildcard can
+                # sit in a middle segment (``Blender*\blender.exe``), which
+                # Path.glob cannot express.
+                matches = [Path(p) for p in sorted(glob.glob(expanded), reverse=True)]
+            else:
+                matches = [Path(expanded)]
+        except (OSError, ValueError):
+            continue
+        for candidate in matches:
+            try:
+                if candidate.is_file():
+                    _DISCOVERY_CACHE[key] = str(candidate)
+                    return _DISCOVERY_CACHE[key]
+            except OSError:
+                continue
+    return None
 
 
 def open_app(app: str, settings: Settings | None = None) -> ToolResult:
@@ -57,6 +123,14 @@ def _resolve_app(app: str, settings: Settings | None) -> tuple[str | None, str, 
         if key == alias.lower():
             resolved = shutil.which(token) or token
             return resolved, app.strip(), "whitelist"
+
+    # M2.18: per-user installs are neither on PATH nor machine-wide, so they need
+    # a probe. Tried after the configured stages so every existing behaviour is
+    # unchanged, and before the Start Menu because a real path is better than a
+    # UWP app id.
+    discovered = discover_app_path(key)
+    if discovered:
+        return discovered, app.strip(), "discovered path"
 
     start_app = _start_apps_lookup(key)
     if start_app:

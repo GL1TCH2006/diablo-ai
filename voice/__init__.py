@@ -5,37 +5,90 @@ from .cancellation import (
     CancellationToken,
     InterruptionManager,
 )
-from .commands import VoiceCommand, VoiceCommandResult, VoiceCommandRouter
+from .capture import (
+    AudioConfig,
+    AudioCaptureError,
+    MicrophoneCapture,
+    RecordingConfig,
+    RecordingResult,
+    list_microphones,
+    is_microphone_available,
+)
+from .commands import VoiceCommand, VoiceCommandResult, VoiceCommandBridge, VoiceCommandRouter
 from .events import VoiceEvent, VoiceStatus
 from .output import VoiceOutputResult, VoiceOutputRouter, VoiceResponsePolicy
 from .pipeline import VoicePipeline, VoicePipelineResult
 from .service import VoiceService
 from .speech_to_text import SpeechToText
 from .stt import (
-    MockSpeechToTextBackend,
     SpeechToTextBackend,
     SpeechToTextError,
     SpeechToTextUnavailable,
     TranscriptResult,
+    MockSpeechToTextBackend,
     UnavailableSpeechToTextBackend,
+    FasterWhisperBackend,
+    create_fallback_stt,
+    create_faster_whisper_backend,
 )
-from .text_to_speech import is_sapi_available, speak
 from .tts import (
-    MockTTSBackend,
-    SapiTTSBackend,
     TTSBackend,
     TTSError,
     TTSResult,
     TTSUnavailable,
+    MockTTSBackend,
+    SapiTTSBackend,
+    OptionalNeuralTTSBackend,
     create_tts_backend,
 )
 from .ui_adapter import VoiceUIAdapter
-from .wake_word import WakeWordListener
-from .wake_wording import DisabledWakeWordDetector, MockWakeWordDetector, WakeWordDetector, WakeWordResult
+from .vad import VAD, EnergyVAD, WebRTCVAD, create_vad
+from .wake_wording import (
+    WakeWordResult,
+    WakeWordDetector,
+    WakeWordListener,
+    WakeWordError,
+    MockWakeWordDetector,
+    DisabledWakeWordDetector,
+    PorcupineWakeWordDetector,
+    OpenWakeWordDetector,
+    create_wake_word_detector,
+)
+from .capabilities import VoiceCapability, VoiceComponentStatus, voice_status, render_voice_status
 
 __all__ = [
-    "is_sapi_available",
-    "speak",
+    # Cancellation
+    "CancellationError",
+    "CancellationOutcome",
+    "CancellationRequest",
+    "CancellationToken",
+    "InterruptionManager",
+    # Capture
+    "AudioConfig",
+    "AudioCaptureError",
+    "MicrophoneCapture",
+    "RecordingConfig",
+    "RecordingResult",
+    "list_microphones",
+    "is_microphone_available",
+    # Commands
+    "VoiceCommand",
+    "VoiceCommandResult",
+    "VoiceCommandBridge",
+    "VoiceCommandRouter",
+    # Events
+    "VoiceEvent",
+    "VoiceStatus",
+    # Output
+    "VoiceOutputResult",
+    "VoiceOutputRouter",
+    "VoiceResponsePolicy",
+    # Pipeline
+    "VoicePipeline",
+    "VoicePipelineResult",
+    # Service
+    "VoiceService",
+    # Speech to Text
     "SpeechToText",
     "SpeechToTextBackend",
     "SpeechToTextError",
@@ -43,33 +96,38 @@ __all__ = [
     "TranscriptResult",
     "MockSpeechToTextBackend",
     "UnavailableSpeechToTextBackend",
+    "FasterWhisperBackend",
+    "create_fallback_stt",
+    "create_faster_whisper_backend",
+    # TTS
     "TTSBackend",
     "TTSError",
-    "TTSUnavailable",
     "TTSResult",
+    "TTSUnavailable",
     "MockTTSBackend",
     "SapiTTSBackend",
+    "OptionalNeuralTTSBackend",
     "create_tts_backend",
-    "WakeWordListener",
-    "WakeWordDetector",
+    # UI Adapter
+    "VoiceUIAdapter",
+    # VAD
+    "VAD",
+    "EnergyVAD",
+    "WebRTCVAD",
+    "create_vad",
+    # Wake Word
     "WakeWordResult",
+    "WakeWordDetector",
+    "WakeWordListener",
+    "WakeWordError",
     "MockWakeWordDetector",
     "DisabledWakeWordDetector",
-    "VoiceStatus",
-    "VoiceEvent",
-    "CancellationToken",
-    "CancellationRequest",
-    "CancellationOutcome",
-    "CancellationError",
-    "InterruptionManager",
-    "VoiceCommand",
-    "VoiceCommandResult",
-    "VoiceCommandRouter",
-    "VoiceResponsePolicy",
-    "VoiceOutputResult",
-    "VoiceOutputRouter",
-    "VoicePipelineResult",
-    "VoicePipeline",
-    "VoiceService",
-    "VoiceUIAdapter",
+    "PorcupineWakeWordDetector",
+    "OpenWakeWordDetector",
+    "create_wake_word_detector",
+    # Capabilities
+    "VoiceCapability",
+    "VoiceComponentStatus",
+    "voice_status",
+    "render_voice_status",
 ]

@@ -1,4 +1,61 @@
 ================================================================================
+CORRECTION NOTE - added 2026-10-17 by unattended reliability batch 4
+================================================================================
+
+The figures and claims below are PRESERVED VERBATIM as they were written at the
+time. They are not rewritten. This note records what was later measured, because
+two of them are wrong in ways that matter to anyone reading this file as evidence.
+
+1. "Deterministic suite (no opt-in env vars) - 3585 passed, 218 skipped, exit 0"
+
+   NOT REPRODUCIBLE, and it should not be treated as a baseline. Re-measured on
+   2026-10-16 and 2026-10-17 the suite could not exit 0 at this tree:
+
+     - tests/test_m217_restart_real.py (all 6 tests) FAILED at every commit that
+       contained it, until a harness defect was fixed on 2026-10-16. The child
+       interpreter set PYTHONPATH after startup, so it could not import `core`
+       (ModuleNotFoundError). A run that exits 0 cannot have included this file.
+     - 3 further failures are environmental on this host and are unrelated to the
+       numbers: `python` on PATH is the Microsoft Store Application Execution
+       Alias stub, so tests/test_terminal.py and
+       tests/test_terminal_destructive_policy.py fail when they invoke `python` by
+       name.
+
+   Measured 2026-10-17 with scripts/run_deterministic.ps1:
+     3602 collected, 3594 passed, 3 failed, 5 skipped, accounted 3602/3602.
+   Cleaned of the one load-sensitive UI flake: 3595 passed, 2 failed, 5 skipped.
+
+2. "Skip inventory - 218 skips (deterministic mode)"
+
+   The bucket counts remain useful, but the totals were produced by a run whose
+   exit status could not have been 0 (see 1). Treat 218 as unverified.
+
+3. Section F, "structural gap not visible as a skip"
+
+   ACCURATE, and now partly closed. The finding that M2.17's real-model evidence
+   lived entirely outside the test suite was correct. A gated pytest file now
+   exists: tests/test_m217_real_model_autonomy.py (3 tests, DIABLO_REAL_MODEL_TESTS=1).
+   It has NEVER been executed with the gate on - contacting a model was out of
+   scope for the batch that wrote it. Treat it as coverage that exists on paper,
+   not as evidence.
+
+4. "TASK 0 STATUS: PASS"
+
+   Disputed for the reasons in 1. Not edited here; recorded as wrong.
+
+WHAT DID NOT CHANGE: the skip-reason classifications, the bucket scheme, the
+observation about tests/real_model_*.py not being collected by pytest, and the
+conclusion that the real-model suites had never been run on this machine.
+
+Full, command-backed re-measurements and per-task history live in
+data/run_reports/ (00_baseline.md, FINAL.md, FINAL2.md, FINAL3.md, b3_00_baseline.md,
+FINAL4.md). Start with data/run_reports/FINAL4.md.
+
+================================================================================
+END OF CORRECTION NOTE - original text follows, unaltered
+================================================================================
+================================================================================
+================================================================================
 M2.17.x TASK 0 - BASELINE AND SKIP INVENTORY
 ================================================================================
 

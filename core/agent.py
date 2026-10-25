@@ -86,6 +86,10 @@ class Agent:
             before_execute=self._before_execute,
             state_listener=self._executor_state_listener,
             event_context=self._event_payload,
+            tool_terminal_timeout=settings.tool_terminal_timeout,
+            tool_python_timeout=settings.tool_python_timeout,
+            tool_blender_timeout=settings.tool_blender_timeout,
+            tool_generic_timeout=settings.tool_generic_timeout,
         )
         # M2.14.1: the Executor needs the authoritative task id so a
         # task-scoped rule can be matched. Sourced from TaskManager, never from
@@ -134,6 +138,13 @@ class Agent:
         runtime_context.router = self._router
         runtime_context.prefs = self._preferences
         self._reconcile_interrupted_tasks()
+        # Clear the recovery-state registry after reconciliation. The registry
+        # was populated for all records during reconciliation, but only the
+        # task actually being resumed needs its entry. The resume() method
+        # calls _restore_recovery_state() again for the specific task, which
+        # will repopulate the registry for that task alone. Clearing here
+        # prevents unbounded growth from tasks that are never resumed.
+        self._exhausted_task_ids = {}
 
     # ------------------------------------------------------------------
     # M2.12 P1 — request-scoped state
@@ -256,6 +267,36 @@ class Agent:
     @property
     def router(self):
         return self._router
+
+    def cancel_current_task(self) -> bool:
+        """Cancel the currently running task, if any.
+
+        This cancels the active cancellation token by calling its cancel method
+        or setting its cancelled flag, which will propagate to all downstream
+        operations that check the cancellation token.
+
+        Returns:
+            True if a cancellation was requested, False if there was no
+            active token to cancel.
+        """
+        token = getattr(self, "_active_cancellation_token", None)
+        if token is None:
+            return False
+        # Try common cancellation methods in order of preference
+        for method_name in ("cancel", "request", "set_cancelled"):
+            method = getattr(token, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    return True
+                except Exception:
+                    continue
+        # Fallback: set cancelled attribute if the token supports it
+        try:
+            token.cancelled = True
+            return True
+        except Exception:
+            return False
 
     def model_status(self) -> str:
         choices = self._router.state() if self._router else {}
@@ -403,10 +444,9 @@ class Agent:
     def _transition(self, state: TaskState) -> None:
         if not hasattr(self._tasks, "transition"):
             return
-        try:
-            self._tasks.transition(state)
-        except ValueError as exc:
-            log.warning("task lifecycle transition ignored: %s", exc)
+        # Fail fast on invalid transitions - the state machine validates them
+        # and raising here makes bugs visible rather than silently ignoring them.
+        self._tasks.transition(state)
 
     def _executor_state_listener(self, state: str) -> None:
         if state == "awaiting_permission":
@@ -2205,6 +2245,13 @@ class Agent:
                                  reason=reason, refused_steps=list(refused))
             return report
         if not resumable:
+            # Apply restored recovery state even when there are no resumable steps,
+            # so the recovery budget is correctly carried forward for future attempts.
+            # Begin task first so task_id is set for the registry lookup.
+            self._tasks.begin_task(record.title or record.goal or "resumed task",
+                                   task_id=record.task_id)
+            self._apply_restored_recovery_state()
+            self._exhausted_task_ids = {}
             report.action = ResumeReport.NOOP
             self._emit_lifecycle("resume_noop", task_id=report.task_id,
                                  reason=reason)
@@ -2220,11 +2267,13 @@ class Agent:
         self._escalations_used = 0
         self._offline_fallback_used = False
         self._provider_failures = []
-        self._exhausted_task_ids = {}
         self._recovered_task_ids = []
-        self._apply_restored_recovery_state()
+        # Begin the task first so task_id is set, then apply restored recovery state.
         self._tasks.begin_task(record.title or record.goal or "resumed task",
                                task_id=record.task_id)
+        self._apply_restored_recovery_state()
+        self._exhausted_task_ids = {}
+        self._recovered_task_ids = []
         if plan is not None:
             self._active_plan = plan
         self._transition(TaskState.EXECUTING)
@@ -2907,14 +2956,13 @@ class Agent:
                     detail = "AI backend became unavailable after tool execution; offline fallback could not verify completion."
                     self._mark_failure(detail)
                     return f"Task failed: {detail}"
-                if self._tasks.state == TaskState.EXECUTING and self._tasks.verification in {
-                    VerificationState.NOT_RUN,
-                    VerificationState.UNVERIFIED,
-                }:
+                # Always go through verification phase when verification hasn't run,
+                # regardless of current task state. The state machine allows
+                # PLANNING -> VERIFYING and EXECUTING -> VERIFYING.
+                if self._tasks.verification == VerificationState.NOT_RUN:
                     self._begin_verification()
-                    if self._tasks.verification == VerificationState.NOT_RUN:
-                        state = VerificationState.UNVERIFIED if self._tasks.any_executed() else VerificationState.NOT_REQUIRED
-                        self._record_verification(VerificationResult(state, "No independent verifier was available."))
+                    state = VerificationState.UNVERIFIED if self._tasks.any_executed() else VerificationState.NOT_REQUIRED
+                    self._record_verification(VerificationResult(state, "No independent verifier was available."))
                 if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED):
                     self._transition(TaskState.COMPLETED)
                 return getattr(response, "text", "") or "Understood."

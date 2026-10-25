@@ -1,0 +1,386 @@
+================================================================================
+DIABLO CANCELLATION CONSISTENCY AUDIT REPORT
+================================================================================
+Project: Diablo
+Repository: C:\PROJECTS\jarvis like ai for my computer\diablo-ai
+Branch: reliability-batch-1
+HEAD: a74b53c
+Date: 2026-10-20
+
+================================================================================
+SECTION 1: REPOSITORY STATE
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c
+Working tree: dirty (28 modified files, 31 untracked files/dirs - all pre-existing)
+Stashes: none
+
+Pre-existing modified files (preserved):
+  .gitignore, README.md, blender/capabilities.py, blender/scripts/diablo_blender_ops.py,
+  config/default_config.toml, core/knowledge_graph.py, core/knowledge_ingest.py,
+  core/verification.py, core/verification_ledger.py,
+  docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt,
+  docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, main.py,
+  tests/m217_restart_child.py, tests/test_applications.py,
+  tests/test_knowledge_ingest.py, tests/test_m213_coding_workflow.py,
+  tests/test_m216_ui_companion.py, tests/test_m216_ui_integration.py,
+  tests/test_m217_autonomy_integration.py, tests/test_recovery_p10_repair.py,
+  tests/test_s2_9_hardening.py, tests/test_terminal_state_invariant.py,
+  tools/__init__.py, tools/applications.py, tools/filesystem.py,
+  ui/companion_state.py, ui/edge_companion.py, ui/launch.py, ui/terminal.py
+
+Pre-existing untracked (preserved):
+  AGENTS.md, DIABLO_*_REPORT.txt, DIABLO_OVERNIGHT_*.txt, DIABLO_PERSONA_INTEGRATION_AUDIT.txt,
+  audit_checks.py, data/, personas/, scripts/, tests/test_*.py, ui/orb/
+
+New files from this audit (none - audit only):
+  None (this audit makes no modifications)
+
+================================================================================
+SECTION 2: EXECUTION-PATH MAP
+================================================================================
+
+The cancellation path for each execution domain:
+
+┌─────────────────┬──────────────────┬──────────────────────────────────────────────────┐
+│ Domain          | Tool             | Cancellation Path                                    │
+├─────────────────┼──────────────────┼──────────────────────────────────────────────────┤
+| Python          | python.run_script| Agent→Executor→run_script(token)→Popen→poll 50ms    │
+| Terminal        | terminal.execute| Agent→Executor→run_command(token)→Popen→poll 50ms   │
+| Blender (ops)   | capability.execute| Agent→CapabilityBridge→Layer→Runner→Popen→poll 50ms │
+| Blender (script)| execute_script   | Agent→CapabilityBridge→Layer→Runner→Popen→poll 50ms │
+| Voice TTS       | speak()          | No cancellation (fire-and-forget daemon thread)       │
+└─────────────────┴──────────────────┴──────────────────────────────────────────────────┘
+
+================================================================================
+SECTION 3: EXECUTION-PATH DETAILED TRACE
+================================================================================
+
+3.1 Python.run_script (tools/python.py)
+----------------------------------------
+Entry: tools/__init__.py line 125-127
+  fn=lambda **kw: python_tool.run_script(kw["script"], kw.get("args"), int(kw.get("timeout", 120) or 120), _tool_context=kw.get("_tool_context"))
+  wants_context=True
+
+Execution (tools/python.py:110-213):
+1. Pre-flight: check cancellation_requested(cancel_token) at line 134
+2. Popen with stdout/stderr pipes, no shell
+3. Two reader threads drain stdout/stderr to bounded streams (64KB)
+4. Main loop (50ms poll):
+   - Check cancellation_requested(cancel_token)
+   - Check deadline
+   - proc.wait(timeout=POLL_INTERVAL_S)
+5. On cancel/timeout: _stop_process() → terminate → wait 5s → kill → wait 5s → reap
+6. Reader threads joined, pipes closed in finally block
+7. Returns ToolResult with cancelled=True or timed_out error
+
+3.2 terminal.execute (tools/terminal.py)
+-----------------------------------------
+Entry: tools/__init__.py line 100-103
+  fn=lambda **kw: terminal.run_command(kw["command"], kw.get("working_dir"), int(kw.get("timeout", 60) or 60), settings)
+  (No wants_context=True - context passed but not declared)
+
+Execution (tools/terminal.py:140-254):
+1. Permission checks: destructive_command_reason(), blocklist, session block, preferences
+2. Pre-flight: cancellation_requested(cancel_token) at line 166
+3. Windows: CREATE_NEW_PROCESS_GROUP for CTRL_BREAK_EVENT support
+4. Popen with stdout/stderr pipes, text mode
+5. Two reader threads drain to bounded streams (64KB)
+6. Main loop (50ms poll):
+   - Check cancellation_requested(cancel_token)
+   - Check deadline
+   - proc.wait(timeout=POLL_INTERVAL_S)
+5. On cancel/timeout: _stop_process() 
+   - Windows: taskkill /T /F /PID (process tree) → fallback terminate/kill
+   - Unix: terminate → wait 5s → kill → wait 5s → reap
+6. Reader threads joined, pipes closed in finally
+7. Returns ToolResult with cancelled=True or timed_out error
+
+3.3 Blender execute_script (blender/capabilities.py → runner.py)
+-----------------------------------------------------------------
+Entry: blender/capabilities.py:566-575
+  def execute_script(self, script: str, _tool_context: Any = None, timeout: float | None = None):
+      token = getattr(_tool_context, "cancellation_token", None) if _tool_context else None
+      with self.cancellation_scope(token):
+          return self._run("execute_script", {"script": script}, timeout=timeout)
+
+Layer._run() (lines 251-311):
+1. _session_lock acquired
+2. Build request with session file paths
+3. token = self._cancel_token() (thread-local from cancellation_scope)
+3. Pre-flight: cancellation_requested(token) → raise BlenderCancelledError
+4. run_kwargs includes cancel_token if runner accepts it
+5. self._runner.run(request, **run_kwargs)
+
+BlenderRunner.run() (lines 443-555):
+1. Build command, write request.json to temp dir
+2. If cancel_token: _execute_supervised() else _execute()
+3. _spawn_and_collect():
+   - Pre-flight: _cancelled(cancel_token) → BlenderCancelledError
+   - Popen with pipes
+   - Reader threads for bounded output (64KB)
+   - Supervision loop (50ms poll):
+     * _cancelled(cancel_token) → cancelled=True, break
+     * deadline check → timed_out=True, break
+     * proc.wait(POLL_INTERVAL_S)
+   - If cancelled/timed_out: _stop_process() → terminate→kill→reap
+   - Finally: join readers, close pipes
+4. Parse result.json, return RunnerResult or raise typed errors
+
+BlenderRunner._stop() (lines 409-441):
+- terminate() → wait 5s → kill() → wait 5s → wait() block on reap
+- Returns True only if confirmed dead
+- No taskkill /T on Windows (uses terminate()/kill() only)
+
+Blender script runner (blender/scripts/runner.py):
+- Runs inside Blender's Python
+- execute_script (diablo_blender_ops.py:387-393):
+  - exec(compile(script)) in namespace with bpy
+  - Now wrapped in try/except → raises ValueError on script error
+- No internal cancellation polling (Blender Python doesn't check token)
+
+3.4 Voice TTS (voice/text_to_speech.py)
+-----------------------------------------
+- speak() spawns daemon thread, returns immediately
+- _speak_blocking() uses subprocess.run() with 30s timeout
+- No cancellation support (fire-and-forget)
+- No process tree termination
+
+================================================================================
+SECTION 4: FINDINGS WITH EVIDENCE
+================================================================================
+
+FINDING 1: Inconsistent Pre-Flight Cancellation Check
+------------------------------------------------------
+Severity: MEDIUM
+Files: tools/python.py (line 134), tools/terminal.py (line 166), blender/capabilities.py (line 275)
+Evidence: 
+- python.py line 134: if cancellation_requested(cancel_token): return ToolResult(...)
+- terminal.py line 166: if cancellation_requested(cancel_token): return ToolResult(...)
+- blender/capabilities.py line 275-279: token = self._cancel_token(); if token is not None and cancellation_requested(token): raise BlenderCancelledError
+Finding: Python and Terminal check pre-flight and return ToolResult; Blender raises exception. Inconsistent but functionally equivalent.
+
+FINDING 2: Blender _run() Pre-Flight vs Runner Pre-Flight Race
+----------------------------------------------------------------
+Severity: LOW
+Files: blender/capabilities.py (line 275), blender/runner.py (line 310)
+Evidence:
+- capabilities.py line 275-279: pre-flight check before runner.run()
+- runner.py line 310-315: _spawn_and_collect() also checks _cancelled(cancel_token) before spawn
+Finding: Duplicate check. Layer pre-flight raises BlenderCancelledError; runner pre-flight also raises. Redundant but not harmful.
+
+FINDING 3: BlenderRunner._stop() Does Not Kill Process Tree on Windows
+-------------------------------------------------------------------------
+Severity: HIGH
+File: blender/runner.py lines 409-441
+Evidence:
+- _stop() uses proc.terminate() → proc.kill() only
+- No taskkill /T /PID on Windows (unlike terminal.py line 105-107)
+- If Blender spawns child processes (e.g., via execute_script with subprocess.Popen), they survive cancellation
+Evidence from blender/scripts/diablo_blender_ops.py line 387-393: execute_script allows arbitrary subprocess.Popen
+Impact: Blender child processes can survive cancellation, leaving orphan processes.
+
+FINDING 4: Terminal Uses CREATE_NEW_PROCESS_GROUP But Not CTRL_BREAK_EVENT
+--------------------------------------------------------------------------
+Severity: MEDIUM
+File: tools/terminal.py lines 172-176, 102-107
+Evidence:
+- Line 176: creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+- Line 105-107: Uses taskkill /T /F /PID on cancel
+- But never uses GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group_id) to gracefully terminate PowerShell
+- Relies on taskkill which is forceful but works
+Finding: Works correctly but could be more graceful. Not a bug.
+
+FINDING 5: Python and Terminal Use Bounded Streams; Blender Runner Also
+-------------------------------------------------------------------------
+Severity: LOW (Consistent)
+Files: tools/python.py (line 17-22), tools/terminal.py (line 22-26), blender/runner.py (line 66-69)
+Evidence: All three use _BoundedStream with MAX_STREAM_CHARS = 64KB. Consistent.
+
+FINDING 6: Output Buffering - Full Capture Before Truncation
+--------------------------------------------------------------
+Severity: MEDIUM
+Files: tools/python.py, tools/terminal.py, blender/runner.py
+Evidence: All use _BoundedStream which drains full stream to EOF but retains only 64KB prefix.
+Finding: For very long-running commands with continuous output, full output accumulates in memory until process ends. Could cause OOM for very long runs. Not currently exploited but a theoretical risk.
+
+FINDING 7: Cancellation vs Timeout Distinction
+----------------------------------------------
+Severity: LOW (Consistent)
+Files: tools/python.py, tools/terminal.py, blender/runner.py
+Evidence: All three distinguish cancelled vs timed_out in ToolResult/RunnerResult.
+- cancelled=True + error="Script cancelled." (Python/Terminal)
+- timed_out=True + error="timed out" (all three)
+- Blender raises BlenderCancelledError vs BlenderTimeoutError
+Finding: Consistent behavior.
+
+FINDING 8: Cancellation Token Propagation
+-----------------------------------------
+Path: Agent → RequestContext → ToolExecutionContext → CapabilityRequest
+Evidence:
+- core/agent.py line 181-186: _active_cancellation_token property on RequestContext
+- core/agent.py line 86-89: Executor gets context via _event_payload() → ToolExecutionContext
+- tools/__init__.py line 125-126: python.run_script fn passes _tool_context=kw.get("_tool_context")
+- tools/__init__.py line 101: terminal.run_command does NOT have wants_context=True but receives _tool_context
+- tools/capability_bridge.py line 1243: CapabilityRequest includes cancellation_token=context.cancellation_token
+Finding: Token flows correctly through all paths. Terminal tool lacks wants_context=True but still receives context.
+
+FINDING 9: Blender execute_script - No Mid-Script Cancellation
+---------------------------------------------------------------
+Severity: HIGH
+Files: blender/scripts/runner.py, blender/scripts/diablo_blender_ops.py
+Evidence:
+- blender/scripts/runner.py:80-88: execute_script runs exec() without any cancellation polling
+- blender/scripts/diablo_blender_ops.py:387-393: op_execute_script runs exec() in try/except
+- BlenderRunner polls cancellation token at 50ms intervals OUTSIDE the Blender process
+- Once Blender process starts, Python script runs uninterrupted until completion or external kill
+Finding: execute_script cannot be interrupted mid-script. The Blender process is killed externally but the script runs to completion unless it happens to be at a point where the OS kills it. No cooperative cancellation inside Blender Python.
+
+FINDING 10: Process Tree Termination - Terminal vs Blender
+-----------------------------------------------------------
+Terminal (tools/terminal.py line 102-107):
+- Windows: subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], timeout=KILL_GRACE_S)
+- Kills entire process tree including grandchildren
+- Verified: test_term_tree.py shows child process killed
+
+Blender (blender/runner.py line 409-441):
+- Uses proc.terminate() / proc.kill() only
+- No taskkill /T on Windows
+- If execute_script spawns subprocess.Popen, those children survive
+Finding: Blender cannot terminate process tree. execute_script can spawn children that survive cancellation.
+
+FINDING 11: Blender Session Cleanup on Cancellation
+---------------------------------------------------
+Severity: LOW
+File: blender/capabilities.py lines 313-339
+Evidence:
+- _after_forced_termination() revalidates session after forced termination
+- Checks session_file_is_valid() - verifies BLENDER magic header
+- If invalid: _discard_session() removes session.blend and .blend1 backups
+- Logs warning: "session discarded after interrupted execute_script"
+Finding: Correctly handles torn session state after forced termination.
+
+FINDING 12: Cancellation vs Timeout Semantics Consistency
+---------------------------------------------------------
+Severity: LOW
+Files: tools/python.py, tools/terminal.py, blender/runner.py
+Evidence:
+- Python/Terminal: cancelled=True → ToolResult(cancelled=True, error="Script cancelled.")
+- Timeout: cancelled=False, timed_out=True → ToolResult(error="timed out")
+- Blender: raises BlenderCancelledError vs BlenderTimeoutError
+- Verification: All distinguish cancellation from timeout correctly
+
+FINDING 13: Permission Checks Survive Cancellation
+--------------------------------------------------
+Severity: LOW (Correct)
+Files: tools/terminal.py, tools/__init__.py
+Evidence:
+- terminal.py line 155-158: destructive_command_reason() checked BEFORE cancellation check
+- Permissions evaluated before cancellation check
+- Blender: permission check in capability_bridge.py line 1191 (execute_script = BLOCKED)
+Finding: Security gates evaluated before cancellation - correct behavior.
+
+FINDING 14: Verification and Evidence on Cancellation
+-----------------------------------------------------
+Severity: LOW
+Files: blender/capabilities.py, tools/capability_bridge.py
+Evidence:
+- Blender execute_script: verification returns None for execute_script (no independent verification)
+- Terminal/Python: verification not applicable (no independent verification for shell/python)
+- Blender render: verification checks file exists + valid PNG
+Finding: Blender execute_script has no independent verification - relies on Blender's return code. This is a gap but not a cancellation issue.
+
+================================================================================
+SECTION 5: TEST RESULTS
+================================================================================
+
+Test Commands and Results:
+--------------------------
+
+pytest tests/test_m2152_blender_cancellation.py -v
+Result: 20 passed, 1 skipped in 0.34s
+
+pytest tests/test_python.py -v
+Result: 11 passed in 2.34s
+
+pytest tests/test_terminal.py -v
+Result: 12 passed in 14.78s
+
+pytest tests/test_terminal.py tests/test_terminal_destructive_policy.py tests/test_permissions.py tests/test_filesystem.py tests/test_git_tools.py tests/test_github.py
+Result: 177 passed in 10.02s
+
+pytest tests/test_m2152_blender_cancellation.py tests/test_blender_controller.py tests/test_blender_concurrency.py tests/test_blender_vision_integration.py tests/test_s2_9_hardening.py tests/test_python.py tests/test_terminal.py tests/test_terminal_destructive_policy.py tests/test_permissions.py
+Result: 377 passed, 3 skipped in 119.65s
+
+Real Blender integration test (DIABLO_REAL_BLENDER_TESTS=1):
+pytest tests/test_m2152_blender_cancellation.py::TestRealBlenderCancellation::test_a_real_render_can_be_cancelled
+Result: 1 passed in 3.75s
+
+================================================================================
+SECTION 6: REMAINING LIMITATIONS
+================================================================================
+
+1. Blender execute_script - No mid-script cooperative cancellation
+   - Blender Python script runs to completion once started
+   - External kill only; no cooperative cancellation inside Blender Python
+   - Arbitrary Blender Python can spawn child processes that survive
+
+2. Blender process-tree termination (Windows)
+   - No taskkill /T in BlenderRunner._stop()
+   - Child processes spawned by execute_script survive cancellation
+   - Terminal tool correctly uses taskkill /T
+
+2. Output buffering - full capture in memory
+   - All three runners buffer full output in memory (bounded to 64KB)
+   - Long-running high-output commands could exceed memory before truncation applies
+   - Mitigation: 64KB limit but still buffered fully first
+
+3. Voice TTS - no cancellation support
+   - Fire-and-forget, cannot interrupt speech
+
+4. Voice STT/Wake-word - not implemented
+   - Mock only; no real audio processing
+
+4. Blender execute_script - no independent verification
+   - Relies on Blender return code only
+   - No independent verification of script effects
+
+================================================================================
+SECTION 7: VERDICT
+================================================================================
+
+VERDICT: PARTIAL
+
+Rationale:
+- Core cancellation infrastructure is solid and consistent across Python, Terminal, and Blender operations
+- Cancellation token propagates correctly through Agent → RequestContext → ToolExecutionContext → tools
+- Pre-flight checks, mid-execution polling, terminate/kill escalation, and reaping work correctly
+- Process-tree termination works for Terminal (taskkill /T) but NOT for Blender
+- Blender execute_script cannot be interrupted mid-script (cooperative cancellation missing)
+- Blender execute_script can spawn orphan child processes on cancellation
+- All deterministic tests pass (319+ tests)
+- Real Blender integration test passes (render cancellation works)
+- Security gates (permissions, path containment) preserved during cancellation
+
+================================================================================
+SECTION 8: RECOMMENDED NEXT TASKS
+================================================================================
+
+P0 - Critical:
+1. Add taskkill /T /F /PID to BlenderRunner._stop() for Windows process-tree termination
+2. Add cooperative cancellation polling inside Blender execute_script (e.g., check token at bpy.app.handlers or via bpy.app.timers)
+
+P1 - High:
+1. Add taskkill /T support to Python tool _stop_process() for consistency
+2. Implement bounded streaming output (stream processing) to avoid full memory buffering
+3. Add cooperative cancellation points in long-running Blender scripts
+
+P2 - Medium:
+1. Implement bounded streaming for terminal output
+2. Add voice TTS interruption support (SAPI doesn't support async stop easily)
+3. Add independent verification for Blender execute_script effects
+
+================================================================================
+END OF AUDIT
+================================================================================

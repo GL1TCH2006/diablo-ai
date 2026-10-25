@@ -219,8 +219,16 @@ class EvidenceTrust(str, Enum):
 #: when one is ``False``. This encodes the existing
 #: ``capability_bridge`` rule (``data.get("valid") is False`` -> ``FAILED``)
 #: generically, by key name, without embedding any tool's semantics.
+#:
+#: ``absent`` is the positive form of ``exists`` for an assertion that *wants* the
+#: subject gone - a delete. Without it, absence could never be PASSED: an absent
+#: path can only report ``exists: False``, and ``exists: False`` is by definition
+#: a failed assertion for every other verification, so the ledger would refuse a
+#: delete that genuinely worked. Evidence carries one of the two, never both:
+#: they are contradictory assertions about the same fact, and the ledger is right
+#: to refuse a contradiction.
 ASSERTION_KEYS = frozenset(
-    {"valid", "exists", "verified", "ok", "success", "passed", "readable", "complete"}
+    {"valid", "exists", "absent", "verified", "ok", "success", "passed", "readable", "complete"}
 )
 
 #: Explicit ``legacy kind -> (subject_kind, method_kind)`` mapping. Covers every
@@ -233,6 +241,7 @@ LEGACY_KIND_AXES: dict[str, tuple[VerificationSubject, VerificationMethod]] = {
     "blender_vision_render": (VerificationSubject.FILE, VerificationMethod.BLENDER_VISION_RENDER),
     "debug": (VerificationSubject.RUN, VerificationMethod.DEBUG_RUN),
     "execution": (VerificationSubject.TASK, VerificationMethod.EXECUTION_OUTCOME),
+    "file_absence": (VerificationSubject.FILE, VerificationMethod.FILE_AND_OUTPUT),
     "file_and_output": (VerificationSubject.FILE, VerificationMethod.FILE_AND_OUTPUT),
     "image_inspection": (VerificationSubject.FILE, VerificationMethod.IMAGE_INSPECTION),
     "project_tests": (VerificationSubject.RUN, VerificationMethod.PROJECT_TESTS),

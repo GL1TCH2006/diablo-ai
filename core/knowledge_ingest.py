@@ -176,7 +176,16 @@ def ingest_project_structure(
                     # Credential material never enters the graph.
                     stats["skipped_files"] += 1
                     continue
-                if not _is_within_allowed(entry, settings) if settings else True:
+                # Containment, FAIL CLOSED. A missing configuration must never widen access,
+                # so the absence of ``settings`` refuses the file rather than
+                # admitting it: with no allowed-roots set there is nothing to
+                # check containment against, and "could not check" is not
+                # permission. The parentheses are explicit because the previous
+                # one-liner parsed as ``(not _is_within_allowed(...)) if settings
+                # else True`` - which happened to fail closed but by accident, and
+                # for the wrong reason (it skipped every file, inside and outside
+                # the roots alike, which is not the same statement).
+                if (settings is None) or (not _is_within_allowed(entry, settings)):
                     stats["skipped_files"] += 1
                     continue
 

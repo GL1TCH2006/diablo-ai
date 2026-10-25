@@ -173,6 +173,71 @@ def _token_cancelled_after(delay: float) -> tuple[CancellationToken, threading.T
     return token, thread
 
 
+# --------------------------------------------------- guaranteed child cleanup
+#
+# Batch 5 Task S. Several tests here spawn a REAL child that sleeps for 60 s via
+# SleepingRunner. When a test deliberately fakes the stop confirmation - see
+# test_uncancellable_child_reports_the_ratified_pending_code, which monkeypatches
+# BlenderRunner._stop so the real kill runs but the *result* is forced to False -
+# the child can outlive the test. That leak is not cosmetic: a surviving child
+# inherits pytest's stdout handle, so any runner reading that output through a
+# pipe never sees EOF. On 2026-10-17 that is exactly what froze Batch 4 for ten
+# hours (pids 40152 / 31140 / 26076, documented in
+# data/run_reports/b4_stop_check.md).
+#
+# The fixture below records every process these tests spawn and force-kills
+# whatever is still alive on teardown. It changes no assertion and no production
+# code: it wraps subprocess.Popen in the runner module the same way the existing
+# CountingPopen helper does, and monkeypatch restores it afterwards.
+
+
+def _force_kill_pid(pid: int) -> bool:
+    """Kill one process tree, tolerating 'it was already dead'."""
+    if pid is None or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+@pytest.fixture()
+def no_leaked_children(monkeypatch):
+    """Reap every child process a test in this module spawns, guaranteed."""
+    runner_module = sys.modules["blender.runner"]
+    real_popen = runner_module.subprocess.Popen
+    created: list[subprocess.Popen] = []
+
+    def factory(cmd, *args, **kwargs):
+        proc = real_popen(cmd, *args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", factory)
+    try:
+        yield created
+    finally:
+        leaked = [p.pid for p in created if p.poll() is None]
+        for pid in leaked:
+            _force_kill_pid(pid)
+        deadline = time.monotonic() + 15.0
+        for proc in created:
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+        still = [p.pid for p in created if p.poll() is None]
+        assert not still, (
+            f"these spawned processes outlived the test: {still}. The runner's "
+            f"terminate/kill escalation did not remove them.")
+
+
 def _token_now() -> CancellationToken:
     token = CancellationToken("task-x")
     token.request("already cancelled", source="s2_9")
@@ -309,6 +374,10 @@ class TestTypedStartupFailures:
 class TestCancellationBeforeExecution:
     """A request cancelled up front never starts a Blender process."""
 
+    @pytest.fixture(autouse=True)
+    def _reap_spawned_children(self, no_leaked_children):
+        """Batch 5 Task S: guaranteed cleanup of any real child this test spawns."""
+
     def test_cancelled_token_prevents_spawn(self, monkeypatch, tmp_path):
         counting = CountingPopen()
         counting.install(monkeypatch)
@@ -348,6 +417,13 @@ class TestCancellationBeforeExecution:
 
 class TestActiveSubprocessSupervision:
     """A cancellation that arrives mid-flight stops the wait and kills the child."""
+
+    @pytest.fixture(autouse=True)
+    def _reap_spawned_children(self, no_leaked_children):
+        """Batch 5 Task S: guaranteed cleanup of any real child this test spawns.
+
+        This is what stopped test_uncancellable_child_reports_the_ratified_pending_code
+        from leaking a 60 s sleeper into the rest of the run."""
 
     def test_cancellation_during_a_real_subprocess_terminates_it(self, tmp_path):
         pid_file = tmp_path / "child.pid"

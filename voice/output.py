@@ -54,11 +54,12 @@ class VoiceOutputResult:
 class VoiceOutputRouter:
     """Speak selected structured events through a replaceable TTS backend."""
 
-    def __init__(self, tts: TTSBackend, policy: VoiceResponsePolicy | None = None) -> None:
+    def __init__(self, tts: TTSBackend, policy: VoiceResponsePolicy | None = None, interruptible: bool = True) -> None:
         self.tts = tts
         self.policy = policy or VoiceResponsePolicy()
         self._muted = False
         self._subscription = None
+        self._interruptible = bool(interruptible)
 
     @property
     def muted(self) -> bool:
@@ -71,10 +72,22 @@ class VoiceOutputRouter:
         self._muted = not self._muted
         return self._muted
 
+    @property
+    def interruptible(self) -> bool:
+        return self._interruptible
+
+    def set_interruptible(self, interruptible: bool) -> None:
+        self._interruptible = bool(interruptible)
+
     def attach_interruption_manager(self, manager) -> None:
         self._subscription = manager.subscribe(self.handle_event)
 
     def handle_event(self, event: Any) -> VoiceOutputResult:
+        # Handle cancellation events by stopping any ongoing speech if interruptible
+        event_type = str(getattr(event, "type", ""))
+        if event_type in {"task_cancel_requested", "task_cancelled"} and self._interruptible:
+            self.stop_speaking()
+
         if not self.policy.should_speak(event):
             return VoiceOutputResult(handled=False, metadata={"reason": "filtered_event"})
         text = self.policy.message_for(event)
@@ -91,6 +104,12 @@ class VoiceOutputRouter:
                 error={"error": "tts_backend_failure", "message": str(exc) or type(exc).__name__},
             )
         return VoiceOutputResult(handled=True, spoken=True, text=text, result=result)
+
+    def stop_speaking(self) -> bool:
+        """Stop any ongoing speech. Returns True if speech was stopped."""
+        if hasattr(self.tts, 'stop'):
+            return self.tts.stop()
+        return False
 
     def close(self) -> None:
         if self._subscription is not None:
