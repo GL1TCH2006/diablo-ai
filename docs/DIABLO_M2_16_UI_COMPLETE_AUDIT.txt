@@ -1,0 +1,752 @@
+================================================================================
+DIABLO COMPLETE AUDIT
+M2.16.UI - DIABLO EDGE COMPANION + PRODUCT INTEGRATION
+================================================================================
+
+This file is the authoritative record for M2.16.UI. It is written to be
+sufficient for another developer to continue the project without access to any
+conversation. Where evidence is thin, that is stated rather than smoothed over.
+
+Audit path follows the repository's existing convention
+(docs/DIABLO_COMPLETE_IMPLEMENTATION_AUDIT.txt) rather than the prompt's
+suggested docs/audits/ subdirectory, per the prompt's own instruction to defer to
+an established naming scheme.
+
+--------------------------------------------------------------------------------
+1. DATE / TIME / HEAD / GIT STATUS
+--------------------------------------------------------------------------------
+
+Audit date            : 2026-10-03
+Code state audited    : 77115d4  (the audit file itself is committed immediately
+                        after this, so 77115d4 is the exact tree these results
+                        describe; no code changed after it)
+Milestone commits     : fe6ba49, 59d0fe5, 6efc59f, b924101, 77115d4
+Base before milestone : 4e64a87
+Branch                : main
+Working tree          : clean at commit time (verified with git status)
+
+Commits in this milestone
+-------------------------
+  fe6ba49  M2.16.UI: companion state machine, edge geometry and narrow event
+           stream
+  59d0fe5  M2.16.UI: edge companion window, launch integration and end-to-end
+           tests
+  6efc59f  M2.16.UI: real-Windows companion validation
+  b924101  M2.16.UI: move backend submission off the UI thread
+  77115d4  M2.16.UI: robust wait budgets and a pre-existing test fragility fix
+  (next)   M2.16.UI: complete audit TXT and roadmap reconciliation
+
+History was preserved throughout: no reset, rebase, squash, amend, force-push,
+branch deletion or discard was performed. 4e64a87 remains an ancestor of HEAD.
+
+--------------------------------------------------------------------------------
+2. ENVIRONMENT
+--------------------------------------------------------------------------------
+
+Python                : 3.14.6
+Platform              : Windows 11 10.0.26200-SP0
+Display               : 1 monitor reported by DisplayLayer
+                       bounds/work_area 1707x1067, scale_percent 150,
+                       dpi awareness = "unaware", virtualized = True
+Ollama                : online, 4 models (qwen3:8b, qwen3:14b, qwen3:latest,
+                       nemotron-3.5-lightning:30b)
+
+The DPI-virtualisation note matters for honesty about geometry: this process is
+not per-monitor DPI aware, so display bounds describe the virtualised desktop
+rather than physical pixels. The companion consumes that abstraction as-is and
+does not change M2.16.4's contracts to compensate.
+
+--------------------------------------------------------------------------------
+3. MILESTONE SCOPE - WHAT WAS ASKED, WHAT WAS BUILT
+--------------------------------------------------------------------------------
+
+The goal was a product surface: Diablo becomes a desktop companion that lives at
+a screen edge, wakes when called, takes a task, shows real execution state,
+reports the outcome and retracts - as a *client* of the existing backend, not as
+a second desktop-control engine.
+
+Files added
+-----------
+  ui/companion_state.py           758 lines  headless state machine + controller
+  ui/edge.py                      252 lines  docking geometry, monitor choice, DPI
+  ui/companion_events.py          371 lines  Part 10 narrowing + redaction
+  ui/edge_companion.py            725 lines  borderless edge-docked Tk view
+
+Files modified
+--------------
+  ui/launch.py        + build_edge_companion / run_edge_companion /
+                       EdgeCompanionRuntime
+  ui/bridge.py        + _on_tool publishes three allowlisted metadata keys
+  main.py             + --edge-companion, --edge, --edge-speak
+
+Tests added
+-----------
+  tests/test_m216_ui_companion.py    76 tests  state machine, timing, cancellation
+  tests/test_m216_ui_event_stream.py 70 tests  vocabulary + redaction
+  tests/test_m216_ui_edge_view.py    26 tests  the view, headless
+  tests/test_m216_ui_edge_real.py    21 tests  real window, real DPI, real leaks
+  tests/test_m216_ui_integration.py  21 tests  end-to-end through real seams
+  tests/soak_edge_companion.py              long-run harness (not collected)
+  tests/real_model_edge_companion.py        bounded real-model harness
+
+Test file modified (outside the milestone, see section 12)
+-------------------------------------------------------
+  tests/test_windows_real.py     one latent limit-truncation fragility fixed
+
+--------------------------------------------------------------------------------
+4. ARCHITECTURE SUMMARY
+--------------------------------------------------------------------------------
+
+    Companion UI  (ui/edge_companion.py - Tk, borderless, topmost)
+         |  reads CompanionSnapshot; submits text; requests cancel
+         v
+    Companion Controller  (ui/companion_state.py - no tkinter import)
+         |  submit_task / cancel / get_state / get_current_task
+         |  subscribe_events / shutdown
+         v
+    ui/companion_events.py   narrow + redact  ->  CompanionEvent
+         |
+         v
+    ui/bridge.py  (AgentBridge / CoreEventBusBridge - PRE-EXISTING)
+         |
+         v
+    Agent -> TaskManager -> Executor -> Capability Layer -> Windows
+
+Four properties are enforced structurally rather than by convention:
+
+1. The logic imports no toolkit. ui/companion_state.py and ui/companion_events.py
+   contain no `import tkinter`, so the entire state machine is testable with no
+   display. The view renders a snapshot and cannot reach past it.
+
+2. There is one event vocabulary boundary. Everything the backend emits passes
+   through ui/companion_events.py, which recognises the conceptual Part 10 names,
+   the AgentEvent types the existing bridge emits, and UIStatus values; drops
+   anything unmapped; and redacts every string.
+
+3. Task identity belongs to the backend. The companion keeps its own job id for
+   display and staleness, and ui/launch.py's submitter deliberately does not
+   forward it to Agent.respond.
+
+4. Backend work never runs on the UI thread. One lazily-created daemon worker
+   ("diablo-companion-submit") performs submission; the view only polls snapshots.
+
+--------------------------------------------------------------------------------
+5. STATE MACHINE
+--------------------------------------------------------------------------------
+
+Seven states, matching Part 3 exactly:
+
+    SLEEPING -> AWAKENING -> LISTENING -> THINKING -> EXECUTING
+                                                      |         |
+                                                      v         v
+    SLEEPING <- RETURNING <- (task_completed | ERROR <-(task_failed)
+    (also <-   (also <-        task_cancelled)
+
+CompanionState.THINKING -> EXECUTING moves only when the backend reports real
+execution progress, never on submission.
+
+Notable decisions, and why:
+
+* Cancellation is a REQUEST, not an outcome. cancel() asks the backend to stop and
+  sets cancellation_requested. The companion does not move to a terminal state
+  until the backend says so. A task that completes after a cancel request is
+  reported as completed, because that is what happened.
+
+* SLEEPING is reachable from every state, so retract() is total. "Go back to the
+  edge" can never silently fail. Hiding mid-task is safe because SLEEPING ->
+  EXECUTING is not a permitted transition, so a late backend event cannot wake the
+  companion against the user's wishes.
+
+* Terminal task ids are remembered. A task that reached a terminal state cannot
+  emit again, which is what makes it safe for a user to reopen the companion to
+  read a result without losing task state (Part 14) and without a late event
+  dragging the reopened companion back into EXECUTING.
+
+* Lifecycle events (awakened/retracting/sleeping) are excluded from the task
+  progress list by an explicit kind set, so a just-finished task does not show a
+  "Sleeping" entry as its last line of progress.
+
+--------------------------------------------------------------------------------
+6. EDGE DOCKING AND SLEEPING BEHAVIOUR
+--------------------------------------------------------------------------------
+
+Placement is pure arithmetic in ui/edge.py over the M2.16.4 display abstraction:
+
+* Rectangles derive from work_area, never bounds, so the companion never lands on
+  the taskbar.
+* The monitor is chosen by cursor position, falling back to primary only when the
+  pointer is unavailable. It does not assume primary (Part 16).
+* All four edges supported; unknown edge names fall back to "right" rather than
+  raising.
+* DPI scale is read from DisplayInfo and clamped to [1.0, 2.0] so an absurd value
+  cannot produce an invisible or screen-filling window.
+* The sleeping footprint is a genuine sliver. At 100% that is 74x34 fully
+  retracted with ~62x34 still inside the work area; extended is 420x340. The
+  sleeping form is under a quarter of the extended area.
+
+A deliberate deviation, stated plainly:
+
+  Part 5 asks for click-through "except on the companion itself", and Part 15
+  requires a deterministic activation method. WS_EX_TRANSPARENT delivers the
+  first and destroys the second, because it swallows the click on the companion
+  itself. The compromise chosen is:
+    - a genuinely tiny sleeping footprint, so it cannot meaningfully intercept
+      input anywhere else;
+    - WS_EX_NOACTIVATE while sleeping, so the presence never steals focus from the
+      application the user is working in, and clicking it activates the companion;
+    - WS_EX_TOOLWINDOW always, so it stays out of the taskbar and Alt-Tab;
+    - NO global keyboard hook, NO global mouse hook, NO desktop-wide hit testing.
+
+Verified negatively by test: the module contains no SetWindowsHookEx,
+RegisterHotKey, WH_KEYBOARD_LL, WH_MOUSE_LL, GetAsyncKeyState or GetKeyState.
+
+The single native call in the milestone is GetWindowLongW/SetWindowLongW on the
+companion's OWN hwnd, which Part 8 and Part 29 explicitly permit for the companion
+window itself. It is confined to one small class (_WindowStyle) and is
+best-effort: on a host where it fails, the companion still runs.
+
+--------------------------------------------------------------------------------
+7. EVENT STREAM AND REDACTION
+--------------------------------------------------------------------------------
+
+The backend's raw event language is much wider than a person needs to see.
+ui/companion_events.py is the only place that decides what is safe to render.
+
+Recognised inputs
+  - the conceptual Part 10 names (REQUEST_ACCEPTED, TASK_CREATED, PLANNING,
+    TOOL_SELECTED, STEP_STARTED/COMPLETED, VERIFICATION_STARTED/COMPLETED,
+    RECOVERY_STARTED, CANCELLATION_REQUESTED, TASK_COMPLETED/FAILED/CANCELLED)
+  - the AgentEvent.type values the existing bridge emits (status, activity,
+    success, cancelled, error)
+  - UIStatus values carried on generic envelopes
+  - tool-level status, which takes priority
+
+Deliberately NOT mapped
+  - "ready" / "idle" / "closed" status heartbeats: they say nothing a user needs,
+    and mapping them made the progress list flicker.
+  - a tool reporting "cancelled": that is one tool's outcome, not the task's. The
+    task-level terminal event is still to come, and rendering it as a cancellation
+    would make the companion claim an outcome the backend never reported.
+
+Redaction applied to every rendered string
+  - credential-shaped assignments (api_key, token, password, secret, bearer,
+    authorization, session_key, ...) in punctuation AND prose forms
+    ("my api key is VALUE")
+  - bare provider keys (sk-, rk-, ghp_, gho_, xox*, ...)
+  - Authorization: Bearer <jwt>
+  - labelled native handles (hwnd, handle, runtime_id, process_id, pid, ...)
+  - bare 0x... addresses
+  - newlines and control characters, collapsed to one line
+  - length caps: 240 chars for a message, 60 for a progress summary
+
+Metadata policy
+  AgentEvent.metadata carries the backend's ENTIRE raw source event. The mapper
+  reads exactly three keys from an explicit allowlist - tool, tool_status, detail -
+  and never reads source_event. An allowlist rather than a denylist, because a
+  denylist silently forwards whatever nobody thought to forbid.
+
+  ui/bridge.py::_on_tool was extended to populate those three keys. The existing
+  `message` format was NOT changed, because a pre-existing test
+  (test_floating_companion.py) asserts on it and Part 35 forbids weakening tests.
+  This is what lets the companion show "Opening Calculator" and distinguish a
+  permission prompt from ordinary progress.
+
+--------------------------------------------------------------------------------
+8. BACKEND LIFECYCLE - THE PART 18 DECISION
+--------------------------------------------------------------------------------
+
+Chosen: (A) attach in-process to the Agent the companion is handed.
+
+Not (B), and not (C). A separate backend process would mean a second Agent, and a
+second Agent is precisely what Part 10 and Rules 13-16 forbid. The repository's
+Agent entry point is already in-process and already the single owner of the request
+lifecycle, so the companion attaches to it and starts nothing.
+
+Consequences, stated as facts:
+  - the companion spawns no child process, so there is no orphan to manage;
+  - the floating companion (--companion) and the edge companion
+    (--edge-companion) are two presentations of ONE backend. A bridge may be
+    passed in and is then deliberately NOT closed by the edge companion, so
+    neither view owns it;
+  - there is exactly one submitter, one canceller and one subscription set.
+
+--------------------------------------------------------------------------------
+9. THREADING
+--------------------------------------------------------------------------------
+
+UI thread (Tk mainloop): rendering, input, the frame timer, and nothing else.
+Backend work: the existing Agent and task execution.
+
+Backend submission happens on exactly one lazily-created daemon worker named
+"diablo-companion-submit", fed by a queue. submit_task hands over a work item and
+returns immediately.
+
+This was a real defect found and fixed during this milestone: submission
+originally called the bridge inline, and the view calls submit_task from Tk's
+main thread, so the UI sat inside Agent.respond for the length of a whole model
+and tool turn. With a real model that is tens of seconds of frozen companion -
+a direct Part 19 violation. Regression cover: seven tests, including one that
+asserts submit_task returns in under 0.5s against a deliberately blocked bridge.
+
+Shutdown stops the worker with a sentinel and a bounded join, so no thread
+outlives close() even when the backend is mid-turn. Verified after 8 full
+companion cycles: thread delta 0.
+
+The worker catches Exception, not BaseException. Swallowing KeyboardInterrupt or
+SystemExit inside a daemon thread would be worse than letting it end; what matters
+is that the controller RECOVERS, which it does because _inflight is decremented in
+a finally and the next submission starts a fresh worker. Tested.
+
+--------------------------------------------------------------------------------
+10. TEST MATRIX AND EVIDENCE
+--------------------------------------------------------------------------------
+
+Every number below was produced by running the suite, not estimated.
+
+Full deterministic suite
+  3362 passed, 218 skipped        (baseline before this milestone: 3163 / 197)
+  baseline reproduced exactly with the new files excluded, confirming the delta is
+  this milestone's 199 tests
+
+Full real Windows suite (DIABLO_REAL_WINDOWS_TESTS=1)
+  3536 passed, 44 skipped         (baseline before this milestone: 3316 / 44)
+
+M2.16.UI suites alone, real Windows enabled
+  295 passed, 0 skipped, 0 access violations
+
+Static checks
+  compileall (whole repo, excluding .venv)   clean
+  pip check                                  No broken requirements found
+  package imports (9 key modules)            0 failures
+
+Leak checks
+  8 full companion cycles (activate, submit, cancel, retract, close, destroy):
+      visible windows  22 -> 22   delta +0
+      threads           1 -> 1    delta +0
+  Real-window suite additionally asserts per-test: no leaked windows, no leaked
+  threads, no accumulated timers, bounded event history across 40 cycles.
+
+Real-Windows coverage (tests/test_m216_ui_edge_real.py)
+  window actually appears; borderless; WS_EX_TOOLWINDOW present;
+  WS_EX_NOACTIVATE present while sleeping and dropped once awake; small sleeping
+  footprint; placement on a real monitor for all four edges; real DPI respected;
+  no hardcoded 1920x1080; Tk accepts the generated geometry string; full
+  launch/activation/shutdown; repeated launch refused; close idempotent;
+  idle frames do not churn the display layer.
+
+--------------------------------------------------------------------------------
+11. SOAK (PART 30)
+--------------------------------------------------------------------------------
+
+Harness: tests/soak_edge_companion.py. Runs the real companion in a real Tk
+mainloop - not pump_once - because timer and handler accumulation is invisible
+unless after-callbacks actually fire and reschedule.
+
+Result of a 32-minute run:
+  duration                31.9 min
+  wake/task cycles        640
+  samples                 384 (every 5s)
+  cpu time used           22.62 s  (1.2% of wall)
+  working set             49.2 -> 51.0 MB  (delta +1.9 MB)
+  threads                 1 -> 1
+  visible windows         23 -> 23
+  pending tk timers       2 -> 2        (stable; no accumulation)
+  companion event history 0 -> 40        (bounded by design)
+  companion progress      0 -> 3
+  companion windows       1 -> 1        (no duplicate window over 640 cycles)
+  final state             thinking     (shutdown cancelled the in-flight task)
+  bridge unsubscribes     1
+  companions after exit   0
+  VERDICT                 SOAK PASS
+
+Reproduce with:  python tests/soak_edge_companion.py --minutes 30
+
+Honest note on the harness itself: three bugs were found and fixed while building
+it, and they are the kind that produce a green report that means nothing -
+  - GetProcessMemoryInfo was failing silently, so the memory column read 0.0 MB and
+    the memory-growth check was vacuous. Now tries K32GetProcessMemoryInfo with
+    argtypes, then falls back to psapi.
+  - GetProcessTimes with None for its optional pointer arguments raised an access
+    violation on this interpreter, which aborted every sample. Now passes real
+    buffers. (Separately, GetProcessTimes reported success while returning zero
+    kernel and user times on this machine, so cpu_seconds uses time.process_time,
+    which CPython implements natively.)
+  - The report printed "NO SAMPLES COLLECTED" with no explanation, which reads
+    like a clean run. It now prints the errors that caused it.
+
+--------------------------------------------------------------------------------
+12. REAL-MODEL VALIDATION (PART 29) - PARTIAL, AND THE KEY FINDING
+--------------------------------------------------------------------------------
+
+Ollama was available, so this was attempted rather than deferred.
+Harness: tests/real_model_edge_companion.py - real settings, real model, real
+Agent, real PermissionManager, real capability runtime, real M2.16.6 desktop
+workflow, with the companion as the only UI.
+
+Three runs, qwen3:8b, latency 0.6-0.7s per turn:
+
+  Run 1  "Open Calculator."
+         -> task_completed at 0.6s
+         tools selected: applications.open, applications.open
+         progress: "applications.open: running", "applications.open - ok"
+
+  Run 2  "Open Calculator, then verify that it is open."
+         -> task_cancelled at 0.5s
+         tools selected: applications.open, applications.open
+         reason: cancelled because no confirmation channel was available
+
+  Run 3  "Open Calculator."  (with --confirm)
+         -> task_completed at 0.5s
+         tools selected: applications.open, applications.open
+
+What this establishes:
+  - the companion integrates end-to-end with the real Agent, the real model, the
+    real event bus and the real permission path. Not a simulation.
+  - terminal state reaches the companion correctly for success AND cancellation.
+  - Run 2 is a positive result about security, not a failure: a tool requiring
+    confirmation was REFUSED because the companion's confirmer was None. The UI
+    cannot bypass the PermissionManager. Part 18 / audit question 6 hold under a
+    real model.
+
+What this does NOT establish - stated plainly:
+  - In 0 of 3 runs did the model select an M2.16.6 desktop.* workflow tool. All
+    three chose the older applications.open capability, which is the PowerShell
+    launch path that predates this work.
+  - No workflow verification ran in any session (0 verification hints).
+  - In run 2 the model passed the whole sentence as the application name
+    ("Calculator, then verif..."), i.e. 8b argument fidelity is weak.
+  - Sample size is N=3 on one machine with one model. No claim is made about
+    natural-language desktop autonomy.
+
+CONCLUSION: real-model tool selection for the M2.16.6 desktop workflow tools
+remains UNPROVEN. This is now seven milestones stale and is the single most
+valuable gap to close.
+
+--------------------------------------------------------------------------------
+13. DEFECTS FOUND BY VALIDATION AND FIXED
+--------------------------------------------------------------------------------
+
+Every item below was found by a test or a measurement, not by inspection.
+
+In code written during this milestone:
+  1. STOP vanished the instant it was pressed. Visibility keyed off `can_cancel`,
+     which goes false once a cancellation is registered - so a registered request
+     was indistinguishable from a lost one. Now keyed off
+     `cancellation_requested`, relabelled STOPPING.
+  2. retract() was refused from THINKING and EXECUTING. "Go back to the edge"
+     could silently fail. SLEEPING is now reachable from every state.
+  3. activate() during RETURNING wiped the task and the result, violating Part 14
+     ("do not lose task state"). Fixed, with terminal task-id tracking so the
+     retained id cannot receive further events.
+  4. A zero peek/dwell window meant "never fire" instead of "fire immediately",
+     leaving the companion stuck in RETURNING forever when animated with no
+     delay.
+  5. Lifecycle events polluted the task progress list.
+  6. Tk implements -transparentcolor by setting WS_EX_LAYERED from an idle
+     handler, which rewrote the extended window style and silently dropped
+     WS_EX_NOACTIVATE. Styling during construction was undone before the first
+     frame completed. Now applied after every geometry commit, and only on change.
+  7. Display enumeration ran on EVERY frame, because the frame path called
+     redock(). Part 5 forbids constant polling. Now cached, refreshed only by the
+     rate-limited monitor check; asserted by test.
+  8. Backend submission ran on the UI thread (section 9). The most serious of
+     these.
+  9. Permission denial was rendered as a task ERROR rather than as a permission
+     prompt, because the bridge flattened tool status into a status enum and the
+     mapper had nothing to distinguish them. Fixed with the three-key allowlist.
+ 10. Five redaction defects, each found by a test and each a real leak or
+     mis-redaction: `Authorization: Bearer <jwt>` redacted the word "Bearer" and
+     left the token; GitHub-style ghp_ keys were missed because the pattern
+     required a hyphen; "my api key is VALUE" redacted the word "is"; handle
+     substitution used the separator capture group and emitted a bare
+     "= [handle]"; NaN timestamps passed a positivity check.
+
+Pre-existing, outside this milestone:
+ 11. tests/test_windows_real.py::test_filtering_by_name_finds_this_interpreter
+     enumerated with limit=20 and then asserted the running interpreter was in the
+     result. This machine has 22 live python processes, so the current one fell
+     outside the truncated result and the test failed - while filtering by name
+     demonstrably does find it (probed: limit=20 misses, limit=40 contains). The
+     assertion was really about enumeration order. Limit raised to 512. This is a
+     minimal robustness fix, not a relaxation: the property named by the test is
+     unchanged and was previously untestable under load.
+
+--------------------------------------------------------------------------------
+14. SECURITY AUDIT
+--------------------------------------------------------------------------------
+
+The companion is an untrusted presentation boundary. It is treated as one.
+
+  - UI text is never treated as an instruction. It becomes a normal Agent request
+    through the existing lifecycle and nothing more. Tested.
+  - The companion cannot bypass permissions. It has no capability access at all;
+    every request goes through the Agent, which goes through the PermissionManager.
+    Demonstrated live in real-model run 2, where a confirmation-requiring tool was
+    refused.
+  - No secrets are stored in UI state. The companion holds task text, a job id, a
+    progress list and a terminal message. No credential field exists.
+  - Secrets are not rendered from backend events. Redaction is applied to every
+    string that becomes a companion event, and raw metadata is never forwarded.
+    Tested against api_key, bearer tokens, GitHub keys and labelled/bare handles.
+  - Native handles do not escape. The only handle the companion ever touches is
+    its own, and it never enters any model or event payload. The handle-key
+    redactor strips even mentions from text.
+  - Event injection cannot grant permission. Injected or malformed events can at
+    worst move the companion's own display state; they cannot reach the Agent, the
+    TaskManager or the PermissionManager. Unmappable payloads are dropped.
+  - The companion imports no Windows capability and no Agent. Asserted by AST
+    inspection of the module's imports, not by matching prose.
+
+--------------------------------------------------------------------------------
+15. PERMISSION / CANCELLATION / VERIFICATION AUDIT
+--------------------------------------------------------------------------------
+
+  - Exactly one PermissionManager, owned by the product entry point. The companion
+    holds a reference to nothing of the sort; it is not importable from the
+    companion layer.
+  - STOP and Escape both request cancellation through the existing bridge, which
+    calls Agent's active cancellation token. No separate cancellation mechanism was
+    introduced. Tested that the token is actually requested.
+  - The UI reflects CANCELLATION_REQUESTED and then WAITS. The companion does not
+    claim "cancelled" until the backend reports task_cancelled. Tested both
+    directions, including a task that completes after a cancel request.
+  - Verification remains independent and authoritative. The companion renders a
+    verification event; it never produces one and never interprets one as success.
+  - Terminal status is derived from backend state only. Success is never inferred
+    from the absence of errors - the companion stays in THINKING if no terminal
+    event arrives rather than rounding up to done. This is deliberate and is a
+    known behaviour to be aware of: see limitations.
+
+--------------------------------------------------------------------------------
+16. AUDIT CHECKLIST - THE 40 QUESTIONS
+--------------------------------------------------------------------------------
+
+ 1. Exactly one authoritative Executor?        YES  (companion imports none)
+ 2. Exactly one TaskManager?                    YES  (companion imports none)
+ 3. Exactly one TaskStore?                      YES  (companion imports none)
+ 4. Exactly one VerificationLedger?             YES  (companion imports none)
+ 5. PermissionManager still authoritative?      YES
+ 6. Can the companion bypass permissions?       NO   (proven live, real-model run 2)
+ 7. Can it directly control Windows?            NO   (AST-tested: no capability
+                                                      imports; only its own hwnd
+                                                      for WS_EX_NOACTIVATE)
+ 8. Can raw native handles escape?              NO   (own hwnd only, never in a
+                                                      payload; text mentions are
+                                                      redacted)
+ 9. Can request_id/task_id be forged?           NO   (the UI's job id is never
+                                                      forwarded to the Agent)
+10. Does cancellation reach backend execution?  YES  (agent token requested)
+11. Does it reach desktop capabilities?         YES  (pre-existing token plumbing,
+                                                      unchanged and previously
+                                                      validated)
+12. Can queued mutations run after cancel?      NO   (pre-existing guarantee)
+13. Can uncertain mutations be replayed?        NO   (pre-existing guarantee)
+14. Can stale windows be targeted?              NO   (pre-existing M2.16.5/6 refusal)
+15. Can ambiguous windows be selected?          NO   (pre-existing refusal)
+16. UIA runtime_id excluded from identity?      YES  (pre-existing)
+17. Application text marked untrusted?          YES  (pre-existing)
+18. Can UI events inject trusted instructions?  NO   (events only move display
+                                                      state; no backend reach)
+19. Can the companion leak secrets?             NO   (redaction tested; no
+                                                      credential state exists)
+20. Can it create duplicate windows?            NO   (registry refuses; 640 soak
+                                                      cycles showed exactly 1)
+21. Can it create duplicate backend workers?    NO   (one worker, asserted; soak
+                                                      thread count constant at 1)
+22. Can event subscriptions accumulate?         NO   (attach is idempotent; close
+                                                      unsubscribes exactly once)
+23. Can timers accumulate?                      NO   (asserted; soak stable at 2)
+24. Can threads remain after shutdown?          NO   (delta 0 after 8 cycles and
+                                                      after a 32-min soak)
+25. Can child processes remain?                 NO   (the companion starts none)
+26. Multi-monitor placement works?              YES  (cursor-preferred, work-area
+                                                      based, all four edges)
+27. DPI behaviour reasonable?                   YES  (clamped, consumed from
+                                                      DisplayLayer, contracts
+                                                      unchanged)
+28. Does sleeping mode interfere with input?    NO   (sliver footprint, NOACTIVATE,
+                                                      no global hooks, no
+                                                      desktop-wide hit testing)
+29. UI thread responsive during tasks?          YES  (submission moved to a worker;
+                                                      regression-tested)
+30. Backend failure leaves it recoverable?      YES  (ERROR, then a new task)
+31. Completion from authoritative state?        YES  (terminal events only)
+32. Verification still independent?             YES  (unchanged, untouched)
+33. Visually distinct from a normal window?     YES  (borderless, topmost,
+                                                      chroma-keyed, tool window)
+34. Still useful without voice?                 YES  (click + text entry)
+35. Voice honestly documented as incomplete?    YES  (no STT/wake-word code exists;
+                                                      asserted by test)
+36. Real-model support honestly documented?    YES  (section 12: PARTIAL, N=3)
+37. All M2.16 milestones represented?           YES  (section 17)
+38. Deferred clearly separated from complete?   YES  (section 14 of the markdown
+                                                      audit + section 18 here)
+39. Are tests reproducible?                     YES  (soak and real-model
+                                                      harnesses are committed and
+                                                      take a --minutes/--timeout
+                                                      argument)
+40. Is the repository clean?                    YES  (verified after the final
+                                                      commit)
+
+--------------------------------------------------------------------------------
+17. SUBSYSTEM-BY-SUBSYSTEM STATUS
+--------------------------------------------------------------------------------
+
+  Core Agent / Planner / Tool Router        COMPLETE (unchanged)
+  PermissionManager                         COMPLETE (unchanged, authoritative)
+  TaskManager / TaskStore                   COMPLETE (unchanged, single instance)
+  Durable execution plans                   COMPLETE (unchanged)
+  Cancellation                              COMPLETE (unchanged, token plumbing)
+  VerificationLedger                        COMPLETE (unchanged, independent)
+  Bounded recovery                          COMPLETE (unchanged)
+  Memory / rules security                   COMPLETE (unchanged)
+  Adaptive Qwen3 routing                    COMPLETE (unchanged)
+  Knowledge Graph                           PARTIAL (deliberately minimal, unchanged)
+  Coding workflows                          COMPLETE (unchanged)
+  Blender integration                       COMPLETE (unchanged)
+  Vision infrastructure                     PARTIAL (no producer beyond geometry)
+  M2.16.1 Window Foundation                 COMPLETE
+  M2.16.2 Pointer Foundation                COMPLETE
+  M2.16.3 Keyboard Foundation               COMPLETE
+  M2.16.4 Screen / Display Foundation       COMPLETE (consumed, NOT modified)
+  M2.16.5 UIA + Visual Targeting            COMPLETE WITH LIMITATIONS
+                                            (uia_select / uia_expand_collapse
+                                            still unproven on a real control)
+  M2.16.6 Integrated Desktop Workflows      COMPLETE WITH LIMITATIONS
+                                            (composition only; real-model tool
+                                            selection unproven)
+  M2.16.UI Edge Companion                   COMPLETE WITH LIMITATIONS
+  Backend / companion lifecycle             COMPLETE (single in-process Agent)
+  Threading                                 COMPLETE
+  Event subscriptions                       COMPLETE
+  Resource leaks                            COMPLETE (0 windows, 0 threads)
+  Process identity                          COMPLETE
+  Screen capture                            COMPLETE WITH LIMITATIONS
+                                            (window-pixel capture unavailable in
+                                            this session)
+  Voice: TTS                                COMPLETE (optional, off by default)
+  Voice: STT / wake word / VAD              DEFERRED (honestly; no code pretends
+                                            otherwise)
+  Real-model validation                     PARTIAL (N=3; see section 12)
+  Documentation                             COMPLETE (this file + markdown §11)
+
+Nothing is marked BROKEN. Nothing is claimed complete that is not.
+
+--------------------------------------------------------------------------------
+18. KNOWN LIMITATIONS OF M2.16.UI
+--------------------------------------------------------------------------------
+
+1. The companion stays in THINKING if the backend never emits a terminal event.
+   This is deliberate - Part 13 forbids inferring success from the absence of
+   errors - but it means a backend that dies silently leaves the user looking at
+   "Working..." with a working STOP button and no explanation. A future watchdog
+   could surface "still waiting" without claiming an outcome.
+
+2. Sleeping is not click-through. See section 6. The two requirements conflict and
+   the compromise is documented rather than silently chosen.
+
+3. The process is DPI-virtualised (awareness "unaware"), so companion geometry is
+   expressed in the virtualised coordinate space that Tk also uses. It is
+   self-consistent and validated on real hardware, but it is not per-monitor DPI
+   aware. Fixing that means a process-level manifest change, which is outside this
+   milestone's blast radius and was deliberately not done.
+
+4. Multi-monitor placement is validated on a single-monitor machine. The geometry
+   is tested exhaustively against synthetic displays including negative virtual
+   desktop coordinates, and against the real single display, but no second
+   physical monitor was available.
+
+5. The companion has no tray icon, no settings panel and no theming. Deliberate:
+   Part 23 asks for a companion, not an application suite.
+
+6. Real-model tool selection for M2.16.6 workflows is unproven (section 12).
+
+--------------------------------------------------------------------------------
+19. KNOWN ENVIRONMENTAL ISSUES (pre-existing, not caused by this milestone)
+
+1. The full suites print "Windows fatal exception: access violation" repeatedly to
+   stderr while every test passes and the process exit code is 0. VERIFIED
+   PRE-EXISTING: with all five M2.16.UI test files excluded, the suite reproduces
+   the exact M2.16.6 baseline (3163 passed / 197 skipped) and still emits ~194 of
+   these. M2.16.UI's own suites emit zero. Not investigated further; out of scope
+   and not a regression.
+
+2. This machine currently runs 22 python processes, which is what exposed the
+   limit-truncation fragility fixed in section 13.11.
+
+3. A stale ApplicationFrameHost from an earlier session (30-09) is present and can
+   contribute to window-matching ambiguity in pre-existing M2.16.6 tests. Two such
+   tests flaked once during a full real run and pass in isolation; the full real
+   suite is green.
+
+--------------------------------------------------------------------------------
+20. DEFERRED WORK
+
+  - Real-model tool selection for the M2.16.6 desktop.* workflow tools. The single
+    most valuable open item.
+  - STT, wake word, VAD and barge-in. No code pretends these exist.
+  - Consuming DesktopWorkflowResult for richer rendering. The mapper already
+    consumes the event stream; a typed result renderer is future work.
+  - A "still waiting" watchdog for the no-terminal-event case (limitation 1).
+  - Per-monitor DPI awareness via a process manifest.
+  - uia_select / uia_expand_collapse against a real ListView/TreeView/ComboBox.
+  - The pre-existing access-violation noise in section 19.1.
+
+--------------------------------------------------------------------------------
+21. ROADMAP
+
+  M2.16.1 Window Foundation                 COMPLETE
+  M2.16.2 Pointer Foundation                COMPLETE
+  M2.16.3 Keyboard Foundation               COMPLETE
+  M2.16.4 Screen / Display Foundation       COMPLETE
+  M2.16.5 UIA + Visual Targeting            COMPLETE WITH LIMITATIONS
+  M2.16.6 Integrated Desktop Workflows      COMPLETE WITH LIMITATIONS
+  M2.16.UI Edge Companion                   COMPLETE WITH LIMITATIONS
+  M2.17 Persistent Autonomy                 not started
+  M2.18a Vision Foundation                  not started
+  M2.18b Blender Vision Depth               not started
+  Voice / STT / VAD / wake word             not started
+
+No future milestone is marked complete and none has been invented to fill the
+table.
+
+--------------------------------------------------------------------------------
+22. RECOMMENDED NEXT MILESTONE
+
+M2.17 Persistent Autonomy - entered with ONE prerequisite task: make the model
+actually select the M2.16.6 desktop.* tools.
+
+The reasoning is specific. Seven milestones of desktop capability now exist and are
+validated deterministically and against real Windows, but in three real sessions
+the model never chose them, preferring the older applications.open path. Building
+autonomy on top of tools the model does not select would produce a milestone whose
+capability is real and whose product surface is empty. Closing the selection gap -
+tool descriptions, catalogue exposure, or model choice - is worth more than any new
+surface right now.
+
+--------------------------------------------------------------------------------
+23. FINAL VERDICT
+
+M2.16.UI is COMPLETE WITH LIMITATIONS.
+
+The companion exists as a real product surface: a borderless, edge-docked
+presence that wakes on click, takes a task through the existing Agent, shows
+meaningful progress, offers a cancellation that reports itself honestly, displays
+the outcome and retracts - and then closes without leaking a window, a thread, a
+timer or a subscription. It was validated on real Windows across all four edges at
+real DPI, soaked for 32 minutes over 640 cycles, and driven end-to-end by a real
+Ollama model through the production permission path.
+
+The architectural constraint that mattered most - that the companion is a client
+and not a second control plane - held throughout, and is enforced by tests rather
+than by convention. Five redaction defects, six state-machine and lifecycle
+defects, a DPI/extended-style interaction, a per-frame display enumeration and one
+serious UI-thread blocking bug were found by validation and fixed.
+
+The honest headline is the real-model result: the companion integrates correctly
+with the model, and the model does not yet use the desktop workflow tools. That
+gap is stated rather than smoothed over, and it is what should be worked next.
+
+================================================================================
+END OF AUDIT
+================================================================================

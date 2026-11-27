@@ -1,0 +1,4 @@
+=== app.py ===
+replace     return computed == candidate
+-    return computed == candidate
++    return computed == stored

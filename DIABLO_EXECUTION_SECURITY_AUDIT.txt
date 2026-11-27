@@ -1,0 +1,509 @@
+================================================================================
+DIABLO EXECUTION SECURITY HARDENING AUDIT
+================================================================================
+Generated: 2026-10-20
+Project: diablo-ai (C:\PROJECTS\jarvis like ai for my computer\diablo-ai)
+Branch: reliability-batch-1
+HEAD: a74b53c
+Working tree: dirty (28 pre-existing modified files, 32 untracked files - all preserved)
+
+================================================================================
+
+SECTION 1: REPOSITORY STATE VERIFICATION
+================================================================================
+
+Branch: reliability-batch-1
+HEAD: a74b53c (docs: M2.17.x Task 1 verification pipeline map)
+
+Modified files (28 - all pre-existing, preserved):
+  .gitignore, README.md, blender/scripts/diablo_blender_ops.py,
+  config/default_config.toml, core/knowledge_graph.py, core/knowledge_ingest.py,
+  core/verification.py, core/verification_ledger.py,
+  docs/DIABLO_M2_16_UI_M2_17_COMPLETE_AUDIT.txt,
+  docs/M2_17_TASK0_BASELINE_AND_SKIP_INVENTORY.txt, main.py,
+  tests/m217_restart_child.py, tests/test_applications.py,
+  tests/test_knowledge_ingest.py, tests/test_m213_coding_workflow.py,
+  tests/test_m216_ui_companion.py, tests/test_m216_ui_integration.py,
+  tests/test_m217_autonomy_integration.py, tests/test_recovery_p10_repair.py,
+  tests/test_s2_9_hardening.py, tests/test_terminal_state_invariant.py,
+  tools/__init__.py, tools/applications.py, tools/filesystem.py,
+  ui/companion_state.py, ui/edge_companion.py, ui/launch.py, ui/terminal.py
+
+Untracked files (32 - pre-existing + 2 new from previous tasks):
+  AGENTS.md, DIABLO_*_REPORT*.txt, audit_checks.py, data/, personas/, scripts/,
+  tests/test_blender_real_integration.py, tests/test_companion_worker_regression.py,
+  tests/test_edge_companion_speech_probe.py, tests/test_filesystem_delete_verification.py,
+  tests/test_m217_*.py, tests/test_m218_delete_containment.py,
+  tests/test_main_ui_entrypoints.py, tests/test_orb_*.py, tests/test_personas.py,
+  tests/test_workspace_path_resolution.py, ui/orb/
+
+No commits, pushes, resets, cleans, stashes, or branch switches performed.
+
+================================================================================
+
+SECTION 2: EXECUTION-PATH INVENTORY
+================================================================================
+
+All subprocess execution entry points traced:
+
+--------------------------------------------------------------------------------
+2.1 terminal.execute (tools/terminal.py:20-52)
+--------------------------------------------------------------------------------
+Command vector:  ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", <user-command>]
+Shell: Yes (PowerShell)
+Working directory: settings.scratch_dir or user-provided working_dir
+Timeout: configurable (default 60s), max bounded by caller
+Output: captured stdout/stderr, text mode, UTF-8, errors=replace
+Cancellation: Checked via cancellation_requested() at dispatch only
+Process termination: subprocess.run() waits for completion (no kill on timeout - returns error)
+
+Permission gate:
+  - Level: SENSITIVE
+  - Destructive command policy: tools/terminal.py:24-26 calls destructive_command_reason()
+  - Blocklist: settings.terminal_blocklist (substring match)
+  - Shell-native detection: config/permissions.py:169-200 detects Remove-Item -Recurse, del /s, etc.
+  - Auto-allow: settings.terminal_auto_allow (exact prefix match, no chaining)
+  - Session block: PermissionManager._session_blocked
+  - User preference: deny/allow via PreferencesStore
+
+--------------------------------------------------------------------------------
+2.2 python.run_script (tools/python.py:14-47)
+--------------------------------------------------------------------------------
+Command vector: [sys.executable, <script-path>, <args...>]
+Shell: NO (direct argv list)
+Working directory: script's parent directory (cwd=str(target.parent))
+Timeout: configurable (default 120s)
+Output: captured stdout/stderr, text mode, UTF-8, errors=replace
+Cancellation: NOT checked - runs to completion or timeout
+
+Permission gate:
+  - Level: SENSITIVE (downgrades to NORMAL if script path within allowed_roots)
+  - Path containment: path_is_within(_p(script), allowed_roots)
+  - No destructive command analysis (not a shell)
+  - File existence check before execution
+
+Explicit documentation (tools/python.py:17-19): "NOT a sandbox - a Python script has Diablo's privileges"
+
+--------------------------------------------------------------------------------
+2.3 Blender execution (blender/runner.py, blender/capabilities.py, blender/scripts/runner.py)
+--------------------------------------------------------------------------------
+Command vector: [blender.exe, [scene.blend], --background, --factory-startup, --disable-autoexec, --python-exit-code 1, --python <dispatch_script>, --, <request.json>, <result.json>]
+Shell: NO (direct argv list)
+Working directory: tempfile.TemporaryDirectory() per invocation
+Timeout: configurable (default 120s, render gets 2x)
+Output: bounded capture (64KB retained, rest drained to prevent pipe deadlock)
+Cancellation: Full supervised cancellation via Popen + cancel_token
+  - Checked before spawn, during wait loop (50ms poll), on timeout
+  - Terminate → Kill escalation (5s grace each)
+  - Child always reaped (finally block)
+  - Returns BlenderCancelledError with terminated=true/false
+Process termination: Bounded terminate-then-kill with reap guarantee
+Output truncation: Reported in RunnerResult (stdout_truncated, stderr_truncated)
+
+Permission gate (via capability bridge):
+  - Level: Determined by CapabilityBridge.permission_level()
+  - Operation inventory: blender/operations.py (READ_ONLY_OPERATIONS vs SESSION_MUTATING_OPERATIONS)
+  - Session lock: threading.RLock serializes all operations per layer
+  - Path validation: scene_file must be session.blend in layer's work_dir
+  - execute_script: ALLOWS ARBITRARY BLENDER PYTHON (see blender/scripts/diablo_blender_ops.py:387-393)
+
+--------------------------------------------------------------------------------
+2.4 Voice TTS (voice/text_to_speech.py:22-60)
+--------------------------------------------------------------------------------
+Command vector: ["powershell", "-NoProfile", "-NonInteractive", "-Command", <generated-script>]
+Shell: Yes (PowerShell)
+Working directory: N/A
+Timeout: 15s (probe), 30s (speak), 35s join timeout
+Output: captured, errors logged
+Cancellation: NOT supported (fire-and-forget thread)
+Process termination: subprocess.run() waits; background thread daemon=True
+
+Permission gate:
+  - No explicit tool registration (TTS is internal, not model-callable)
+  - voice_enabled setting gates UI invocation
+  - SAPI probe: is_sapi_available() checks voice count
+  - Edge companion: _tts_available() probes voice_capabilities.voice_status()
+
+--------------------------------------------------------------------------------
+2.5 applications.open (tools/applications.py:171-268)
+--------------------------------------------------------------------------------
+Command vector: ["powershell", ...] for Start-Apps lookup, then Start-Process or ShellExecute
+Shell: Yes (PowerShell for lookup), native process layer for launch
+Working directory: N/A
+Timeout: 15s lookup, 5s x 6 polls for confirmation
+Output: captured
+Cancellation: NOT supported
+Process termination: Confirmation polls only; no kill
+
+Permission gate:
+  - Level: NORMAL (whitelisted) / SENSITIVE (other)
+  - Whitelist: settings.app_whitelist
+  - Known paths: settings.app_known_paths
+
+--------------------------------------------------------------------------------
+2.6 system.info (tools/system.py:93-176)
+--------------------------------------------------------------------------------
+Command vector: ["powershell", ... Get-CimInstance ...] fallback
+Shell: Yes (PowerShell fallback)
+Working directory: N/A
+Timeout: 25s
+Output: captured, JSON parsed
+Cancellation: NOT supported
+
+Permission gate: SAFE (read-only)
+
+--------------------------------------------------------------------------------
+2.7 git.* tools (tools/git.py)
+--------------------------------------------------------------------------------
+Command vector: ["git", <args...>]
+Shell: NO (direct argv)
+Working directory: user-provided root (validated via path_is_within)
+Timeout: 30s default
+Output: captured, truncated to 12KB for diff
+Cancellation: NOT supported
+Process termination: subprocess.run() waits
+
+Permission gate:
+  - Read ops (status, diff, log, branch): SAFE
+  - Write ops (stage, commit): NORMAL
+  - Destructive ops (push, restore, reset, rebase): SENSITIVE, gated by git_*_policy settings
+    - Default "blocked" → ToolBlockedError
+    - "confirm" → requires confirmation
+    - "allow" → allowed
+  - Ref validation: _valid_git_ref() rejects leading "-", control chars
+  - Backup before restore/reset --hard
+
+--------------------------------------------------------------------------------
+2.8 github.* tools (tools/github.py)
+--------------------------------------------------------------------------------
+Command vector: ["gh", <args...>]
+Shell: NO (direct argv)
+Working directory: repo root
+Timeout: 60s
+Output: captured
+Cancellation: NOT supported
+
+Permission gate:
+  - Read ops: SAFE
+  - Write ops (issue_create, pr_create, release_create): SENSITIVE, gated by path containment
+
+--------------------------------------------------------------------------------
+2.9 desktop.* tools (tools/desktop.py → capability bridge → integration/workflows.py → windows capability)
+--------------------------------------------------------------------------------
+Command vector: Native Windows API via pywin32/comtypes (no subprocess)
+Exception: Fallback to PowerShell for some confirmations (tools/applications.py:258-260)
+Shell: NO for primary path (UIA/Win32 API)
+Working directory: N/A
+Timeout: Configurable per operation
+Cancellation: Via CancellationToken passed through tool_context
+Process termination: N/A (native calls)
+
+Permission gate:
+  - Level: Delegated to CapabilityBridge.permission_level() per operation
+  - Mutating ops (open_application, interact): SENSITIVE
+  - Read ops (find, read, verify): SAFE
+
+--------------------------------------------------------------------------------
+2.10 Coding/test execution (coding/test_runner.py, coding/profile.py)
+--------------------------------------------------------------------------------
+Command vector: [sys.executable, -m pytest, ...] or git commands
+Shell: NO (direct argv)
+Working directory: project root
+Timeout: Configurable
+Output: captured
+Cancellation: NOT supported in test_runner
+Process termination: subprocess.run() waits
+
+Permission gate: project.verify tool (SENSITIVE, path-gated)
+
+--------------------------------------------------------------------------------
+
+SECTION 3: FINDINGS WITH EVIDENCE AND SEVERITY
+================================================================================
+
+FINDING 1: python.run_script has NO cancellation support
+--------------------------------------------------------------------------------
+Severity: HIGH (Verified vulnerability)
+Location: tools/python.py:14-47, core/executor.py:292-310
+Evidence:
+  - run_script() uses subprocess.run() with timeout but NO cancellation_token parameter
+  - Executor checks cancellation at 4 points (lines 171, 262, 280, 326) but python.run_script cannot be interrupted mid-execution
+  - A long-running or hung Python script cannot be cancelled once started
+  - Cancellation token passed to Executor.run() is ignored by python tool
+
+Impact: User presses "Stop" → task marked cancelled → Python script continues running in background with full user privileges
+
+FINDING 2: python.run_script executes with FULL USER PRIVILEGES, no sandbox
+--------------------------------------------------------------------------------
+Severity: HIGH (Documented design, not a bug)
+Location: tools/python.py:17-19
+Evidence:
+  - Explicit comment: "NOT a sandbox - a Python script has Diablo's privileges"
+  - Runs with sys.executable (Diablo's Python interpreter)
+  - cwd = script's parent directory (not restricted to allowed_roots)
+  - Script can import os, subprocess, socket, etc. and do anything user can do
+  - Path containment only checked for permission LEVEL, not at execution time
+
+Impact: Malicious or buggy script can read/write/delete any file user can access, make network connections, spawn processes
+
+FINDING 3: terminal.execute - no process kill on timeout
+--------------------------------------------------------------------------------
+Severity: MEDIUM (Verified gap)
+Location: tools/terminal.py:32-52
+Evidence:
+  - subprocess.run(timeout=timeout) raises TimeoutExpired
+  - Tool returns error "Command timed out after Ns" but subprocess.run() DOES kill the process on timeout (Python 3.14 behavior)
+  - However, NO cancellation integration: if user cancels during command, command continues
+  - No explicit process group kill on Windows (subprocess.run uses CREATE_NEW_PROCESS_GROUP? No)
+
+Wait - Python's subprocess.run DOES kill the child on timeout. But if cancellation is requested externally, the command continues.
+
+Impact: Cancelled terminal commands may continue running
+
+FINDING 4: Blender execute_script allows ARBITRARY PYTHON in Blender context
+--------------------------------------------------------------------------------
+Severity: HIGH (By design, powerful capability)
+Location: blender/scripts/diablo_blender_ops.py:387-393, blender/capabilities.py:559-561
+Evidence:
+  - execute_script operation passes user script directly to exec() in Blender's Python
+  - Blender Python has full bpy access + os, subprocess, socket, etc.
+  - No sandbox, no restriction on imports
+  - Runs in Blender process (separate from Diablo process)
+
+Impact: Model can execute arbitrary code in Blender process. Blender process runs with user privileges.
+
+FINDING 5: Blender execute_script - NO cancellation support during script execution
+--------------------------------------------------------------------------------
+Severity: MEDIUM
+Location: blender/scripts/runner.py:80-88, blender/runner.py:304-441
+Evidence:
+  - Blender runner supports cancellation via cancel_token (polling loop)
+  - BUT: during handler execution (ops.op_execute_script), the Blender Python runs uninterruptibly
+  - Runner only checks cancellation BETWEEN operations, not DURING
+  - Long-running execute_script cannot be cancelled mid-script
+
+Impact: Arbitrary Blender Python script runs to completion even if user cancels
+
+FINDING 6: Voice TTS - no cancellation, no interruption (barge-in)
+--------------------------------------------------------------------------------
+Severity: LOW (Documented limitation)
+Location: voice/text_to_speech.py:48-60, voice/capabilities.py:35-38
+Evidence:
+  - speak() spawns daemon thread, returns immediately
+  - now=True waits with 35s join timeout
+  - No way to stop speaking once started (no SAPI async cancel used)
+  - No barge-in: microphone not monitored during TTS
+  - Documented in voice/capabilities.py:35-38
+
+Impact: User cannot interrupt TTS; must wait for completion
+
+FINDING 7: applications.open fallback uses PowerShell Get-Process polling
+--------------------------------------------------------------------------------
+Severity: LOW (Fallback path only)
+Location: tools/applications.py:253-268
+Evidence:
+  - _confirm_process_powershell() runs Get-Process in loop (6x, 0.4s intervals)
+  - Uses f-string with exe_base directly in PowerShell command (potential injection if exe_base untrusted)
+  - exe_base derived from launch_path via os.path.basename → lower()
+
+Risk: Low - exe_base comes from resolved executable path, not user input directly
+
+FINDING 8: git command ref validation - defensive but incomplete
+--------------------------------------------------------------------------------
+Severity: LOW
+Location: tools/git.py:30-32 (_valid_git_ref), line 75 (check-ref-format)
+Evidence:
+  - _valid_git_ref() rejects leading "-", control chars
+  - git check-ref-format --branch validates branch name
+  - BUT: remote/branch args in push/pull not validated same way
+  - git_push/pul use _valid_git_ref on remote/branch (lines 129-132, 183-186)
+
+FINDING 9: desktop workflow tools delegate to capability bridge with native calls
+--------------------------------------------------------------------------------
+Severity: INFORMATIONAL
+Location: tools/desktop.py, tools/capability_bridge.py, integration/workflows.py
+Evidence:
+  - Primary path uses pywin32/comtypes (no subprocess)
+  - Windows capability uses native Win32/UIA APIs
+  - Cancellation supported via CancellationToken in tool_context
+  - Some fallbacks use PowerShell (applications.py confirmation)
+
+================================================================================
+
+SECTION 4: TEST EVIDENCE
+================================================================================
+
+Commands executed and results:
+
+```
+# Terminal, permissions, filesystem, git, github
+pytest tests/test_terminal.py tests/test_terminal_destructive_policy.py \
+       tests/test_permissions.py tests/test_filesystem.py \
+       tests/test_git_tools.py tests/test_github.py
+# Result: 177 passed in 10.02s
+
+# Blender cancellation, Python tool, S2.9 hardening
+pytest tests/test_m2152_blender_cancellation.py tests/test_python.py \
+       tests/test_s2_9_hardening.py
+# Result: 121 passed, 1 skipped in 5.62s
+```
+
+Key test coverage:
+- test_terminal_destructive_policy.py: Verifies destructive command blocking (Remove-Item -Recurse, etc.)
+- test_terminal.py: Tests basic execution, timeout, auto-allow, blocklist
+- test_permissions.py: Tests permission levels, session blocks, preferences
+- test_m2152_blender_cancellation.py: Tests BlenderRunner cancellation (terminate→kill, reap, session revalidation)
+- test_s2_9_hardening.py: Tests runner timeout, spawn errors, output truncation, cancellation
+- test_python.py: Tests script execution, timeout, path errors
+- test_git_tools.py: Tests git policy gates (blocked/confirm/allow), ref validation
+- test_github.py: Tests gh CLI wrapper, auth status
+
+Gaps in test coverage:
+- NO test verifies python.run_script cancellation (because it doesn't exist)
+- NO test verifies Blender execute_script cancellation mid-script
+- NO test verifies terminal.execute cancellation mid-command
+- NO test verifies Voice TTS interruption
+- NO test for execute_script arbitrary code execution limits
+
+================================================================================
+
+SECTION 5: PRIORITIZED REMEDIATION PLAN
+================================================================================
+
+P0 - Critical (Active Vulnerabilities)
+---------------------------------------
+
+1. Add cancellation support to python.run_script
+   Files: tools/python.py, tools/__init__.py (tool registration), core/executor.py
+   Approach:
+     - Add cancellation_token parameter to run_script()
+     - Use subprocess.Popen instead of subprocess.run()
+     - Implement terminate→kill with reap (mirror BlenderRunner)
+     - Check token before and during execution
+     - Return ToolResult with cancelled=True on interruption
+   Risk: Medium - changes execution model, must preserve backward compatibility
+
+2. Add mid-operation cancellation to Blender execute_script
+   Files: blender/scripts/runner.py, blender/runner.py
+   Approach:
+     - Option A: Run execute_script in separate thread with timeout, kill Blender process on cancel
+     - Option B: Inject cancellation checks into user script (not feasible for arbitrary code)
+     - Option B: Document that execute_script is non-interruptible, add warning to tool description
+   Risk: High - Blender process architecture makes mid-script cancellation hard
+
+P1 - High (Significant Gaps)
+-----------------------------
+
+3. Add terminal.execute cancellation integration
+   Files: tools/terminal.py, core/executor.py
+   Approach:
+     - Replace subprocess.run() with Popen + wait loop + cancel_token polling
+     - On cancel: terminate process group (Windows: taskkill /T /PID)
+     - Return cancelled result
+   Risk: Medium - must handle Windows process groups correctly
+
+4. Add execution-time path containment enforcement for python.run_script
+   Files: tools/python.py
+   Approach:
+     - Verify script path is within allowed_roots at EXECUTION time (not just permission level)
+     - Verify cwd is within allowed_roots
+     - Reject if script uses os.chdir to escape
+   Risk: Low - defensive hardening
+
+5. Blender execute_script - add security warning / capability gating
+   Files: tools/__init__.py (capability bridge registration), blender/capabilities.py
+   Approach:
+     - Mark execute_script as requiring explicit confirmation (explicit_confirmation=True)
+     - Add warning to tool description: "Executes arbitrary Blender Python with full user privileges"
+     - Consider separate permission level for "arbitrary code execution"
+   Risk: Low - policy change only
+
+P2 - Medium (Defense in Depth)
+------------------------------
+
+6. Output size limits for all execution paths
+   Files: tools/terminal.py, tools/python.py, blender/runner.py (already has 64KB), tools/git.py (already has 12KB)
+   Approach:
+     - Terminal: already truncates output in ToolResult display, but subprocess.run captures full output in memory first
+     - Python: same issue
+     - Implement streaming read with size limit for all paths
+
+7. Working directory validation at execution time (not just permission level)
+   Files: tools/python.py, tools/terminal.py, tools/git.py
+   Approach:
+     - In tool function, re-validate cwd/root against allowed_roots using path_is_within()
+     - Reject if validation fails (defense in depth against TOCTOU)
+
+8. Argument sanitization for PowerShell fallbacks
+   Files: tools/applications.py:259-260 (exe_base in f-string)
+   Approach:
+     - Use PowerShell parameter binding instead of string interpolation
+     - Or validate exe_base against strict allowlist
+
+P3 - Low (Hardening)
+--------------------
+
+9. Document all execution capabilities and their security properties
+   Files: docs/ (new or update existing)
+   Approach:
+     - Create EXECUTION_SECURITY.md with table of all tools, their privilege level, sandbox status, cancellation support
+
+10. Add integration test for python cancellation
+    Files: tests/test_python.py (new test)
+    Approach:
+      - Test that long-running script can be cancelled
+      - Verify process is reaped
+
+11. Add integration test for terminal cancellation
+    Files: tests/test_terminal.py (new test)
+    Approach:
+      - Test that "Stop" kills running command
+
+================================================================================
+
+SECTION 6: VERDICT
+================================================================================
+
+VERDICT: PARTIAL
+
+Rationale:
+- Core architecture is sound: single Executor, PermissionManager, path containment, policy gates
+- Critical gaps exist in cancellation support for python.run_script and terminal.execute
+- Blender execute_script is a powerful capability by design but non-interruptible
+- No sandboxing for Python/Blender scripts (documented, not a bug)
+- All deterministic tests pass (298+ tests covering execution security)
+- No active exploits found; gaps are in defensive depth (cancellation, interruption)
+- Voice TTS limitation is documented and acceptable for current scope
+
+The system is FUNCTIONALLY SECURE for its threat model (local user, trusted model, permission gates)
+but lacks DEFENSIVE DEPTH for interruption/cancellation of long-running operations.
+
+================================================================================
+
+SECTION 7: SAFEST NEXT IMPLEMENTATION TASK
+================================================================================
+
+TASK: Add cancellation support to python.run_script (P0 #1)
+
+Files to modify:
+  - tools/python.py: run_script() signature + Popen implementation
+  - tools/__init__.py: update tool registration to pass cancellation_token
+  - core/executor.py: already passes cancellation_token to tool fn (spec.wants_context)
+
+Implementation approach:
+  1. Change run_script(script, args, timeout) → run_script(script, args, timeout, cancellation_token=None)
+  2. Use subprocess.Popen with same stdout/stderr capture
+  3. Poll with short timeout, check cancellation_token.is_cancelled()
+  4. On cancel: terminate → kill → reap (mirror BlenderRunner._stop())
+  5. Return ToolResult(cancelled=True, success=False)
+  6. Update tool registration fn= to pass _tool_context.cancellation_token
+
+Test command to verify:
+  pytest tests/test_python.py -v -k "cancellation" (new test to be added)
+
+Estimated effort: 2-3 hours
+Risk: MEDIUM - must ensure no regression in existing python tool tests (177 tests pass currently)
+
+================================================================================
+END OF AUDIT
+================================================================================

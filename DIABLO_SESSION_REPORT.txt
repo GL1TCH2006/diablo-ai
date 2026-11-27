@@ -1,0 +1,122 @@
+DIABLO SESSION REPORT
+====================
+
+SESSION DATE AND TIME
+- Start time: Mon Nov 23 2026 (session start)
+- End time: Mon Nov 23 2026 (session end)
+- Total iterations run: 1 (Phase 1 bug fixes were pre-completed; Phase 2-5 executed in this session)
+
+════════════════════════════════════════════════════════
+PHASE 1 — BUG FIX LOOP
+════════════════════════════════════════════════════════
+
+All Phase 1 bugs were fixed in a prior session (per KNOWN STARTING STATE):
+- core/cancellation.py:73 — CancellationError → CancellationRequested ✓
+- core/planner_agent.py — frozen dataclass mutation fixed via dataclasses.replace() ✓
+- core/executor_agent.py — raw string vs enum fixed, duplicate set_task_provider removed, debug prints removed ✓
+- core/async_executor.py — duplicate ExecutionOutcome/ExecutionResult dataclass definitions removed ✓
+
+Test suite was launched from prior session but stalled at ~58% (PID 40836 still running at session end). Final counts could not be retrieved. Previously verified: test_planner_agent.py 9/9, test_executor_agent.py 10/10, test_async_executor.py 13/13 all passing.
+
+Failures at start: 99 (from prior session audit)
+Failures at end: unknown (test suite stalled)
+Bugs fixed this session: 0 (all Phase 1 fixes were pre-completed)
+Fixes reverted: none
+Remaining failures: 99 (mostly environment-related: missing pywin32/rich at audit time, now installed; test suite could not complete to verify)
+
+════════════════════════════════════════════════════════
+PHASE 2 — COMPANION UI EXIT CRASH
+════════════════════════════════════════════════════════
+
+Fix applied: yes
+File changed: C:\PROJECTS\jarvis like ai for my computer\diablo-ai\main.py
+
+What was changed:
+1. In the second close_capabilities() function (line ~379), added guard: if not args.edge_companion: return 0 — this prevents the edge companion from being launched when the user quits the console UI (close_capabilities() is called from the finally block after ui.run() returns).
+
+2. Fixed recursive close_capabilities() call on the edge companion success path (line ~442): changed `close_capabilities(); return status` to `return status` — the cleanup was already done at the top of the function, so the recursive call was unnecessary and would cause infinite recursion when args.edge_companion=True.
+
+Note: needs manual test by running python main.py and quitting — shell cannot do interactive UI testing. Import verified OK: python -c "import ui.edge_companion; print('import OK')" → import OK
+
+════════════════════════════════════════════════════════
+PHASE 3 — STT IMPLEMENTATION
+════════════════════════════════════════════════════════
+
+Implemented: partial (code fix in place, runtime verification pending)
+
+Files changed:
+- C:\PROJECTS\jarvis like ai for my computer\diablo-ai\voice\stt\local.py — FasterWhisperBackend.is_available()
+
+What was changed:
+- Rewrote is_available() to attempt model initialization even when no download_root is configured. Previously it returned False immediately when _download_root was None. Now it calls _initialize_model() which lets faster-whisper download the model to the default cache directory.
+
+What works now:
+- Code fix is syntactically correct (file imports and parses)
+- The STT backend class FasterWhisperBackend is fully implemented with transcribe() method
+
+What still needs work:
+- Runtime verification: STT backend creation (create_faster_whisper_backend('tiny', device='cpu', compute_type='int8')) was launched but model download did not complete within session time. Need to verify backend.is_available() returns True after model download.
+- Could not run tests/test_voice_interruption.py due to earlier shell blocking
+
+════════════════════════════════════════════════════════
+PHASE 4 — DDLE INTEGRATION
+════════════════════════════════════════════════════════
+
+tools/ddle.py created: yes
+Tools registered in tools/__init__.py: yes
+tests/test_ddle_tools.py created: yes
+Test results: 4/4 passed
+
+Files created:
+- C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tools\ddle.py — start_task(), task_status(), list_tasks() functions
+- C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tests\test_ddle_tools.py — 4 tests (all passing)
+
+Files modified:
+- C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tools\__init__.py — added ddle to imports, registered ddle.start_task, ddle.task_status, ddle.list_tasks in build_registry()
+
+DDLE core tests (C:\PROJECTS\DDLE\tests\test_ddle_core.py): 16/16 passed
+
+════════════════════════════════════════════════════════
+PHASE 5 — FINAL VERIFICATION
+════════════════════════════════════════════════════════
+
+Full test suite: unknown (stalled at ~58% from prior session; PID 40836 still running)
+DDLE tests: 16/16 passed
+DDLE tools tests: 4/4 passed
+All imports OK: yes (OpenAIProvider, CancellationToken/CancellationRequested, PlannerAgent, ExecutorAgent, ddle.start_task/task_status/list_tasks)
+Cancellation working: yes (t.request() + t.raise_if_cancelled() raises CancellationRequested correctly)
+STT available: unknown (code fix in place, model download didn't complete — runtime verification pending)
+
+════════════════════════════════════════════════════════
+COMPLETE LIST OF ALL FILES CHANGED THIS SESSION
+════════════════════════════════════════════════════════
+
+Created:
+1. C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tools\ddle.py — DDLE tool integration (start_task, task_status, list_tasks)
+2. C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tests\test_ddle_tools.py — DDLE tool tests (4 tests)
+
+Modified:
+3. C:\PROJECTS\jarvis like ai for my computer\diablo-ai\main.py — Phase 2 companion UI exit crash fix (guard run_edge_companion with args.edge_companion, remove recursive close_capabilities() call)
+4. C:\PROJECTS\jarvis like ai for my computer\diablo-ai\voice\stt\local.py — Phase 3 STT fix (is_available() attempts model init without download_root)
+5. C:\PROJECTS\jarvis like ai for my computer\diablo-ai\tools\__init__.py — registered DDLE tools in build_registry()
+
+════════════════════════════════════════════════════════
+WHAT REMAINS FOR NEXT SESSION
+════════════════════════════════════════════════════════
+
+Could not complete:
+1. Full test suite final counts — stalled at ~58% (PID 40836 still running). Need to wait for completion or restart and record exact pass/fail/error counts.
+2. STT runtime verification — faster-whisper tiny model download didn't complete. Need to verify backend.is_available() returns True after download.
+3. Manual UI test — python main.py then quit to verify companion UI exit crash fix doesn't cause issues. Shell cannot do interactive UI testing.
+4. tests/test_voice_interruption.py — could not run due to earlier shell blocking.
+
+Manual tests needed:
+- python main.py → type "hi" → :quit → verify no crash on exit
+- python main.py --edge-companion → verify edge companion launches correctly
+- Verify STT backend.is_available() returns True after model download
+
+Recommended next steps (priority order):
+1. Wait for or restart the full test suite and record final pass/fail/error counts
+2. Complete STT runtime verification (wait for model download, then test is_available())
+3. Manual UI exit test (python main.py, quit)
+4. Verify DDLE tools work end-to-end through the Diablo agent (register and call ddle.start_task through the tool registry)
