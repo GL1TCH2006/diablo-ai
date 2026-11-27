@@ -9,6 +9,7 @@ from config.settings import Settings
 from core.logging_setup import get_logger
 
 from .ollama_provider import OllamaProvider
+from .openai_provider import OpenAIProvider
 from .provider import AIProvider, AIProviderError, ModelInfo
 
 log = get_logger("model_manager")
@@ -34,6 +35,8 @@ def build_backend(settings: Settings, force_offline: bool = False) -> BackendRes
             models=[ModelInfo("offline/rule-based", capabilities=("tools",))],
         )
     if provider_name != "ollama":
+        if provider_name == "openai":
+            return _build_openai_backend(settings)
         return _offline_fallback(settings, f"Unsupported AI provider '{settings.ai_provider}'. No cloud provider is enabled.")
     if not getattr(settings, "allow_remote_ollama", False) and not _is_local_ollama_host(settings.ollama_host):
         return _offline_fallback(settings, "Remote Ollama hosts are disabled. Set allow_remote_ollama=true to opt in.")
@@ -113,4 +116,45 @@ def _offline_fallback(settings: Settings, note: str) -> BackendResult:
         model_name="offline/rule-based",
         note=note,
         models=[],
+    )
+
+
+def _build_openai_backend(settings: Settings) -> BackendResult:
+    """Build an OpenAI-compatible provider backend."""
+    base_url = getattr(settings, "openai_base_url", "") or "https://integrate.api.nvidia.com/v1"
+    api_key = getattr(settings, "openai_api_key", "") or ""
+    model = getattr(settings, "openai_model", "") or ""
+    timeout = float(getattr(settings, "ai_request_timeout", 0) or 0)
+
+    from .openai_provider import DEFAULT_TOOL_TIMEOUT
+
+    timeout_val = timeout if timeout > 0 else DEFAULT_TOOL_TIMEOUT
+    provider = OpenAIProvider(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=timeout_val,
+    )
+    if not provider.is_available():
+        note = f"OpenAI provider not reachable at {base_url}: {provider.reason}"
+        return _offline_fallback(settings, note)
+
+    discovered_models = provider.list_models()
+    if model and model in [m.name for m in discovered_models]:
+        model_name = model
+        note = f"-> OpenAI online: model '{model}' configured."
+    elif discovered_models:
+        model_name = discovered_models[0].name
+        note = f"-> OpenAI online: {len(discovered_models)} model(s) available. Using '{model_name}'."
+    else:
+        # No models listed but endpoint is reachable; use the configured model name.
+        model_name = model or "openai/model"
+        note = "-> OpenAI online: no models listed; using configured model."
+
+    available_note = f"{note}"
+    return BackendResult(
+        provider=provider,
+        model_name=model_name,
+        note=available_note,
+        models=discovered_models,
     )

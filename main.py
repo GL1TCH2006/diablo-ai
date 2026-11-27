@@ -399,6 +399,11 @@ def main() -> int:
                 return False
 
         agent.set_confirmer(confirm)
+        # Only launch the edge companion if the user explicitly asked for it.
+        # close_capabilities() is also called from the finally block below when
+        # the user quits the console UI; launching a new UI on exit is wrong.
+        if not args.edge_companion:
+            return 0
         # M2.16.UI: the edge companion places itself from real display topology.
         # Without a display layer ``_list_displays`` returns []
         # (``ui/edge_companion.py:473``), ``_refresh_display`` returns None
@@ -433,7 +438,6 @@ def main() -> int:
             if display_layer is not None:
                 display_layer.close()
         else:
-            close_capabilities()
             return status
 
     # M2.14.1: the floating companion now has a product launch path. It is

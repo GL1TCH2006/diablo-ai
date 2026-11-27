@@ -9,7 +9,7 @@ from core.agent import Agent
 from core.context import ProjectContext
 from core.events import EventBus
 from core.executor import Executor
-from core.task_manager import StepStatus, TaskManager
+from core.task_manager import StepStatus, TaskManager, TaskState
 from core.task_store import TaskRecord, TaskStore
 from coding.change_tracker import ChangeTracker
 from coding.snapshot_manager import SnapshotManager
@@ -164,6 +164,25 @@ def test_debug_failures_project_into_task_status(tmp_settings, monkeypatch):
     agent._run_debug("debug this")
 
     assert agent._tasks.steps[0].status == StepStatus.FAILED
+
+
+def test_mark_failure_does_not_relabel_cancelled_task_as_failed(tmp_settings):
+    """Cancellation is terminal: _mark_failure must not move CANCELLED to FAILED."""
+    agent = _bare_agent(tmp_settings)
+    agent._events = EventBus()
+    agent._tasks.state = TaskState.CANCELLED
+    agent._mark_failure("downstream exception after cancellation")
+    assert agent._tasks.state == TaskState.CANCELLED
+
+
+def test_mark_failure_still_transitions_genuine_failure_to_failed(tmp_settings):
+    """A genuine non-cancellation exception still produces FAILED."""
+    agent = _bare_agent(tmp_settings)
+    agent._events = EventBus()
+    agent._tasks.state = TaskState.PLANNING
+    agent._mark_failure("genuine execution failure")
+    assert agent._tasks.state == TaskState.FAILED
+    assert agent._tasks.failure_reason == "genuine execution failure"
 
 
 def test_denied_operation_does_not_start_task_or_inspect_git(tmp_settings, monkeypatch, tmp_path):

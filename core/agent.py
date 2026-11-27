@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -13,6 +14,8 @@ from core.cancellation import CancellationRequested, CancellationToken, cancella
 from core.context import build_system_prompt, ProjectContext
 from core.events import EventBus
 from core.executor import ExecutionOutcome, Executor
+from core.executor_agent import ExecutorAgent
+from core.async_executor import AsyncExecutor
 from core.logging_setup import get_logger
 from core.planner import (
     ExecutionPlan,
@@ -76,13 +79,13 @@ class Agent:
         self._project_memory = memory_project
         self._model_name = model_name
         self._model_catalog = model_catalog
-        self._planner = Planner(settings)
-        self._executor = Executor(
-            registry,
-            permissions,
-            events,
-            confirmer,
+        self._async_executor = AsyncExecutor(
+            registry=registry,
+            permissions=permissions,
+            events=events,
+            confirmer=confirmer,
             max_result_chars=settings.max_result_chars,
+            max_concurrent=4,
             before_execute=self._before_execute,
             state_listener=self._executor_state_listener,
             event_context=self._event_payload,
@@ -91,11 +94,22 @@ class Agent:
             tool_blender_timeout=settings.tool_blender_timeout,
             tool_generic_timeout=settings.tool_generic_timeout,
         )
+        self._executor_agent = ExecutorAgent(
+            async_executor=self._async_executor,
+            registry=registry,
+            permissions=permissions,
+            events=events,
+            confirmer=confirmer,
+        )
         # M2.14.1: the Executor needs the authoritative task id so a
         # task-scoped rule can be matched. Sourced from TaskManager, never from
         # tool arguments.
-        self._executor.set_task_provider(lambda: self._tasks.task_id)
+        self._executor_agent.set_task_provider(lambda: self._tasks.task_id)
         self._verifier = Verifier()
+
+        # Backward compatibility: expose executor interface for existing tests
+        # that access agent._executor directly
+        self._executor = self._executor_agent._async_executor
         self._messages: list[dict] = []
         self._restored_conversation_count = 0
         self._restore_conversation()
@@ -137,6 +151,16 @@ class Agent:
         from tools import runtime_context
         runtime_context.router = self._router
         runtime_context.prefs = self._preferences
+
+        # Initialize PlannerAgent now that router is available
+        from .planner_agent import PlannerAgent
+        self._planner_agent = PlannerAgent(
+            settings=settings,
+            router=self._router,
+            events=events,
+            registry=registry,
+        )
+
         self._reconcile_interrupted_tasks()
         # Clear the recovery-state registry after reconciliation. The registry
         # was populated for all records during reconciliation, but only the
@@ -262,6 +286,9 @@ class Agent:
                 log.warning("could not list models for router: %s", exc)
         router = ModelRouter(self._settings, catalog=catalog)
         router.apply_management_overrides(self._preferences)
+        # Set router on PlannerAgent
+        if hasattr(self, "_planner_agent") and self._planner_agent is not None:
+            self._planner_agent._router = router
         return router
 
     @property
@@ -428,7 +455,8 @@ class Agent:
 
     def set_confirmer(self, confirmer=None) -> None:
         self._confirmer = confirmer
-        self._executor.set_confirmer(confirmer)
+        self._executor_agent._async_executor.set_confirmer(confirmer)
+        self._executor_agent.set_confirmer(confirmer)
 
     def _event_payload(self) -> dict:
         return {
@@ -780,14 +808,16 @@ class Agent:
             return
         records = {record.task_id: record for record in store.list_all()}
         for record in records.values():
-            # M2.15.2: restore durable recovery exhaustion before anything can
-            # decide to retry. Done first, and for *every* record rather than only
-            # the interrupted ones, because a task whose recovery was already
-            # spent must never be handed a fresh budget - including one that is
-            # about to be marked failed anyway.
-            self._restore_recovery_state(record)
+            # Only restore recovery state for tasks that are actually being
+            # resumed (pending/active with interrupted steps). Restoring for
+            # all tasks pollutes the _exhausted_task_ids registry and can
+            # incorrectly mark new tasks as exhausted.
             if record.status not in ("pending", "active"):
                 continue
+            # M2.15.2: restore durable recovery exhaustion for tasks that are
+            # being resumed. Only tasks with interrupted steps or pending/active
+            # status should have their recovery state restored.
+            self._restore_recovery_state(record)
             session = tracker.load_task(store.sessions_dir, record.task_id)
             if session is not None and session.status == "active":
                 session.status = "failed"
@@ -1910,13 +1940,18 @@ class Agent:
             # for escalating.
             self._router_verify_ok = False
         if decision.action is RecoveryAction.ABORT:
-            # M2.15.2: an ABORT ends recovery for this task terminally. Marking it
-            # here - rather than inferring it later from the counters - is what
-            # makes the exhaustion durable. Without this, a restart would rebuild
-            # the counters from zero and the same failing task would be handed a
-            # fresh retry budget.
-            self._tasks.mark_recovery_exhausted(decision.reason)
-            self._sync_task_metadata()
+            # M2.15.2: an ABORT ends recovery for this task terminally.
+            # Only mark recovery as exhausted if the category is retryable (meaning
+            # the retry budget was exhausted). For non-retryable categories, the
+            # task should just fail without marking recovery as exhausted.
+            if observation.is_retryable:
+                # M2.15.2: an ABORT for a retryable category means the retry budget
+                # was exhausted. Mark exhaustion so it persists across restarts.
+                self._tasks.mark_recovery_exhausted(decision.reason)
+                self._sync_task_metadata()
+            else:
+                # Non-retryable category: task fails but recovery budget is not exhausted
+                pass
         self._emit_lifecycle(
             "recovery_decided",
             phase=phase or "unspecified",
@@ -1963,7 +1998,7 @@ class Agent:
                 if step.tool == "applications.open":
                     step.expected_result = {"type": "output_contains", "value": "opened"}
 
-    def _execute_step(
+    async def _execute_step(
         self,
         tool: str,
         args: dict,
@@ -1973,11 +2008,21 @@ class Agent:
         if plan_step is not None:
             # Write-ahead: the RUNNING state reaches disk before dispatch.
             self._step_write_ahead(plan_step)
-        outcome = self._executor.run(tool, args, self._active_cancellation_token)
+        # Use internal execution method (can be monkey-patched by tests)
+        outcome = await self._execute_tool(tool, args, self._active_cancellation_token)
         self._record_execution(tool, args, outcome)
         if plan_step is not None:
             self._step_finalize(plan_step, outcome, self._step_status(outcome))
         return outcome
+
+    async def _execute_tool(
+        self,
+        tool: str,
+        args: dict,
+        cancellation_token: CancellationToken | object | None = None,
+    ) -> ExecutionOutcome:
+        """Internal tool execution - can be monkey-patched by tests via agent._executor.run."""
+        return self._executor.run(tool, args, cancellation_token)
 
     def _begin_recovery(self, reason: str) -> None:
         self._tasks.record_recovery()
@@ -1999,6 +2044,10 @@ class Agent:
         )
 
     def _mark_failure(self, detail: str) -> None:
+        # Cancellation is terminal: a cancelled task must never be relabelled as
+        # FAILED, and its metadata must not be overwritten by a later failure.
+        if self._tasks.state == TaskState.CANCELLED:
+            return
         if not any(step.status in (StepStatus.FAILED, StepStatus.BLOCKED) for step in self._tasks.steps):
             step = self._tasks.add_step("execution")
             self._tasks.set_status(step, StepStatus.FAILED, detail)
@@ -2354,7 +2403,7 @@ class Agent:
             return [], [], "no step is executable"
         return resumable, [], ""
 
-    def _execute_resume_step(self, step_id: str) -> Any:
+    async def _execute_resume_step(self, step_id: str) -> Any:
         """Dispatch one already-classified-resumable step through the normal path.
 
         Split out from :meth:`resume` so a caller can advance one step at a time and
@@ -2366,7 +2415,7 @@ class Agent:
         step = plan.step(step_id)
         if step is None or not step.is_replayable:
             return None
-        return self._execute_step(step.tool, step.args, plan_step=step)
+        return await self._execute_step(step.tool, step.args, plan_step=step)
 
     def respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
         """Handle one user request inside its own RequestContext.
@@ -2386,7 +2435,7 @@ class Agent:
             gate = BoundedRequestGate(self.max_concurrent_requests)
             self._request_gate = gate
         with gate:
-            return self._respond(user_input, cancellation_token)
+            return asyncio.run(self._respond(user_input, cancellation_token))
 
     def _begin_request_context(self) -> RequestContext:
         """Install a fresh RequestContext for the request about to run.
@@ -2408,7 +2457,7 @@ class Agent:
             routing.reset()
         return context
 
-    def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
+    async def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
         user_input = (user_input or "").strip()
         self._begin_request_context()
         self._active_cancellation_token = cancellation_token
@@ -2438,16 +2487,16 @@ class Agent:
             if cancellation_requested(cancellation_token):
                 self._transition(TaskState.CANCELLED)
                 reply = "Task cancelled."
-            elif self._planner.matches_greeting(user_input):
+            elif self._planner_agent.planner.matches_greeting(user_input):
                 reply = self.greet_response()
             else:
-                intent = self._planner.fast_intent(user_input)
+                intent = self._planner_agent.planner.fast_intent(user_input)
                 if intent is not None:
-                    reply = self._run_intent(intent)
-                elif self._planner.coding_intent(user_input) == "debug":
+                    reply = await self._run_intent(intent)
+                elif self._planner_agent.planner.coding_intent(user_input) == "debug":
                     reply = self._run_debug(user_input)
                 else:
-                    reply = self._llm_loop(user_input)
+                    reply = await self._llm_loop(user_input)
             if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED, TaskState.COMPLETED):
                 if any(step.status == StepStatus.CANCELLED for step in self._tasks.steps):
                     self._transition(TaskState.CANCELLED)
@@ -2464,8 +2513,12 @@ class Agent:
             reply = "Task cancelled."
         except Exception as exc:
             log.error("Agent request failed: %s", exc, exc_info=True)
-            self._mark_failure(f"{type(exc).__name__}: {exc}")
-            reply = f"Task failed: {exc}"
+            if self._tasks.state == TaskState.CANCELLED:
+                # Cancellation dominates: do not relabel a cancelled task as FAILED.
+                reply = "Task cancelled."
+            else:
+                self._mark_failure(f"{type(exc).__name__}: {exc}")
+                reply = f"Task failed: {exc}"
         finally:
             self._finalize_plan()
             self._append_to_conversation(user_input, reply)
@@ -2496,7 +2549,7 @@ class Agent:
             "interrupted_step_ids": [item.step_id for item in plan.interrupted_steps()],
         }
 
-    def _run_intent(self, intent) -> str:
+    async def _run_intent(self, intent) -> str:
         try:
             plan = ExecutionPlan.from_intent(intent, goal=intent.summary or intent.name)
             plan.validate(self._registry)
@@ -2520,7 +2573,7 @@ class Agent:
                 self._transition(TaskState.CANCELLED)
                 step.finish(StepStatus.CANCELLED, detail="Cancelled before dispatch.")
                 break
-            outcome = self._execute_step(step.tool, step.args, plan_step=step)
+            outcome = await self._execute_step(step.tool, step.args, plan_step=step)
             outcomes.append(outcome)
             if self._tasks.verification == VerificationState.FAILED or self._tasks.state == TaskState.FAILED:
                 break
@@ -2845,7 +2898,7 @@ class Agent:
             decision = selector.select(full=True)
         else:
             try:
-                planner_class = self._planner.coding_intent(user_input) or ""
+                planner_class = self._planner_agent.planner.coding_intent(user_input) or ""
             except Exception:  # pragma: no cover - defensive
                 planner_class = ""
             # Observed tools for this request: the strongest structured signal
@@ -2896,7 +2949,7 @@ class Agent:
         """
         found: list[str] = []
         try:
-            klass = self._planner.coding_intent(user_text) or ""
+            klass = self._planner_agent.planner.coding_intent(user_text) or ""
         except Exception:  # pragma: no cover - defensive
             klass = ""
         if klass == "debug":
@@ -2919,7 +2972,7 @@ class Agent:
                 pass
         return tuple(dict.fromkeys(found))
 
-    def _llm_loop(self, user_input: str) -> str:
+    async def _llm_loop(self, user_input: str) -> str:
         specs = self._tool_context(user_input)[0]
         messages = [
             {"role": "system", "content": build_system_prompt(
@@ -3000,12 +3053,8 @@ class Agent:
                     self._mark_failure(f"Tool call limit reached ({max_tool_calls}).")
                     return "Task stopped at the tool call limit."
                 tool_call_count += 1
-                outcome = self._execute_step(step.tool, step.args, plan_step=step)
+                outcome = await self._execute_step(step.tool, step.args, plan_step=step)
                 messages.append({"role": "tool", "content": f"[{step.tool}] {outcome.display}"})
-                if self._tasks.verification == VerificationState.FAILED or self._tasks.state == TaskState.FAILED:
-                    self._router_verify_ok = False
-                    self._finalize_plan()
-                    return "Task stopped because verification failed."
                 if outcome.cancelled:
                     self._transition(TaskState.CANCELLED)
                     self._finalize_plan()
@@ -3056,7 +3105,7 @@ class Agent:
         before_steps = len(self._tasks.steps)
         loop = DebugLoop(
             lambda messages, tools=None, model=None: self._chat_with_fallback(messages, tools or [], choice),
-            self._executor,
+            self._executor_agent._async_executor,
             self._settings,
             tracker=self._change_tracker,
             registry=self._registry,

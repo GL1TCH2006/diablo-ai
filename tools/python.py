@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -9,12 +10,13 @@ from typing import Any
 
 from core.cancellation import cancellation_requested
 from core.logging_setup import get_logger
+from core.process_manager import get_process_manager
 
 from .registry import ToolResult
 
 log = get_logger("python_tool")
 
-# Bounded output handling (mirroring BlenderRunner pattern)
+# Bounded output handling (mirroring BlenderRunner/Python tool pattern)
 MAX_STREAM_CHARS = 64 * 1024
 POLL_INTERVAL_S = 0.05
 TERMINATE_GRACE_S = 5.0
@@ -84,27 +86,19 @@ def _stop_process(proc: subprocess.Popen, operation: str) -> bool:
     """Terminate then kill the child, both bounded, and reap it.
 
     Returns ``True`` only when the child is *confirmed* dead.
+    Uses ProcessManager for unified process tree termination.
     """
     if proc.poll() is not None:
         return True
     log.warning("terminating python script (pid=%s) for %s", proc.pid, operation)
-    for action, grace in (("terminate", TERMINATE_GRACE_S), ("kill", KILL_GRACE_S)):
-        try:
-            getattr(proc, action)()
-        except (OSError, ValueError, ProcessLookupError, AttributeError):
-            pass
-        try:
-            proc.wait(timeout=grace)
-            return True
-        except subprocess.TimeoutExpired:
-            continue
-    # Last resort: block on reap so we never return with a live child.
-    try:
-        proc.wait(timeout=KILL_GRACE_S)
-        return True
-    except subprocess.TimeoutExpired:
-        log.error("python script (pid=%s) survived kill for %s", proc.pid, operation)
-        return False
+
+    pm = get_process_manager()
+    task_id = f"python_{proc.pid}"
+    pm.register(task_id, proc, operation=operation)
+
+    success = pm.terminate_tree(task_id, grace_period=KILL_GRACE_S)
+    pm.unregister(proc.pid)
+    return success
 
 
 def run_script(
@@ -149,6 +143,10 @@ def run_script(
     except OSError as exc:
         return ToolResult(False, error=f"Failed to start script: {exc}")
 
+    # Register with ProcessManager for unified cleanup
+    pm = get_process_manager()
+    pm.register(f"python_{proc.pid}", proc, operation=operation)
+
     out = _BoundedStream()
     err = _BoundedStream()
     readers = [
@@ -160,7 +158,6 @@ def run_script(
 
     timed_out = False
     cancelled = False
-    reaped = True
     try:
         while True:
             if cancellation_requested(cancel_token):
@@ -175,7 +172,7 @@ def run_script(
             except subprocess.TimeoutExpired:
                 continue
         if cancelled or timed_out:
-            reaped = _stop_process(proc, operation)
+            pm.terminate_tree(f"python_{proc.pid}", grace_period=KILL_GRACE_S)
     finally:
         # Reap: never leave a child running, whatever happened above.
         for reader in readers:
@@ -186,6 +183,7 @@ def run_script(
                     stream.close()
                 except (ValueError, OSError):
                     pass
+        pm.unregister(proc.pid)
 
     stdout = out.text()
     stderr = err.text()

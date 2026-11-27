@@ -11,6 +11,7 @@ from config.permissions import ToolBlockedError, destructive_command_reason
 from config.settings import Settings
 from core.cancellation import cancellation_requested
 from core.logging_setup import get_logger
+from core.process_manager import get_process_manager
 
 from .registry import ToolResult
 
@@ -92,49 +93,22 @@ def _stop_process(proc: subprocess.Popen, operation: str) -> bool:
     """Terminate then kill the child process tree, both bounded, and reap it.
 
     Returns ``True`` only when the child is *confirmed* dead.
-    On Windows, uses ``taskkill /T /PID`` to terminate the entire process tree.
+    Uses ProcessManager for unified process tree termination (Windows Job Objects on Windows).
     """
     if proc.poll() is not None:
         return True
     log.warning("terminating terminal command (pid=%s) for %s", proc.pid, operation)
 
-    # First try: use taskkill to kill the entire process tree (Windows)
-    if sys.platform == "win32":
-        try:
-            log.debug("using taskkill /T /PID %d", proc.pid)
-            subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=KILL_GRACE_S,
-            )
-            # Wait a moment for reap
-            try:
-                proc.wait(timeout=1.0)
-                return True
-            except subprocess.TimeoutExpired:
-                pass
-        except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
-            pass
+    # Use ProcessManager for unified process tree termination
+    pm = get_process_manager()
+    # Try to find the task_id for this process
+    task_id = f"terminal_{proc.pid}"
+    pm.register(f"terminal_{proc.pid}", proc, operation="terminal")
 
-    # Fallback: standard terminate/kill (works on Unix, limited on Windows)
-    log.warning("falling back to standard terminate/kill for terminal command (pid=%s)", proc.pid)
-    for action, grace in (("terminate", TERMINATE_GRACE_S), ("kill", KILL_GRACE_S)):
-        try:
-            getattr(proc, action)()
-        except (OSError, ValueError, ProcessLookupError, AttributeError):
-            pass
-        try:
-            proc.wait(timeout=grace)
-            return True
-        except subprocess.TimeoutExpired:
-            continue
-    # Last resort: block on reap so we never return with a live child.
-    try:
-        proc.wait(timeout=KILL_GRACE_S)
-        return True
-    except subprocess.TimeoutExpired:
-        log.error("terminal command (pid=%s) survived kill for %s", proc.pid, operation)
-        return False
+    # Use ProcessManager's terminate_tree for unified cleanup
+    success = pm.terminate_tree(f"terminal_{proc.pid}", grace_period=KILL_GRACE_S)
+    pm.unregister(proc.pid)
+    return success
 
 
 def run_command(
@@ -175,6 +149,10 @@ def run_command(
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+    # Register with ProcessManager for unified cleanup
+    pm = get_process_manager()
+    task_id = f"terminal_{os.getpid()}_{int(time.monotonic() * 1000)}"
+
     try:
         proc = subprocess.Popen(
             PS_PREFIX + [command],
@@ -190,6 +168,9 @@ def run_command(
     except OSError as exc:
         return ToolResult(False, error=f"Failed to run command: {exc}")
 
+    # Register with ProcessManager for unified cleanup
+    pm.register(f"terminal_{proc.pid}", proc, operation="terminal", creationflags=creationflags)
+
     out = _BoundedStream()
     err = _BoundedStream()
     readers = [
@@ -201,7 +182,6 @@ def run_command(
 
     timed_out = False
     cancelled = False
-    reaped = True
     try:
         while True:
             if cancellation_requested(cancel_token):
@@ -216,7 +196,7 @@ def run_command(
             except subprocess.TimeoutExpired:
                 continue
         if cancelled or timed_out:
-            reaped = _stop_process(proc, operation)
+            pm.terminate_tree(f"terminal_{proc.pid}", grace_period=KILL_GRACE_S)
     finally:
         # Reap: never leave a child running, whatever happened above.
         for reader in readers:
@@ -227,6 +207,7 @@ def run_command(
                     stream.close()
                 except (ValueError, OSError):
                     pass
+        pm.unregister(proc.pid)
 
     stdout = out.text()
     stderr = err.text()

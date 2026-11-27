@@ -6,7 +6,7 @@ from core.knowledge_graph import NodeType, RelationType
 from core.knowledge_tools import QUERY_TYPES
 from core.logging_setup import get_logger
 
-from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal, data_tool, chart_tool
+from . import applications, coding as coding_tool, filesystem, git as git_tool, github as gh_tool, memory as memory_tool, models as models_tool, patches as patches_tool, python as python_tool, rules as rules_tool, system, tasks as tasks_tool, terminal, data_tool, chart_tool, ddle
 from .registry import ToolRegistry, ToolSpec
 
 log = get_logger("tools")
@@ -922,6 +922,52 @@ def build_registry(
         from .desktop import build_desktop_tools
         for spec in build_desktop_tools(capability_registry, events=capability_events):
             registry.register(spec)
+
+    # DDLE tools — supervise development work via the DDLE controller at C:/PROJECTS/DDLE.
+    registry.register(
+        ToolSpec(
+            name="ddle.start_task",
+            description="Create and run a DDLE development task: context, execute, critic, exit check.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Human-readable task description"},
+                    "exit_conditions": {"type": "array", "items": {"type": "string"}, "description": "Exit conditions for the critic"},
+                    "max_iterations": {"type": "integer", "description": "Maximum loop iterations", "default": 10},
+                },
+                "required": ["description"],
+            },
+            fn=lambda **kw: ddle.start_task(
+                kw["description"], kw.get("exit_conditions"), int(kw.get("max_iterations", 10) or 10)
+            ),
+            describe=lambda args: f"DDLE start task: {args.get('description', '')[:60]}",
+            level=PermissionLevel.SENSITIVE,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="ddle.task_status",
+            description="Load a DDLE task from disk and return its current status.",
+            parameters={
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "DDLE task ID"}},
+                "required": ["task_id"],
+            },
+            fn=lambda **kw: ddle.task_status(kw["task_id"]),
+            describe=lambda args: f"DDLE task status: {args.get('task_id', '')}",
+            level=PermissionLevel.SAFE,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="ddle.list_tasks",
+            description="List all DDLE tasks saved to disk with their states.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            fn=lambda **kw: ddle.list_tasks(),
+            describe=lambda args: "DDLE list tasks",
+            level=PermissionLevel.SAFE,
+        )
+    )
 
     log.info("registered tools: %s", ", ".join(registry.names()))
     return registry

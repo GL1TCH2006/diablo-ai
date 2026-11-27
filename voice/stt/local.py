@@ -83,13 +83,13 @@ class FasterWhisperBackend(SpeechToTextBackend):
                 return False
 
     def is_available(self) -> bool:
-        # Only available if explicitly configured with a model path
-        if not self._initialized:
-            # Only initialize if explicitly configured with a model path
-            if self._download_root and Path(self._download_root).exists():
-                return self._initialize_model()
+        if not self._download_root:
             return False
-        return self._model is not None
+        with self._model_lock:
+            if self._initialized:
+                return self._model is not None
+            self._initialized = True
+            return self._initialize_model()
 
     def dependency_status(self) -> dict[str, bool]:
         """Return the status of optional dependencies."""

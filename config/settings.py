@@ -46,6 +46,9 @@ class Settings:
     ollama_host: str = "http://localhost:11434"
     allow_remote_ollama: bool = False
     ai_model: str = ""
+    openai_base_url: str = "https://integrate.api.nvidia.com/v1"
+    openai_api_key: str = ""
+    openai_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
     workspace_root: Path = Path("C:/PROJECTS")
     data_dir: Path = BASE_DIR / "data"
     memory_dir: Path = BASE_DIR / "data" / "memory"
@@ -155,6 +158,9 @@ def load_settings() -> Settings:
         ollama_host=env.get("OLLAMA_HOST", _str(toml, ["ollama", "host"], "http://localhost:11434")),
         allow_remote_ollama=_as_bool(env.get("ALLOW_REMOTE_OLLAMA"), _bool(toml, ["ollama", "allow_remote"], False)),
         ai_model=env.get("AI_MODEL", ""),
+        openai_base_url=env.get("OPENAI_BASE_URL", _str(toml, ["openai", "base_url"], "https://integrate.api.nvidia.com/v1")),
+        openai_api_key=env.get("OPENAI_API_KEY", _str(toml, ["openai", "api_key"], "")),
+        openai_model=env.get("OPENAI_MODEL", _str(toml, ["openai", "model"], "nvidia/nemotron-3-ultra-550b-a55b")),
         ai_request_timeout=_as_float(
             env.get("AI_REQUEST_TIMEOUT"), _as_float(_str(toml, ["ai", "request_timeout"], ""), 600.0)
         ),
