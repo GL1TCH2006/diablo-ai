@@ -1,0 +1,545 @@
+================================================================================
+M2.17.x TASK 1 - VERIFICATION PIPELINE MAP
+================================================================================
+
+ARCHITECTURE MAPPING ONLY. No implementation was modified.
+
+Every claim below was read out of the code at HEAD a4649ea, not inferred from the
+architecture documents. Where the code and a document disagree, the code wins and
+the disagreement is noted.
+
+================================================================================
+1. GOAL PATH
+================================================================================
+
+  Goal model            core/goals.py :: Goal, GoalState
+  Durable store         core/goals.py :: GoalStore  (one JSON per goal under
+                         <sessions_dir>/goals/, written with memory.storage.save_json)
+  Runtime               core/autonomy.py :: AutonomyRuntime
+
+  A. Where is a goal created?
+     core/goals.py :: create_goal(). Persisted by GoalStore.create().
+     No production caller creates a goal other than an operator/probe: goals arrive
+     as pre-existing durable records reconciled at startup. main.py --autonomy
+     creates the *store*, not goals.
+
+  B. Where is it persisted?
+     GoalStore.save() -> save_json() -> atomic temp file + os.replace.
+
+  C. Where is it associated with a task?
+     core/autonomy.py :: AutonomyRuntime.observe()
+        goal.attach_task(task_id)
+     The task_id itself is minted by the TaskManager during Agent.respond and read
+     back via AutonomyRuntime._current_task_id() ->
+     Agent.request_context.task_id. The goal never supplies or chooses an id.
+
+  D. What exact condition marks a goal completed?
+     core/goals.py :: Goal.mark_completed()
+        if not self.has_required_evidence: return False
+        return self.transition(GoalState.COMPLETED)
+     has_required_evidence ==
+        len(self.verified_task_ids) >= max(1, self.required_evidence)
+     verified_task_ids grows only through Goal.record_verified_task(), which is
+     called from exactly one production site: AutonomyRuntime.observe(), and only
+     inside `if verdict == "verified"`.
+
+  E. Does goal completion depend on VerificationState, TaskState, or BOTH?
+     BOTH, and correctly so. `verdict` is
+     AutonomyRuntime._task_verdict() -> core.task_manager.terminal_verdict(state,
+     verification), which yields TerminalVerdict.VERIFIED for exactly one pair:
+     TaskState.COMPLETED + VerificationState.PASSED.
+
+     CONCLUSION: the goal layer is already sound. It cannot be completed by a task
+     that merely finished. The defect is strictly upstream of it.
+
+================================================================================
+2. TASK PATH
+================================================================================
+
+  Durable record        core/task_store.py :: TaskRecord, TaskStore
+  In-memory authority   core/task_manager.py :: TaskManager
+  Plan                  core/planner.py :: ExecutionPlanRecord, PlanStepRecord
+
+  A. Where is a task created?
+     TaskManager.begin_task(title, task_id) during Agent._begin_request_context /
+     _respond; persisted by TaskStore.create() and kept in sync by
+     Agent._sync_task_metadata().
+
+  B. Where are plan steps persisted?
+     TaskRecord.plan (an ExecutionPlanRecord) on the task record, written through
+     TaskStore and surfaced in _lifecycle_metadata().
+
+  C. Where does a step become DONE?
+     Agent._record_execution() -> Agent._step_finalize() ->
+     TaskManager.set_status(step, self._step_status(outcome)).
+     Also PlanStepRecord status transitions via the write-ahead/finalize pair
+     (_step_write_ahead / _step_finalize).
+
+  D. Where does a task become COMPLETED?
+     Agent._finish_tracking() (agent.py:1973) computes the status, settles
+     verification, calls tasks.synchronize_verification(), asserts
+     tasks.terminal_violation(), and only then transitions.
+
+  E. What prevents SUCCESSFUL TOOL CALL -> COMPLETED when verification is UNVERIFIED?
+
+     NOTHING PREVENTS IT - AND THAT IS BY DESIGN, NOT A DEFECT.
+
+     agent.py:2009-2013 states it explicitly:
+       "COMPLETED with a non-PASSED verdict is legitimate and is NOT forced to
+        FAILED; the invariant forbids the opposite disagreement only."
+
+     core/task_manager.py ::
+        COMPLETED_ADMISSIBLE_VERIFICATIONS = frozenset({
+            PASSED, UNVERIFIED, NOT_REQUIRED, NOT_RUN })
+
+     So a successful `filesystem.write_file` yields COMPLETED + UNVERIFIED, and
+     terminal_verdict() reports TerminalVerdict.UNVERIFIED, whose `.succeeded` is
+     None - not True. The safety property is carried by the VERDICT, not by
+     refusing COMPLETED. Forcing COMPLETED+UNVERIFIED to FAILED would be a
+     behaviour change to a deliberate M2.14 invariant and is explicitly out of
+     scope here.
+
+================================================================================
+3. EXECUTOR
+================================================================================
+
+  Entry point           core/executor.py :: Executor.run(tool, args, token)
+  Call site             Agent._execute_step() (agent.py:1936) -> _record_execution()
+
+  A. After a tool returns success, what happens?
+     _execute_step: transition EXECUTING -> write-ahead the plan step as RUNNING ->
+     Executor.run() -> _record_execution(tool, args, outcome) ->
+     _step_finalize() marks the step DONE -> _record_verification IF the tool
+     supplied one -> _sync_task_metadata().
+
+  B. Is verification automatically invoked?
+     NO - not for a tool. It is invoked automatically ONLY for a tool that attaches
+     a VerificationResult to its ToolResult.
+
+     THE INSERTION POINT (agent.py:1772-1779, inside Agent._record_execution):
+         verification = getattr(outcome, "verification", None)
+         if (outcome.success and not outcome.cancelled
+                 and isinstance(verification, VerificationResult)):
+             self._begin_verification()
+             self._record_verification(verification)
+
+     outcome.verification is populated by core/executor.py:308:
+         outcome.verification = getattr(result, "verification", None)
+
+     and ToolResult declares the field (tools/registry.py):
+         verification: Any = None
+
+     So the channel tool -> executor -> agent -> ledger is fully built and fully
+     wired. It is exercised in production today by tools/coding.py (project.verify,
+     4 sites) and tools/capability_bridge.py:1261.
+
+  C. If verification is unavailable, what state is recorded?
+     Agent._finish_tracking() agent.py:2001-2008:
+        elif tasks.verification == VerificationState.NOT_RUN:
+            result = VerificationResult(
+                VerificationState.UNVERIFIED if tasks.any_executed()
+                else VerificationState.NOT_REQUIRED,
+                "No independent verifier was available.", "execution")
+            self._begin_verification(); self._record_verification(result)
+     UNVERIFIED is therefore recorded, with the literal detail
+     "No independent verifier was available." That string is the fingerprint of
+     this gap and is visible in every real-model task record.
+
+  D. If verification fails, what happens to the step?
+     A tool-supplied FAILED VerificationResult is recorded to the ledger; step status
+     comes from _step_status(outcome) and recovery is decided by the single
+     RecoveryPolicy via Agent._failure_observation(). Independently,
+     Agent._failure_category() (agent.py:3123-3125) maps a tool-supplied FAILED
+     verification to FailureCategory.VERIFICATION_FAILED.
+
+  E. Can a tool result currently cause completion without ledger evidence?
+     YES, and unavoidably so at the task layer: COMPLETED+UNVERIFIED is admissible
+     (§2E). What is impossible is *goal* completion without a ledger-backed PASSED
+     entry, because AutonomyRuntime.observe() only records evidence for
+     verdict == "verified", which requires COMPLETED+PASSED, which requires a
+     ledger entry.
+
+================================================================================
+4. FILESYSTEM PATH
+================================================================================
+
+Permission levels as declared in tools/__init__.py (level_for shown in full):
+
+  filesystem.read_file    SAFE     if path_is_within(path, allowed_roots)
+                                    else SENSITIVE
+  filesystem.list_dir     SAFE     if in-root, else SENSITIVE
+  filesystem.write_file   NORMAL   if in-root, else SENSITIVE
+                                      (declared SENSITIVE, demoted in-root)
+  filesystem.delete_file  SENSITIVE  (no level_for -> always needs confirmation)
+
+  Allowed roots helper    config/permissions.py :: path_is_within()
+  Path coercion           tools/__init__.py :: _p(value) -> Path(value)
+
+  Path semantics finding (mapped here, NOT fixed - that is Task 8):
+  _p() is a bare Path(value). There is no workspace_root resolution anywhere in the
+  filesystem tool path. A relative path is therefore interpreted by
+  path_is_within() relative to the PROCESS CWD, not to settings.workspace_root.
+  This is the mechanism behind the relative-path cancellations observed in the
+  previous milestone's real-model run.
+
+  Operation table. "Result verification" is what the tool attaches to
+  ToolResult; nothing else can supply one.
+
+  | Operation        | Mutation (tools/filesystem.py)      | Result verification | Ledger | Task terminal | Goal evidence |
+  |------------------|------------------------------------|---------------------|--------|---------------|---------------|
+  | read file        | none (read_text)                   | NONE                | empty  | COMPLETED+UNVERIFIED | none |
+  | list dir         | none (iterdir)                     | NONE                | empty  | COMPLETED+UNVERIFIED | none |
+  | write file       | Path.write_text (+parent.mkdir)    | NONE                | empty  | COMPLETED+UNVERIFIED | none |
+  | create dir       | implicit parent.mkdir(parents)     | NONE                | empty  | COMPLETED+UNVERIFIED | none |
+  | delete file      | Path.unlink                        | NONE                | empty  | CANCELLED (no confirmation channel under --autonomy) | none |
+  | project.verify   | runs pytest (tools/coding.py)      | VerificationResult PASSED/FAILED/UNVERIFIED | recorded | COMPLETED+<verdict> | YES when PASSED |
+
+  The write_file result string is NOT trustworthy as evidence and must not be
+  treated as such: tools/filesystem.py:38 reports `target.stat().st_size` from the
+  writer's own post-write view, and a ToolResult(True) only means no OSError was
+  raised. An independent verifier must re-observe the filesystem.
+
+================================================================================
+5. VERIFICATION FUNNEL
+================================================================================
+
+  Authoritative source  core/verification_ledger.py :: VerificationLedger
+  Entry                 core/verification_ledger.py :: VerificationEntry
+  Trust ladder          core/verification_ledger.py :: EvidenceTrust
+                         (CLAIMED < DECLARED < OBSERVED; only OBSERVED supports PASSED)
+  State                 core/verification.py :: VerificationState
+                         (NOT_RUN, PASSED, FAILED, NOT_REQUIRED, UNVERIFIED)
+  Single funnel         core/task_manager.py :: TaskManager.record_verification()
+  Gate                  core/verification_ledger.py :: adjudicate()
+  Terminal classifier   core/task_manager.py :: terminal_verdict(), TerminalVerdict
+  Recovery input        core/recovery.py :: FailureObservation, RecoveryPolicy
+
+  A. Authoritative source of verification evidence?
+     The VerificationLedger. TaskManager.record_verification() is the ONLY funnel
+     every writer passes through, and it sets the scalar verification /
+     verification_evidence fields FROM THE ADJUDICATED ENTRY, never from the
+     writer's request.
+
+  B. What qualifies as PASSED evidence?
+     adjudicate() requires all four of:
+       1. subject_kind is known (not VerificationSubject.UNKNOWN)
+       2. method_kind is not VerificationMethod.NONE
+       3. trust is EvidenceTrust.OBSERVED
+       4. _validate_evidence(evidence) == ""
+     _validate_evidence requires: a Mapping (a string is explicitly "narration, not
+     evidence"), all keys str, at least one substantive leaf, JSON-serialisable,
+     and every key in ASSERTION_KEYS present must be the boolean True.
+     ASSERTION_KEYS = {valid, exists, verified, ok, success, passed, readable,
+                       complete}
+
+     Design consequence worth recording: because "exists" is an ASSERTION_KEY, a
+     verifier that observes "the file is absent" and requests PASSED with
+     exists=False is downgraded to UNVERIFIED. To record an honest FAILED, a
+     verifier must REQUEST FAILED - adjudicate() only ever gates PASSED, and a
+     non-PASSED request is never upgraded.
+
+  C. Can a PASSED verification entry exist without independent evidence?
+     NO. Three independent gates would each have to be defeated: the trust ladder
+     requires OBSERVED, _validate_evidence rejects empty/narration/false-assertion
+     evidence, and the entry retains requested_state plus the downgrade reason so a
+     downgrade stays auditable.
+
+  D. How is verification associated with a step?
+     TaskManager.record_verification(..., step_id="") accepts step_id;
+     PlanStepRecord.verification_state is annotated by Agent._annotate_step()
+     (agent.py:1622-1625) from the tool-supplied result. The corpus uses the
+     task-level funnel; step_id is available but the production writers in scope
+     (coding.py, capability_bridge.py) do not set it.
+
+  E. How is verification associated with a task?
+     TaskManager holds one VerificationLedger; entries carry task_id and run_id;
+     the bounded projection rides the task record under
+     lifecycle.verification_ledger via TaskManager.verification_ledger_snapshot()
+     -> VerificationLedger.to_persisted_dict().
+
+  F. What happens when verification is missing?
+     _finish_tracking() records UNVERIFIED (or NOT_REQUIRED if nothing executed) with
+     detail "No independent verifier was available." Task may still reach COMPLETED.
+
+  G. What happens when verification fails?
+     FAILED is recorded; FAILED + TaskState.COMPLETED is an invariant VIOLATION
+     caught by terminal_violation(); FAILED + TaskState.FAILED is admissible; the
+     task transitions FAILED and recovery is offered by RecoveryPolicy.
+
+  H. What happens when a step is CANCELLED?
+     terminal_verdict() returns TerminalVerdict.CANCELLED for a CANCELLED task
+     regardless of verification ("cancellation dominates"). .succeeded is None.
+     _finish_tracking() calls tasks.invalidate_verification("Task was cancelled
+     before verification completed.") when status == "cancelled", so a prior PASSED
+     cannot survive a cancellation. AutonomyRuntime.observe() maps CANCELLED to
+     reason "task was cancelled" and records no evidence.
+
+================================================================================
+6. LEDGER WRITES IN PRODUCTION
+================================================================================
+
+  Every production write goes through Agent._record_verification() ->
+  TaskManager.record_verification() -> VerificationLedger.record() -> adjudicate().
+
+  Agent sites that call it: 419 (the funnel itself), 1779 (tool-supplied result -
+  THE INSERTION POINT), 2000, 2008 (finish-tracking fallbacks), 2411, 2519, 2522,
+  2535, 3045, 3054. TaskManager also writes directly at 1957
+  (_force_failed_verification) and 1996 (already-terminal failure) - both
+  deliberately routed through the funnel rather than set_verification().
+
+  Persistence: Agent._lifecycle_metadata() -> "verification_ledger":
+  _ledger_snapshot(tasks), written by _sync_task_metadata() into the existing
+  task record. No second persistence system.
+
+  DOES ORDINARY FILESYSTEM OPERATION PRODUCE LEDGER EVIDENCE? NO. Not because the
+  ledger refuses it, but because no filesystem tool supplies a VerificationResult.
+  Every filesystem task record carries exactly one entry - the synthetic UNVERIFIED
+  written by _finish_tracking with the detail "No independent verifier was
+  available."
+
+================================================================================
+7. TASK / VERIFICATION INVARIANTS (as implemented - not reinterpreted)
+================================================================================
+
+  core/task_manager.py :: terminal_invariant_violation(state, verification)
+
+    COMPLETED + PASSED        admissible
+    COMPLETED + UNVERIFIED    ADMISSIBLE (deliberate)
+    COMPLETED + NOT_REQUIRED  ADMISSIBLE
+    COMPLETED + NOT_RUN       ADMISSIBLE
+    COMPLETED + FAILED        VIOLATION
+                               "reports a failure as a finished request"
+    FAILED    + PASSED        VIOLATION
+                               "a passing verdict must never survive an execution
+                                failure"
+    FAILED    + others        admissible
+    CANCELLED + anything      admissible; terminal_verdict returns CANCELLED and it
+                               dominates every other fact
+    UNVERIFIED on COMPLETED   admissible; .succeeded is None, never True
+
+  Enforced at exactly one place: Agent._finish_tracking() calls
+  tasks.terminal_violation() where the terminal state is actually decided, and
+  fails closed (log.error + force FAILED) rather than persisting an inadmissible
+  pair.
+
+  Verification is also invalidated rather than trusted across boundaries:
+  Agent._record_execution() calls tasks.invalidate_verification() when a later
+  executed operation fails or is cancelled.
+
+================================================================================
+8. GOAL COMPLETION
+================================================================================
+
+  Task completed -> AutonomyRuntime.observe() -> _task_verdict() ->
+  terminal_verdict(record lifecycle state, lifecycle verification) ->
+  Goal.record_verified_task() only when verdict == "verified" ->
+  Goal.has_required_evidence -> Goal.mark_completed().
+
+  Does the goal require verification?        YES - exclusively, via VERIFIED.
+  Does it only require task completion?      NO. COMPLETED alone is insufficient.
+  Does it distinguish UNVERIFIED?             YES - no evidence recorded.
+  Does it distinguish CANCELLED?             YES - reason "task was cancelled".
+  Does it distinguish FAILED?                YES - reason from the verdict.
+
+  GAP: none at this layer. AutonomyRuntime.observe() is already verification-driven
+  and already refuses to complete a goal on UNVERIFIED. It is also already correct
+  about "missing": a corrupt lifecycle payload yields "unknown" rather than a pass.
+
+  One observation recorded without acting on it: observe() derives the verdict from
+  the task record's persisted lifecycle metadata, i.e. it reads what was WRITTEN,
+  not the live TaskManager. That is the right durability choice for a restart-
+  sensitive runtime, and it is why the real-model probe saw "unverified" rather than
+  a live value.
+
+================================================================================
+9. REAL-MODEL CONNECTION
+================================================================================
+
+  qwen3:8b -> backend (ai/) -> Agent._llm_loop() -> provider selects a tool ->
+  Agent._execute_step() -> Executor.run() -> ToolResult ->
+  [ToolResult.verification -> outcome.verification -> _record_verification ->
+   VerificationLedger] -> _finish_tracking() -> TaskStore ->
+  AutonomyRuntime._task_verdict() -> goal evidence.
+
+  Where the probes attach: tests/real_model_autonomy.py drives
+  AutonomyRuntime.tick() against a real Agent and a real provider. It does not
+  substitute any production component.
+
+  Task 0 finding re-verified at this HEAD: the three real-model probes
+  (tests/real_model_autonomy.py, real_model_desktop_selection.py,
+  real_model_edge_companion.py) match no pytest collection pattern and are absent
+  from `pytest --collect-only`. No test_m217_* file references
+  DIABLO_REAL_MODEL_TESTS. NOT converted in this task.
+
+  Observed end-to-end behaviour, from the previous milestone's real run: real file
+  operations executed, produced exactly one ledger entry each - the synthetic
+  UNVERIFIED - and therefore produced zero goal evidence and zero completed goals.
+  That is this map's central claim, confirmed empirically.
+
+================================================================================
+10. THE EXACT M2.17 GAP
+================================================================================
+
+  QUESTION: what exact missing capability prevents a safe ordinary filesystem
+  mutation from becoming independently verified, and therefore prevents a real
+  autonomous goal from reaching COMPLETED?
+
+  ANSWER, IN ONE SENTENCE:
+  Nothing is missing in the verification architecture. The channel by which a tool
+  hands an independently observed VerificationResult to the ledger is already built,
+  already adjudicated, and already in production use. What is missing is a producer
+  at the far end: an independent filesystem observer that re-reads the filesystem
+  after a mutation and attaches a VerificationResult to the filesystem tools'
+  existing ToolResult.verification field.
+
+  THE FULL CHAIN, WITH THE ONE ABSENT LINK MARKED:
+
+    Agent._record_execution (agent.py:1772-1779)      [present]
+      reads outcome.verification
+        ^
+        | executor.py:308 outcome.verification = result.verification   [present]
+        ^
+    ToolResult.verification (tools/registry.py)                        [present]
+        ^
+        |  <<< ABSENT: no independent filesystem verifier >>>           [MISSING]
+        ^
+    tools/filesystem.py write_file/read_file/list_dir/delete_file
+      return ToolResult(True, ...) with verification=None
+
+  Everything downstream of the absent link is implemented and exercised:
+  adjudicate()'s four gates, ASSERTION_KEYS (which already contains "exists"),
+  VerificationSubject.FILE, VerificationMethod.FILE_AND_OUTPUT, EvidenceTrust.OBSERVED,
+  TaskManager.record_verification(), the ledger projection, terminal_verdict(),
+  AutonomyRuntime.observe(), Goal.record_verified_task(), Goal.mark_completed().
+
+  ALREADY AVAILABLE FOR REUSE - do not rebuild any of these:
+
+    1. tools/registry.py :: ToolResult.verification
+         The extension point. Already the production mechanism.
+    2. core/agent.py :: Agent._record_execution (1772-1779)
+         The consumer. Already handles PASSED and FAILED tool-supplied verdicts.
+    3. core/verification.py :: Verifier.check_file(path)
+         An independent existence / is_file / size probe. Already used by the
+         create_hello_python intent at agent.py:2506. INSUFFICIENT ALONE for a
+         write: it takes the caller's Path, checks no containment, verifies no
+         content, and returns a tuple rather than a VerificationResult.
+    4. tools/coding.py :: _verification_from_run
+         The precedent to copy: builds a VerificationResult whose evidence dict
+         carries an explicit boolean assertion key, with the comment that the key
+         is adjudicated by the ledger "independently of this function's own logic".
+    5. core/verification_ledger.py :: ASSERTION_KEYS, adjudicate, _validate_evidence
+    6. core/verification_ledger.py :: VerificationSubject.FILE,
+         VerificationMethod.FILE_AND_OUTPUT
+         "file_and_output" already maps to (FILE, FILE_AND_OUTPUT) via
+         LEGACY_KIND_AXES:236.
+    7. core/task_manager.py :: terminal_verdict, COMPLETED_ADMISSIBLE_VERIFICATIONS
+    8. core/autonomy.py :: AutonomyRuntime.observe, Goal.mark_completed
+    9. core/agent.py :: _failure_category -> FailureCategory.VERIFICATION_FAILED
+         Already maps a tool-supplied FAILED verdict to a recovery category.
+
+  NOT MISSING, and therefore not to be built: a second ledger, a second verifier
+  registry, a new goal state machine, a new completion path, a new funnel.
+
+  SECONDARY GAP, separate from the above and mapped for Task 8:
+  tools/__init__.py :: _p() resolves relative paths against the process CWD rather
+  than settings.workspace_root, so a legitimate workspace-relative path can be
+  judged SENSITIVE and then cancelled for want of a confirmation channel. This is
+  NOT to be fixed by loosening containment.
+
+================================================================================
+11. SMALLEST CORRECT NEXT STEP (for Task 2, not performed here)
+================================================================================
+
+  Add an independent filesystem observation that runs after the mutation and returns
+  a VerificationResult, then attach it to the filesystem tools' existing
+  ToolResult.verification. No new architecture, no new ledger writes, no permission
+  change, no change to any invariant.
+
+  Constraints that follow from this map:
+    - Request FAILED for a negative observation; do not request PASSED with
+      exists=False and rely on the downgrade (adjudicate only gates PASSED).
+    - The verifier must observe independently: re-stat / re-read the filesystem
+      rather than trusting write_file's own ToolResult output.
+    - Containment must be checked by the verifier as well, not only by
+      PermissionManager, so an out-of-root path cannot produce evidence.
+    - Evidence must carry a substantive, JSON-serialisable observation and must not
+      embed file content, so no secret can reach the durable ledger.
+    - delete_file stays SENSITIVE and therefore stays non-autonomously-completable.
+      Nothing in Task 2 may change that.
+
+================================================================================
+12. FILES AND FUNCTIONS INSPECTED
+================================================================================
+
+  core/goals.py            Goal, GoalState, GoalStore, create_goal,
+                           mark_completed, record_verified_task, attach_task,
+                           has_required_evidence, is_schedulable
+  core/autonomy.py         AutonomyRuntime (tick, submit_goal, observe,
+                           _task_verdict, cancel, reconcile), AutonomyScheduler,
+                           reconcile_on_startup, summarise_goal
+  core/agent.py            _record_verification (419), _lifecycle_metadata (459),
+                           _sync_task_metadata (485), _annotate_step (1622),
+                           _record_execution (1772-1779), _failure_observation
+                           (1809), _execute_step (1930-1940),
+                           _force_failed_verification (1947), _mark_failure (1961),
+                           _finish_tracking (1973-2026), _failure_category (3115),
+                           _ledger_snapshot (3129)
+  core/task_manager.py     TaskState, TerminalVerdict, terminal_verdict (211),
+                           terminal_invariant_violation (237),
+                           COMPLETED_ADMISSIBLE_VERIFICATIONS,
+                           FAILED_ADMISSIBLE_VERIFICATIONS,
+                           verification_ledger_snapshot,
+                           record_verification (476), synchronize_verification,
+                           set_verification, invalidate_verification
+  core/task_store.py       TaskRecord (status / outcome / plan / metadata),
+                           TaskStore.create / get / update / finish
+  core/verification.py     VerificationState, VerificationResult,
+                           Verifier.check_file / check_run / check_output /
+                           check_failure / terminal_failure
+  core/verification_ledger.py  VerificationSubject, VerificationMethod,
+                           EvidenceTrust, ASSERTION_KEYS, LEGACY_KIND_AXES,
+                           _is_substantive, _validate_evidence, adjudicate (341),
+                           VerificationEntry, VerificationLedger.record /
+                           append / to_persisted_dict / from_dict
+  core/executor.py         Executor.run, decision evaluation, confirmation
+                           channel (:220-225), outcome.verification (:308),
+                           telemetry (:143)
+  core/planner.py          ExecutionPlanRecord, PlanStepRecord, side_effect_key
+  core/recovery.py         RecoveryPolicy, FailureObservation, FailureCategory
+  tools/registry.py        ToolResult (incl. the verification field), ToolSpec
+  tools/filesystem.py      read_file, write_file, list_dir, delete_file,
+                           _create_backup, within_allowed
+  tools/__init__.py        filesystem ToolSpec registrations, level_for lambdas,
+                           _p path coercion
+  tools/coding.py          project.verify, _verification_from_run
+  tools/capability_bridge.py  ToolResult verification producer (:1261)
+  core/request_context.py  BoundedRequestGate, RequestContext.task_id
+  config/permissions.py    PermissionManager.evaluate, path_is_within
+  main.py                  --autonomy wiring, build_capability_runtime
+
+================================================================================
+13. VALIDATION RUN (no implementation changed)
+================================================================================
+
+  Focused (verification + ledger + task + filesystem + M2.17 goal/autonomy):
+    tests/test_verification.py, test_verification_ledger.py,
+    test_phase3_verification.py, test_p3_verification_migration.py,
+    test_filesystem.py, test_task_store.py, test_task_inspection.py,
+    test_m217_persistent_autonomy.py, test_m217_autonomy_runtime.py,
+    test_m217_autonomy_integration.py
+    RESULT: 308 passed, exit 0
+
+  Import check:
+    core.agent, core.autonomy, core.goals, core.verification,
+    core.verification_ledger, core.task_manager, core.task_store,
+    core.executor, tools.filesystem
+    RESULT: all import cleanly
+
+  Working tree after mapping: CLEAN (no implementation file modified)
+
+  Full suites deliberately NOT re-run: Task 1 changed nothing, and Task 0 already
+  recorded both baselines at this exact commit.
+
+================================================================================
+TASK 1 STATUS: PASS
+================================================================================

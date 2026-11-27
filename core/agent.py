@@ -1,0 +1,3284 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from collections.abc import Mapping
+from pathlib import Path
+
+from ai.provider import AIProvider, ToolCall
+from config.permissions import PermissionManager
+from config.settings import Settings
+from core.cancellation import CancellationRequested, CancellationToken, cancellation_requested
+from core.context import build_system_prompt, ProjectContext
+from core.events import EventBus
+from core.executor import ExecutionOutcome, Executor
+from core.executor_agent import ExecutorAgent
+from core.async_executor import AsyncExecutor
+from core.logging_setup import get_logger
+from core.planner import (
+    ExecutionPlan,
+    ExecutionPlanRecord,
+    PlanStepError,
+    PlanStepRecord,
+    PlanValidationError,
+    Planner,
+    side_effect_key,
+)
+from core.recovery import (
+    FailureCategory,
+    FailureObservation,
+    RecoveryAction,
+    RecoveryDecision,
+    RecoveryPolicy,
+)
+from core.request_context import (
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    BoundedRequestGate,
+    RequestContext,
+)
+from core.task_manager import StepStatus, TaskState
+from core.verification import VerificationResult, VerificationState, Verifier
+from core.verification_ledger import VerificationEntry
+from coding.change_tracker import ChangeTracker
+from coding.snapshot_manager import SnapshotManager
+from memory.rule_engine import RuleEngine
+from memory.rules_store import RuleStore
+from memory.memory_store import MemoryStore
+from core.task_store import TaskStore, TaskRecord, GitTaskState, CommitInfo, TaskChangeStep
+
+log = get_logger("agent")
+
+
+class Agent:
+    def __init__(
+        self,
+        provider: AIProvider,
+        settings: Settings,
+        registry,
+        permissions: PermissionManager,
+        events: EventBus,
+        confirmer=None,
+        project: ProjectContext | None = None,
+        memory_conversation=None,
+        memory_preferences=None,
+        memory_project=None,
+        model_name: str = "",
+        model_catalog: list | None = None,
+    ):
+        self._provider = provider
+        self._settings = settings
+        self._registry = registry
+        self._permissions = permissions
+        self._events = events
+        self._confirmer = confirmer
+        self._project = project
+        self._conversation = memory_conversation
+        self._preferences = memory_preferences
+        self._project_memory = memory_project
+        self._model_name = model_name
+        self._model_catalog = model_catalog
+        self._async_executor = AsyncExecutor(
+            registry=registry,
+            permissions=permissions,
+            events=events,
+            confirmer=confirmer,
+            max_result_chars=settings.max_result_chars,
+            max_concurrent=4,
+            before_execute=self._before_execute,
+            state_listener=self._executor_state_listener,
+            event_context=self._event_payload,
+            tool_terminal_timeout=settings.tool_terminal_timeout,
+            tool_python_timeout=settings.tool_python_timeout,
+            tool_blender_timeout=settings.tool_blender_timeout,
+            tool_generic_timeout=settings.tool_generic_timeout,
+        )
+        self._executor_agent = ExecutorAgent(
+            async_executor=self._async_executor,
+            registry=registry,
+            permissions=permissions,
+            events=events,
+            confirmer=confirmer,
+        )
+        # M2.14.1: the Executor needs the authoritative task id so a
+        # task-scoped rule can be matched. Sourced from TaskManager, never from
+        # tool arguments.
+        self._executor_agent.set_task_provider(lambda: self._tasks.task_id)
+        self._verifier = Verifier()
+
+        # Backward compatibility: expose executor interface for existing tests
+        # that access agent._executor directly
+        self._executor = self._executor_agent._async_executor
+        self._messages: list[dict] = []
+        self._restored_conversation_count = 0
+        self._restore_conversation()
+        self._max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
+        self._request_gate = BoundedRequestGate(self._max_concurrent_requests)
+        self._request_context = RequestContext()
+        # M2.12 P2: the durable plan for the request in flight. Lives on the
+        # Agent rather than on RequestContext because the P1 field set is
+        # ratified and must not grow; it is reset per request in
+        # _begin_request_context and mirrored to TaskRecord.plan immediately.
+        self._active_plan: ExecutionPlanRecord | None = None
+        # M2.13.0: every model degradation seen during the request in flight,
+        # oldest first. Lives on the Agent for the same reason _active_plan
+        # does - the P1 RequestContext field set is ratified and must not grow -
+        # and is reset per request in _begin_request_context. Each entry is the
+        # dict form of an AIProviderError plus the model it happened on and
+        # what was tried next, so a silent fallback chain can be reconstructed.
+        self._provider_failures: list[dict] = []
+        # M2.13.0: the most recent adaptive tool-context decision, kept for
+        # diagnostics. None until the first model turn selects one.
+        self._tool_context_decision: Any = None
+        # The plan step currently between write-ahead and terminal state. Set by
+        # _step_write_ahead so pre-execution hooks (checkpoints) can attach
+        # provenance to the step they belong to.
+        self._running_plan_step: PlanStepRecord | None = None
+        self._task_store = TaskStore(settings.sessions_dir)
+        self._change_tracker = ChangeTracker(settings.sessions_dir)
+        self._snapshot_manager = SnapshotManager(settings.sessions_dir)
+        self._rules_store = RuleStore(settings.memory_dir / "rules.json")
+        self._rules_engine = RuleEngine(self._rules_store, project=self._project.name if self._project else "")
+        permissions.rule_engine = self._rules_engine
+        self._memory_store = MemoryStore(settings.memory_dir / "memory.json")
+        if self._project_memory is not None:
+            from core.project_task_history import ProjectTaskHistory
+            attach_task_history = getattr(self._project_memory, "attach_task_history", None)
+            if callable(attach_task_history):
+                attach_task_history(ProjectTaskHistory(self._task_store, settings.workspace_root))
+        self._router = self._build_router()
+        from tools import runtime_context
+        runtime_context.router = self._router
+        runtime_context.prefs = self._preferences
+
+        # Initialize PlannerAgent now that router is available
+        from .planner_agent import PlannerAgent
+        self._planner_agent = PlannerAgent(
+            settings=settings,
+            router=self._router,
+            events=events,
+            registry=registry,
+        )
+
+        self._reconcile_interrupted_tasks()
+        # Clear the recovery-state registry after reconciliation. The registry
+        # was populated for all records during reconciliation, but only the
+        # task actually being resumed needs its entry. The resume() method
+        # calls _restore_recovery_state() again for the specific task, which
+        # will repopulate the registry for that task alone. Clearing here
+        # prevents unbounded growth from tasks that are never resumed.
+        self._exhausted_task_ids = {}
+
+    # ------------------------------------------------------------------
+    # M2.12 P1 — request-scoped state
+    #
+    # Request state lives on RequestContext. The names below are thin,
+    # backwards-compatible accessors onto the *active* context, kept because
+    # the UI and existing tests read and write them directly. They are
+    # accessors only: no request state is stored on the Agent instance.
+    # ------------------------------------------------------------------
+
+    @property
+    def request_context(self) -> RequestContext:
+        """The active (most recent) request context.
+
+        Retained after ``respond()`` returns so post-request inspection keeps
+        working exactly as before. Not an execution input for a future
+        scheduler, which will pass each context explicitly.
+        """
+        context = getattr(self, "_request_context", None)
+        if context is None:
+            context = RequestContext()
+            self._request_context = context
+        return context
+
+    @property
+    def max_concurrent_requests(self) -> int:
+        """Configured request admission limit. P1 default is 1 (single-flight)."""
+        return int(getattr(self, "_max_concurrent_requests", DEFAULT_MAX_CONCURRENT_REQUESTS))
+
+    @property
+    def request_gate(self) -> BoundedRequestGate:
+        return self._request_gate
+
+    # -- legacy aliases onto the active RequestContext -----------------
+
+    @property
+    def _tasks(self):
+        return self.request_context.tasks
+
+    @_tasks.setter
+    def _tasks(self, value) -> None:
+        self.request_context.tasks = value
+
+    @property
+    def _active_cancellation_token(self):
+        return self.request_context.cancellation_token
+
+    @_active_cancellation_token.setter
+    def _active_cancellation_token(self, value) -> None:
+        self.request_context.cancellation_token = value
+
+    @property
+    def _router_verify_ok(self) -> bool:
+        return self.request_context.router_verify_ok
+
+    @_router_verify_ok.setter
+    def _router_verify_ok(self, value: bool) -> None:
+        self.request_context.router_verify_ok = bool(value)
+
+    @property
+    def _escalations_used(self) -> int:
+        return self.request_context.escalations_used
+
+    @_escalations_used.setter
+    def _escalations_used(self, value: int) -> None:
+        self.request_context.escalations_used = int(value)
+
+    @property
+    def _offline_fallback_used(self) -> bool:
+        return self.request_context.offline_fallback_used
+
+    @_offline_fallback_used.setter
+    def _offline_fallback_used(self, value: bool) -> None:
+        self.request_context.offline_fallback_used = bool(value)
+
+    @property
+    def _pending_goal(self) -> str:
+        return self.request_context.pending_goal
+
+    @_pending_goal.setter
+    def _pending_goal(self, value: str) -> None:
+        self.request_context.pending_goal = "" if value is None else str(value)
+
+    @property
+    def _recovered_task_ids(self) -> list[str]:
+        return self.request_context.recovered_task_ids
+
+    @_recovered_task_ids.setter
+    def _recovered_task_ids(self, value) -> None:
+        self.request_context.recovered_task_ids = list(value or [])
+
+    @property
+    def _terminal_event_emitted(self) -> bool:
+        return self.request_context.terminal_event_emitted
+
+    @_terminal_event_emitted.setter
+    def _terminal_event_emitted(self, value: bool) -> None:
+        self.request_context.terminal_event_emitted = bool(value)
+
+    @property
+    def _last_model(self):
+        return self.request_context.last_model
+
+    @_last_model.setter
+    def _last_model(self, value) -> None:
+        self.request_context.last_model = value
+
+    def _build_router(self):
+        from ai.model_router import ModelRouter
+        catalog = list(self._model_catalog) if self._model_catalog is not None else []
+        if self._model_catalog is None and hasattr(self._provider, "list_models"):
+            try:
+                catalog = self._provider.list_models()
+            except Exception as exc:
+                log.warning("could not list models for router: %s", exc)
+        router = ModelRouter(self._settings, catalog=catalog)
+        router.apply_management_overrides(self._preferences)
+        # Set router on PlannerAgent
+        if hasattr(self, "_planner_agent") and self._planner_agent is not None:
+            self._planner_agent._router = router
+        return router
+
+    @property
+    def router(self):
+        return self._router
+
+    def cancel_current_task(self) -> bool:
+        """Cancel the currently running task, if any.
+
+        This cancels the active cancellation token by calling its cancel method
+        or setting its cancelled flag, which will propagate to all downstream
+        operations that check the cancellation token.
+
+        Returns:
+            True if a cancellation was requested, False if there was no
+            active token to cancel.
+        """
+        token = getattr(self, "_active_cancellation_token", None)
+        if token is None:
+            return False
+        # Try common cancellation methods in order of preference
+        for method_name in ("cancel", "request", "set_cancelled"):
+            method = getattr(token, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    return True
+                except Exception:
+                    continue
+        # Fallback: set cancelled attribute if the token supports it
+        try:
+            token.cancelled = True
+            return True
+        except Exception:
+            return False
+
+    def model_status(self) -> str:
+        choices = self._router.state() if self._router else {}
+        verified = "verified" if choices.get("fast_identity_verified") else "identity unverified"
+        line = f"MODE: {choices.get('mode', '?')}  FAST: {choices.get('fast', '?')} ({verified})  STRONG: {choices.get('strong', '?')}"
+        if self._last_model is not None:
+            line += f"\nCurrent: {self._last_model.to_state_line()}"
+        return line
+
+    _CODING_PREFIXES = ("project.", "code.", "git.", "gh.", "memory.", "rules.", "filesystem.write_file", "filesystem.delete_file")
+
+    @property
+    def conversation(self):
+        return self._conversation
+
+    @property
+    def preferences(self):
+        return self._preferences
+
+    @property
+    def project_memory(self):
+        return self._project_memory
+
+    #: The stores a user-facing "forget everything" must clear, in the order
+    #: they are reported back. Each is a live instance, never a path: see
+    #: :meth:`wipe_user_data`.
+    _WIPE_TARGETS = (
+        ("conversation", "_conversation"),
+        ("memory", "_memory_store"),
+        ("rules", "_rules_store"),
+        ("preferences", "_preferences"),
+    )
+
+    def wipe_user_data(self) -> dict[str, int]:
+        """Delete everything the user stored, and report what was removed.
+
+        M2.15.2. This is the authoritative implementation of the ``:wipe`` command.
+
+        Two properties matter more than the list of stores.
+
+        **The live instances are cleared, not fresh ones built from the same
+        paths.** ``MemoryStore`` and ``RuleStore`` hold their document in memory
+        and rewrite the whole file on the next save. Wiping by constructing a
+        second ``MemoryStore(memory.json)``, deleting through it, and leaving the
+        Agent's own instance untouched would empty the file for a moment and then
+        have the Agent flush its stale copy straight back over it. The only safe
+        target is the object the Agent is actually using.
+
+        **In-memory state is cleared too.** ``self._messages`` is the live
+        conversation the prompt is built from. Emptying ``conversation.json``
+        while leaving ``_messages`` intact would keep showing the user their
+        "deleted" history on the next turn and re-append it to the file.
+
+        Rules are cleared through the same live store the permission ladder reads,
+        so a rule cannot survive the wipe by being re-read from a cache.
+
+        Settings, workspace files, the knowledge graph and Git history are not
+        user memory and are deliberately untouched.
+
+        Returns per-store counts so the caller can report honestly rather than
+        claiming a wipe it did not perform.
+        """
+        removed: dict[str, int] = {}
+
+        for label, attr in self._WIPE_TARGETS:
+            store = getattr(self, attr, None)
+            if store is None:
+                removed[label] = 0
+                continue
+            try:
+                removed[label] = self._count_store(store)
+            except Exception as exc:  # noqa: BLE001 - one store must not block the rest
+                log.warning("wipe: could not count %s: %s", label, exc)
+                removed[label] = 0
+            try:
+                store.clear()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("wipe: could not clear %s: %s", label, exc)
+                removed[label] = 0
+
+        # The live prompt state. Without this the deleted conversation keeps
+        # appearing in the next turn and is written back to disk.
+        self._messages = []
+        return removed
+
+    @staticmethod
+    def _count_store(store: object) -> int:
+        """How many records a store holds, best effort.
+
+        Counts are for reporting only. A store that cannot report a count is
+        still cleared; refusing to wipe because the count was unreadable would
+        leave the user's data behind, which is the opposite of what was asked.
+        """
+        # `list` (memory, rules) and `all` (preferences) take no arguments.
+        for attribute in ("list", "all"):
+            reader = getattr(store, attribute, None)
+            if callable(reader):
+                value = reader()
+                if isinstance(value, (list, tuple, dict)):
+                    return len(value)
+        # `recent(n)` takes a turn count; the store is already capped at
+        # max_turns * 2 entries, so a generous n returns everything it holds.
+        reader = getattr(store, "recent", None)
+        if callable(reader):
+            value = reader(10_000)
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        return 0
+
+    def task_history_context(self, limit: int = 5) -> str:
+        if self._project is None or self._project_memory is None:
+            return ""
+        render = getattr(self._project_memory, "render_task_history_context", None)
+        if not callable(render):
+            return ""
+        try:
+            return render(self._project.name, max_chars=900, limit=limit)
+        except Exception as exc:
+            log.warning("project task history render failed: %s", exc)
+            return ""
+
+    @property
+    def change_tracker(self):
+        return self._change_tracker
+
+    @property
+    def current_project(self) -> ProjectContext | None:
+        return self._project
+
+    def set_confirmer(self, confirmer=None) -> None:
+        self._confirmer = confirmer
+        self._executor_agent._async_executor.set_confirmer(confirmer)
+        self._executor_agent.set_confirmer(confirmer)
+
+    def _event_payload(self) -> dict:
+        return {
+            "run_id": getattr(self._tasks, "run_id", ""),
+            "task_id": getattr(self._tasks, "task_id", "") or getattr(self._tasks, "run_id", ""),
+        }
+
+    def _emit_lifecycle(self, event_kind: str, **values) -> None:
+        bus = getattr(self, "_events", None)
+        if bus is not None:
+            bus.emit(event_kind, {**self._event_payload(), **values})
+
+    def _transition(self, state: TaskState) -> None:
+        if not hasattr(self._tasks, "transition"):
+            return
+        # Fail fast on invalid transitions - the state machine validates them
+        # and raising here makes bugs visible rather than silently ignoring them.
+        self._tasks.transition(state)
+
+    def _executor_state_listener(self, state: str) -> None:
+        if state == "awaiting_permission":
+            self._transition(TaskState.AWAITING_PERMISSION)
+
+    def _begin_verification(self) -> None:
+        self._transition(TaskState.VERIFYING)
+        self._emit_lifecycle("verification_started", state="verifying")
+
+    def _record_verification(self, result: VerificationResult, **axes) -> VerificationEntry:
+        """Adjudicate a verification result and apply it to the task.
+
+        The ledger (``TaskManager.record_verification``) is the authoritative
+        boundary: it decides whether a requested PASSED is legitimate and
+        returns the adjudicated entry. The scalar task fields are set from that
+        entry, never from the writer's request, so a writer can no longer
+        assert PASSED without valid, non-empty, trusted evidence.
+        """
+        entry = self._tasks.record_verification(result, **axes)
+        if entry.state == VerificationState.FAILED:
+            self._emit_lifecycle("verification_failed", verification=entry.state.value, detail=entry.detail)
+            self._transition(TaskState.FAILED)
+        else:
+            self._emit_lifecycle(
+                "verification_completed",
+                verification=entry.state.value,
+                detail=entry.detail,
+                kind=entry.legacy_kind,
+                subject_kind=entry.subject_kind.value,
+                method_kind=entry.method_kind.value,
+                trust=entry.trust.value,
+            )
+        if entry.downgraded:
+            # A writer asked for PASSED and the ledger refused. Surfaced
+            # explicitly so a silent downgrade can never hide in the logs.
+            log.info(
+                "verification downgraded: kind=%s requested=passed reason=%s",
+                entry.legacy_kind or "<none>",
+                entry.reason,
+            )
+            self._emit_lifecycle(
+                "verification_downgraded",
+                kind=entry.legacy_kind,
+                requested=VerificationState.PASSED.value,
+                adjudicated=entry.state.value,
+                reason=entry.reason,
+            )
+        return entry
+
+    def _lifecycle_metadata(self) -> dict:
+        tasks = self._tasks
+        state = getattr(tasks, "state", TaskState.CREATED)
+        verification = getattr(tasks, "verification", VerificationState.NOT_RUN)
+        return {
+            "state": state.value if hasattr(state, "value") else str(state),
+            "verification": verification.value if hasattr(verification, "value") else str(verification),
+            "verification_detail": getattr(tasks, "verification_detail", ""),
+            "verification_evidence": dict(getattr(tasks, "verification_evidence", {}) or {}),
+            "verification_history": list(getattr(tasks, "verification_history", []) or [])[-20:],
+            # Bounded ledger projection (M2.12 P3). Rides in the existing
+            # lifecycle metadata rather than a second persistence system.
+            # Read defensively for the same reason as every other field here:
+            # tests substitute partial task doubles for this object.
+            "verification_ledger": _ledger_snapshot(tasks),
+            "recovery_attempts": int(getattr(tasks, "recovery_attempts", 0) or 0),
+            # M2.15.2: durable recovery exhaustion. Persisted here, in the
+            # existing lifecycle projection, rather than in a new store.
+            "recovery_exhausted": bool(getattr(tasks, "recovery_exhausted", False)),
+            "recovery_termination": str(getattr(tasks, "recovery_termination", "") or ""),
+            "escalations_used": int(getattr(self, "_escalations_used", 0) or 0),
+            "partial": bool(getattr(tasks, "partial", False)),
+            "failure_reason": getattr(tasks, "failure_reason", ""),
+            "run_id": getattr(tasks, "run_id", ""),
+        }
+
+    def _sync_task_metadata(self, task_id: str = "") -> None:
+        store = getattr(self, "_task_store", None)
+        tracker = getattr(self, "_change_tracker", None)
+        target = task_id or getattr(self._tasks, "task_id", "")
+        if store is None or not target:
+            return
+        record = store.get(target)
+        if record is None:
+            return
+        record.metadata = dict(record.metadata or {})
+        record.metadata["lifecycle"] = self._lifecycle_metadata()
+        if tracker is not None and tracker.active is not None and tracker.active.id == target:
+            record.change_steps = [
+                TaskChangeStep(
+                    tool=step.tool,
+                    args=step.args,
+                    allowed=step.allowed,
+                    executed=step.executed,
+                    success=step.success,
+                    reason=step.reason,
+                    ts=step.ts,
+                    status=getattr(step, "status", ""),
+                    duration_ms=getattr(step, "duration_ms", 0),
+                    exit_code=getattr(step, "exit_code", None),
+                    checkpoint_id=getattr(step, "checkpoint_id", ""),
+                )
+                for step in tracker.active.steps
+            ]
+        try:
+            store.update(target, metadata=record.metadata, change_steps=record.change_steps)
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not persist task lifecycle for %s: %s", target, exc)
+
+    def _create_run_record(self) -> None:
+        project = self._project
+        project_name = project.name if project and project.name != "(none)" else "unknown"
+        project_root = project.path if project and project.path else ""
+        record = TaskRecord(
+            task_id=self._tasks.task_id,
+            project_name=project_name,
+            project_root=project_root,
+            title=self._tasks.task_title,
+            goal=self._pending_goal.strip() or self._tasks.task_title,
+            created_at=time.strftime("%Y%m%d-%H%M%S"),
+            status="pending",
+            metadata={"lifecycle": self._lifecycle_metadata()},
+        )
+        try:
+            self._task_store.create(record)
+        except ValueError as exc:
+            if "already exists" not in str(exc):
+                log.warning("could not create task record: %s", exc)
+
+    def _restore_recovery_state(self, record) -> bool:
+        """Restore durable recovery budgets and exhaustion onto the live task.
+
+        M2.15.2.
+
+        ``TaskManager.begin_task`` resets ``recovery_attempts`` to zero for a new
+        task. That is correct for genuinely new work and wrong for a task that
+        survived a restart with its recovery budget already spent: the counters
+        were written to ``TaskRecord.metadata["lifecycle"]`` but nothing ever read
+        them back, so a restarted process started the same failing task from a
+        full budget. A task that had exhausted every retry and every escalation
+        would retry again, forever, one process lifetime at a time.
+
+        Restoration is one-way and only ever *raises* the counters, never lowers
+        them. A task that recorded more attempts in this lifetime than the record
+        holds must not have its budget restored upwards; the greater count is the
+        one that was actually spent.
+
+        Exhaustion is terminal and monotonic once restored, so this cannot re-open
+        a recovery path that a previous process closed.
+        """
+        task_id = str(getattr(record, "task_id", "") or "")
+        if not task_id:
+            return False
+        tasks = self._tasks
+        if getattr(tasks, "task_id", "") != task_id:
+            # A different task is live. Recording the restored task id lets a
+            # later bind apply it rather than losing it entirely.
+            # Defensive: several tests construct an Agent via __new__ and call the
+            # reconciliation directly, so the registry may not exist yet.
+            registry = getattr(self, "_exhausted_task_ids", None)
+            if registry is None:
+                registry = self._exhausted_task_ids = {}
+            registry[task_id] = {
+                "recovery_attempts": 0,
+                "recovery_exhausted": False,
+                "recovery_termination": "",
+            }
+        lifecycle = (getattr(record, "metadata", None) or {}).get("lifecycle") or {}
+        if not isinstance(lifecycle, dict):
+            return False
+
+        persisted_attempts = int(lifecycle.get("recovery_attempts") or 0)
+        persisted_escalations = int(lifecycle.get("escalations_used") or 0)
+        persisted_exhausted = bool(lifecycle.get("recovery_exhausted"))
+
+        if getattr(tasks, "task_id", "") == task_id:
+            if persisted_attempts > int(getattr(tasks, "recovery_attempts", 0) or 0):
+                tasks.recovery_attempts = persisted_attempts
+            if persisted_escalations > int(getattr(self, "_escalations_used", 0) or 0):
+                self._escalations_used = persisted_escalations
+            if persisted_exhausted:
+                tasks.mark_recovery_exhausted(
+                    str(lifecycle.get("recovery_termination") or
+                        "recovery was already exhausted before restart"))
+
+        registry = getattr(self, "_exhausted_task_ids", None)
+        if registry is None:
+            registry = self._exhausted_task_ids = {}
+        registry[task_id] = {
+            "recovery_attempts": persisted_attempts,
+            "recovery_exhausted": persisted_exhausted,
+            "recovery_termination": str(lifecycle.get("recovery_termination") or ""),
+        }
+        if persisted_exhausted or persisted_attempts:
+            log.info(
+                "restored recovery state for task %s: attempts=%d exhausted=%s",
+                task_id, persisted_attempts, persisted_exhausted,
+            )
+        return bool(persisted_exhausted or persisted_attempts)
+
+    def _apply_restored_recovery_state(self) -> None:
+        """Apply restored recovery state to the task this turn just began.
+
+        ``TaskManager.begin_task`` zeroes ``recovery_attempts`` because new work
+        should start with a full budget. For a task that existed before the
+        restart and had already exhausted recovery, that is exactly wrong.
+
+        Only the state for the task that is actually beginning is applied, and
+        only upward: a task that was not recorded as exhausted keeps a full
+        budget, and a task that has spent more in this lifetime than was recorded
+        is never restored downwards.
+        """
+        if not self._exhausted_task_ids:
+            return
+        task_id = str(getattr(self._tasks, "task_id", "") or "")
+        restored = self._exhausted_task_ids.get(task_id)
+        if not restored:
+            return
+        self._exhausted_task_ids.pop(task_id, None)
+
+        attempts = int(restored.get("recovery_attempts") or 0)
+        if attempts > int(getattr(self._tasks, "recovery_attempts", 0) or 0):
+            self._tasks.recovery_attempts = attempts
+            log.info("task %s resumes with %d recovery attempts already spent",
+                     task_id, attempts)
+        if restored.get("recovery_exhausted"):
+            self._tasks.mark_recovery_exhausted(
+                str(restored.get("recovery_termination") or
+                    "recovery was exhausted before restart"))
+            self._emit_lifecycle(
+                "recovery_exhausted_restored",
+                task_id=task_id,
+                reason=self._tasks.recovery_termination,
+            )
+            log.warning(
+                "task %s resumes already exhausted; recovery will not be retried",
+                task_id)
+
+    def _classify_interrupted_steps(self, record) -> list[str]:
+        """Flag steps left RUNNING by a process death.
+
+        A step persisted as RUNNING may or may not have applied its side effect.
+        The status is deliberately left alone and the step is marked
+        ``interrupted`` instead, so nothing replays it implicitly and a future
+        Agent.resume can require an explicit decision. Read-only steps are
+        reported separately because replaying them is free.
+        """
+        plan = getattr(record, "plan", None)
+        if plan is None:
+            return []
+        flagged: list[str] = []
+        for step in plan.steps:
+            if step.status is StepStatus.RUNNING and not step.interrupted:
+                step.mark_interrupted()
+                flagged.append(step.step_id)
+        return flagged
+
+    def _restore_conversation(self) -> int:
+        """Rehydrate the live message history from the persisted conversation.
+
+        M2.15.2.
+
+        ``ConversationStore`` persisted and reloaded conversation correctly, and
+        the ``:memory`` command displayed it correctly - but nothing ever moved it
+        into ``self._messages``, which is the list the prompt is built from. So
+        the data survived the restart and the model still could not see any of
+        it. That is the narrower form of conversation amnesia this fixes; the
+        store itself was never the problem.
+
+        Restored entries go into the *existing* message architecture as ordinary
+        role-tagged turns. They are not concatenated into the system prompt,
+        because a restored user turn is user input and belongs in the user role:
+        promoting it to a system instruction would let prior conversation forge
+        directives, which is exactly the boundary the memory trust rules exist to
+        hold.
+
+        Filtering, in order:
+
+        * only ``user`` and ``assistant`` roles - anything else in the file is not
+          a conversation turn and must not become one;
+        * non-empty string content, so a corrupt or half-written entry cannot
+          inject an empty turn;
+        * the same ``max_conversation_turns`` cap the prompt already applies, so
+          restoration cannot exceed the context limit that governs a live session.
+
+        Memory and rules are *not* involved. They have their own sanitised
+        reference sections and their own trust rules; folding them in here would
+        duplicate them into the turn history and route them around sanitisation.
+        """
+        store = getattr(self, "_conversation", None)
+        if store is None:
+            return 0
+        if self._messages:
+            # Already live in this process: the authoritative history is the one
+            # already in flight, and restoring would duplicate every turn.
+            return 0
+
+        reader = getattr(store, "recent", None)
+        if not callable(reader):
+            return 0
+        try:
+            max_turns = max(1, int(getattr(self._settings, "max_conversation_turns", 20)))
+            raw = reader(max_turns)
+        except Exception as exc:  # noqa: BLE001 - amnesia must not stop startup
+            log.warning("could not restore conversation: %s", exc)
+            return 0
+
+        restored: list[dict] = []
+        for entry in raw if isinstance(raw, (list, tuple)) else []:
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = entry.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            restored.append({"role": role, "content": content})
+            if len(restored) >= max_turns * 2:
+                break
+
+        if restored:
+            self._messages = restored
+            log.info("restored %d conversation turns after restart", len(restored))
+        self._restored_conversation_count = len(restored)
+        return len(restored)
+
+    def _reconcile_interrupted_tasks(self) -> None:
+        store = getattr(self, "_task_store", None)
+        tracker = getattr(self, "_change_tracker", None)
+        if store is None or tracker is None:
+            return
+        records = {record.task_id: record for record in store.list_all()}
+        for record in records.values():
+            # Only restore recovery state for tasks that are actually being
+            # resumed (pending/active with interrupted steps). Restoring for
+            # all tasks pollutes the _exhausted_task_ids registry and can
+            # incorrectly mark new tasks as exhausted.
+            if record.status not in ("pending", "active"):
+                continue
+            # M2.15.2: restore durable recovery exhaustion for tasks that are
+            # being resumed. Only tasks with interrupted steps or pending/active
+            # status should have their recovery state restored.
+            self._restore_recovery_state(record)
+            session = tracker.load_task(store.sessions_dir, record.task_id)
+            if session is not None and session.status == "active":
+                session.status = "failed"
+                session.final_result = "Recovered after interrupted process; not resumed automatically."
+                session.finished_at = time.strftime("%Y%m%d-%H%M%S")
+                tracker.save(session)
+            metadata = dict(record.metadata or {})
+            interrupted = self._classify_interrupted_steps(record)
+            metadata["lifecycle"] = {
+                **(metadata.get("lifecycle") or {}),
+                "state": "failed",
+                "verification": "failed",
+                "verification_detail": "Recovered after interrupted process.",
+                "recovered": True,
+                "recovery_action": "marked_failed",
+                "interrupted_steps": interrupted,
+            }
+            reconciled = False
+            try:
+                if interrupted:
+                    store.update(record.task_id, plan=record.plan)
+                store.update(record.task_id, metadata=metadata)
+                reconciled = store.finish(record.task_id, "Recovered after interrupted process; not resumed automatically.", "failed") is not None
+            except (OSError, TypeError, ValueError) as exc:
+                log.warning("could not reconcile interrupted task %s: %s", record.task_id, exc)
+            if reconciled:
+                self._recovered_task_ids.append(record.task_id)
+                for step_id in interrupted:
+                    self._emit_lifecycle(
+                        "plan_step_interrupted",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        replayable=False,
+                    )
+        for session in tracker.load_all(store.sessions_dir):
+            if session.status != "active":
+                continue
+            record = records.get(session.id)
+            if record is None:
+                session.status = "failed"
+                session.final_result = "Recovered orphan coding session; not resumed automatically."
+                session.finished_at = time.strftime("%Y%m%d-%H%M%S")
+                tracker.save(session)
+                self._recovered_task_ids.append(session.id)
+            elif record.status in TaskRecord.VALID_STATUSES and record.status not in ("pending", "active"):
+                session.status = record.status
+                session.final_result = record.outcome or session.final_result
+                session.finished_at = record.finished_at or time.strftime("%Y%m%d-%H%M%S")
+                tracker.save(session)
+
+    def session_summary(self) -> str:
+        return self._change_tracker.summary() if self._change_tracker else "No active coding session."
+
+    def rules_summary(self) -> str:
+        project = self._project.name if self._project else self._rules_engine.project
+        # M2.14.1: task-scoped rules must be filtered by the *current* task here
+        # too, not only at enforcement time. Rendering every task rule regardless
+        # of which task is running tells the model a rule applies that the
+        # permission ladder is in fact ignoring, so the two disagree in the
+        # prompt the model reasons over.
+        task_id = self._tasks.task_id
+        return self._rules_store.render_active(
+            project=project, task_id=task_id,
+            limit=self._settings.rules_max_active_in_prompt,
+        ) or "(no active rules)"
+
+    def rules_and_conflicts(self) -> str:
+        text = self.rules_summary()
+        conflicting = self._rules_store.detect_conflicts_for_all()
+        if conflicting:
+            text += f"\nConflict warnings:\n{conflicting}"
+        return text
+
+    def why_summary(self) -> str:
+        decision = getattr(self._permissions, "last_decision", None)
+        if decision is None:
+            return "No permission decision recorded yet."
+        tool, dec = decision
+        reason = dec.reason or "no specific reason"
+        engine_note = self._rules_engine.explain() if self._rules_engine else ""
+        return f"Last decision for '{tool}': allowed={dec.allow} confirm={dec.requires_confirmation}\nReason: {reason}\n{engine_note}"
+
+    def git_diff_summary(self) -> str:
+        root = Path(self._project.path) if self._project and self._project.path else None
+        if not root or not (root / ".git").is_dir():
+            return "No git repository detected for the active project."
+        from tools.git import git_diff, git_status
+        status = git_status(str(root))
+        diff = git_diff(str(root), include_staged=False, stat=False)
+        if diff.error:
+            return f"git diff failed: {diff.error}"
+        parts = []
+        if status.output:
+            parts.append(status.output)
+        parts.append(diff.output)
+        return "\n\n".join(parts)
+
+    def _is_coding_tool(self, tool: str) -> bool:
+        if tool in ("terminal.execute", "python.run_script"):
+            return True
+        return tool.startswith(self._CODING_PREFIXES)
+
+    def _canonical_root(self, value: str) -> str:
+        if not value:
+            return ""
+        candidate = Path(str(value))
+        try:
+            from tools.git import _git
+            code, out, _ = _git(str(candidate), ["rev-parse", "--show-toplevel"])
+            if code == 0 and out.strip():
+                return str(Path(out.strip()).resolve())
+        except Exception:
+            pass
+        try:
+            return str(candidate.resolve())
+        except OSError:
+            return str(candidate)
+
+    def _project_root_from_args(self, args: dict, tool: str = "") -> str:
+        workspace = args.get("workspace")
+        if workspace:
+            return self._canonical_root(str(workspace))
+        if tool == "code.patch_file":
+            return self._canonical_root(str(getattr(self._settings, "base_dir", Path.cwd())))
+        for key in ("path", "file", "script"):
+            value = args.get(key)
+            if not value:
+                continue
+            candidate = Path(str(value))
+            if candidate.is_dir():
+                return self._canonical_root(str(candidate))
+            if candidate.exists() or candidate.suffix:
+                return self._canonical_root(str(candidate.parent))
+            return self._canonical_root(str(candidate))
+        for key in ("root", "working_dir", "cwd"):
+            value = args.get(key)
+            if value:
+                return self._canonical_root(str(value))
+        if self._project and self._project.path:
+            return self._canonical_root(self._project.path)
+        scratch = getattr(self._settings, "scratch_dir", "")
+        return self._canonical_root(str(scratch)) if scratch else ""
+
+    @staticmethod
+    def _within_project(project_root: str, active_root: str) -> bool:
+        """Whether an operation target belongs to the active task project.
+
+        Containment, not string equality. The previous exact comparison meant a
+        write to ``<project>/tests/test_x.py`` derived the root
+        ``<project>/tests``, which compared unequal to ``<project>`` and was
+        refused - so no project could ever contain a subdirectory, even though
+        the boundary's actual intent is only to stop a session straying into a
+        *different* project. Descendants stay inside the boundary, so this is a
+        correction rather than a relaxation; anything genuinely outside is still
+        refused.
+        """
+        if project_root.casefold() == active_root.casefold():
+            return True
+        from config.permissions import path_is_within
+
+        return path_is_within(Path(project_root), [Path(active_root)])
+
+    def _before_execute(self, tool: str, args: dict) -> None:
+        if not self._is_coding_tool(tool) or self._change_tracker is None:
+            return
+        project_root = self._project_root_from_args(args, tool)
+        if self._change_tracker.active is not None:
+            active_root = self._canonical_root(self._change_tracker.active.project)
+            if project_root and active_root and not self._within_project(project_root, active_root):
+                raise ValueError("operation target is outside the active task project")
+            self._attach_checkpoint(self._maybe_create_checkpoint(tool, args))
+            return
+        goal = (self._pending_goal.strip() or "Development task across multiple tool calls").strip()
+        self._change_tracker.start(goal, project_root, session_id=getattr(self._tasks, "task_id", ""))
+        self._pending_goal = ""
+        if project_root:
+            self._capture_task_git_start(
+                task_id=self._change_tracker.active.id,
+                project_root=project_root,
+                title=self._tasks.task_title or goal,
+                goal=goal,
+            )
+        self._attach_checkpoint(self._maybe_create_checkpoint(tool, args))
+
+    def _attach_checkpoint(self, snapshot_id: str) -> None:
+        """Bind a pre-execution snapshot to the step about to run."""
+        if not snapshot_id:
+            return
+        step = getattr(self, "_running_plan_step", None)
+        if step is None or step.checkpoint_id:
+            return
+        step.checkpoint_id = snapshot_id
+        self._persist_plan()
+
+    def _note_step(self, tool: str, args: dict, outcome) -> None:
+        if not self._is_coding_tool(tool) or self._change_tracker is None:
+            return
+        if self._change_tracker.active is None:
+            if not outcome.executed:
+                return
+            project_hint = self._project_root_from_args(args, tool)
+            goal = (self._pending_goal.strip() or "Development task across multiple tool calls").strip()
+            self._change_tracker.start(goal, project_hint, session_id=getattr(self._tasks, "task_id", ""))
+            self._pending_goal = ""
+            if self._change_tracker.active:
+                self._capture_task_git_start(
+                    task_id=self._change_tracker.active.id,
+                    project_root=project_hint,
+                    title=self._tasks.task_title or goal,
+                    goal=goal,
+                )
+        running = getattr(self, "_running_plan_step", None)
+        self._change_tracker.step(
+            tool,
+            args,
+            bool(getattr(outcome, "allowed", False)),
+            bool(getattr(outcome, "executed", False)),
+            bool(getattr(outcome, "success", False)),
+            str(getattr(outcome, "reason", "") or ""),
+            str(getattr(outcome, "status", "") or ""),
+            int(getattr(outcome, "duration_ms", 0) or 0),
+            getattr(outcome, "exit_code", None),
+            str(getattr(running, "checkpoint_id", "") or ""),
+        )
+        self._sync_task_metadata(self._change_tracker.active.id)
+        self._project_knowledge_live()
+        if tool == "git.commit" and getattr(outcome, "success", False) and self._change_tracker.active:
+            self._capture_commit(
+                task_id=self._change_tracker.active.id,
+                project_root=self._project_root_from_args(args, tool),
+                commit_message=args.get("message", ""),
+            )
+
+    # ------------------------------------------------------------------
+    # M2.14 - knowledge graph projection
+    #
+    # The graph is a projection, never an authority. These two calls read an
+    # authoritative TaskRecord that TaskStore already persisted and write
+    # derived nodes. They run strictly after the authoritative write, add no
+    # state, and cannot fail the task: every projection error is swallowed
+    # inside the projector. Nothing here adjudicates verification, drives the
+    # task lifecycle, or grants a permission.
+    # ------------------------------------------------------------------
+
+    def _project_knowledge_live(self) -> None:
+        """Project the current task into the knowledge graph.
+
+        Best-effort by construction. A knowledge-graph problem must never be
+        able to fail, delay or alter a task, so every outcome is ignored here.
+        """
+        try:
+            from core.knowledge_projection import project_task
+
+            store = getattr(self, "_task_store", None)
+            task_id = getattr(self._tasks, "task_id", "")
+            if store is None or not task_id:
+                return
+            record = store.get(task_id)
+            if record is None:
+                return
+            project_task(record, self._settings)
+        except Exception as exc:  # pragma: no cover - projection is non-critical
+            log.debug("knowledge projection skipped: %s", exc)
+
+    def _knowledge_project_root(self, args: dict, tool: str = "") -> str:
+        """The project a data/chart observation belongs to.
+
+        ``_project_root_from_args`` is a *scoping hint*: given a file argument
+        it answers "which directory is this operation about", and for a file it
+        returns the file's parent. That is the right answer for change
+        tracking and for Git, and the wrong answer for identity.
+
+        Project identity is not a property of a file's parent directory. A
+        dataset at ``<project>/data/sales.csv`` describes ``<project>``, and
+        keying it on ``<project>/data`` mints a second project for one
+        directory tree: the dataset then cannot be found by querying the
+        project that actually contains it, and cross-project isolation quietly
+        stops meaning anything because the same tree is now two projects.
+
+        So when this agent is working inside a known project and the
+        observation points into it, that project is the identity. The
+        path-derived root is still used when there is no project context, or
+        when the observation genuinely points somewhere else, which keeps
+        behaviour unchanged for every caller that has no project.
+        """
+        derived = self._project_root_from_args(args, tool)
+        active = ""
+        if self._project is not None and getattr(self._project, "path", ""):
+            active = self._canonical_root(self._project.path)
+        if not active:
+            return derived
+        if not derived:
+            return active
+        # Only adopt the active project when the observation really is inside
+        # it. An observation of something outside stays attributed to where it
+        # actually happened, rather than being folded into the current project.
+        try:
+            if self._within_project(derived, active):
+                return active
+        except Exception:
+            return derived
+        return derived
+
+    def _project_knowledge_tool(
+        self, tool: str, args: dict, outcome: ExecutionOutcome
+    ) -> None:
+        """Project an observed data/chart result into the knowledge graph.
+
+        M2.14 Phase D seam. ``data.*`` and ``chart.*`` are not coding tools, so
+        ``_note_step`` never observes them; this is called from
+        ``_record_execution`` instead, where the authoritative tool name, the
+        authoritative invocation args and the request's task identity are all
+        available.
+
+        This only reads what the tool already returned. It never re-runs an
+        operation, never re-implements data or chart behaviour, and cannot
+        affect the outcome that was just recorded.
+        """
+        data = getattr(outcome, "data", None)
+        if not isinstance(data, dict) or not data:
+            return
+        if not getattr(outcome, "success", False):
+            # A failed or blocked operation produced no artifact to describe.
+            return
+        try:
+            from core.knowledge_projection import project_tool_result
+
+            project_root = self._knowledge_project_root(args, tool)
+            if not project_root:
+                return
+            # Project the task first so the TASK node exists as an anchor.
+            # data.*/chart.* are not coding tools, so _note_step never runs for
+            # them and would otherwise leave TASK -> PRODUCED -> CHART without
+            # its source. _project_knowledge_live is idempotent.
+            self._project_knowledge_live()
+            project_tool_result(
+                tool=tool,
+                args=args if isinstance(args, dict) else {},
+                result_data=data,
+                task_id=str(getattr(self._tasks, "task_id", "") or ""),
+                project_root=project_root,
+                settings=self._settings,
+            )
+        except Exception as exc:  # pragma: no cover - projection is non-critical
+            log.debug("knowledge tool projection skipped for %s: %s", tool, exc)
+
+    def _persist_tool_observation(self, tool: str, outcome: ExecutionOutcome) -> None:
+        spec = self._registry.get(tool) if isinstance(tool, str) else None
+        if spec is None or not spec.persist_data or not isinstance(getattr(outcome, "data", None), dict):
+            return
+        task_id = getattr(self._tasks, "task_id", "")
+        store = getattr(self, "_task_store", None)
+        if not task_id or store is None:
+            return
+        result = dict(outcome.data)
+        capability_result = result.get("capability_result")
+        if not isinstance(capability_result, dict):
+            return
+        observation = {
+            "tool": tool,
+            "status": str(getattr(outcome, "status", "") or ""),
+            "capability": capability_result.get("capability", ""),
+            "operation": capability_result.get("operation", ""),
+            "result": capability_result,
+        }
+        try:
+            encoded = json.dumps(observation, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return
+        if len(encoded) > 24000:
+            observation["result"] = {
+                "truncated": True,
+                "summary": encoded[:24000],
+            }
+        try:
+            record = store.get(task_id)
+            if record is None:
+                return
+            metadata = dict(record.metadata or {})
+            observations = list(metadata.get("tool_observations") or [])
+            observations.append(observation)
+            metadata["tool_observations"] = observations[-20:]
+            store.update(task_id, metadata=metadata)
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not persist tool observation for %s: %s", task_id, exc)
+
+    def _should_checkpoint(self, tool: str) -> bool:
+        checkpoint_tools = {
+            "git.commit", "git.push", "git.restore", "git.reset", "git.rebase",
+            "git.add", "git.pull", "git.branch.create", "git.branch.switch",
+            "filesystem.write_file", "filesystem.delete_file",
+            "terminal.execute", "python.run_script",
+            "code.patch_file",
+        }
+        return tool in checkpoint_tools
+
+    def _maybe_create_checkpoint(self, tool: str, args: dict) -> str:
+        """Create a pre-execution checkpoint. Returns its snapshot id, or "".
+
+        M2.12 P2: the id is returned so the caller can attach it to the
+        executing plan step, which is what makes a step's checkpoint an exact
+        "workspace state immediately before this step ran" undo boundary.
+        """
+        if not self._should_checkpoint(tool):
+            return ""
+        if self._snapshot_manager is None:
+            return ""
+        if self._change_tracker is None or self._change_tracker.active is None:
+            return ""
+
+        task_id = self._change_tracker.active.id
+        if not task_id:
+            return ""
+
+        project_root = self._project_root_from_args(args, tool)
+
+        if not project_root:
+            return ""
+
+        from pathlib import Path
+        if not Path(project_root).is_dir():
+            return ""
+
+        if not (Path(project_root) / ".git").exists():
+            return ""
+
+        label = f"pre-{tool.replace('.', '-')}"
+        try:
+            snapshot = self._snapshot_manager.create_snapshot(
+                task_id=task_id,
+                label=label,
+                project_root=project_root,
+                creation_reason=f"auto-checkpoint-before-{tool}",
+            )
+            self._task_store.link_snapshot(task_id, snapshot.snapshot_id)
+            return str(getattr(snapshot, "snapshot_id", "") or "")
+        except Exception as exc:
+            record = self._task_store.get(task_id)
+            if record is not None:
+                metadata = dict(record.metadata or {})
+                metadata["checkpoint_error"] = f"{tool}: {exc}"
+                self._task_store.update(task_id, metadata=metadata)
+            log.warning("auto-checkpoint failed for %s: %s", tool, exc)
+            return ""
+
+    def _capture_task_git_start(self, task_id: str, project_root: str, title: str, goal: str) -> None:
+        """Capture starting Git state for a task and create TaskRecord."""
+        if self._task_store is None:
+            return
+        if not task_id or not project_root:
+            return
+
+        git_state = GitTaskState(project_root=project_root)
+
+        # Try to capture starting Git state if it's a Git repo
+        try:
+            from pathlib import Path
+            from tools.git import _git
+            root_path = Path(project_root)
+            if (root_path / ".git").exists():
+                code, out, err = _git(project_root, ["rev-parse", "HEAD"])
+                if code == 0 and out:
+                    git_state.starting_commit = out.strip()
+                code, out, err = _git(project_root, ["branch", "--show-current"])
+                if code == 0 and out:
+                    git_state.starting_branch = out.strip()
+                else:
+                    git_state.starting_branch = "(detached)"
+        except Exception as exc:
+            log.warning("failed to capture starting git state for task %s: %s", task_id, exc)
+
+        # Determine project name
+        project_name = self._project.name if self._project and self._project.name != "(none)" else Path(project_root).name or "unknown"
+        existing = self._task_store.get(task_id)
+        if existing is not None:
+            title = existing.title or title
+            goal = existing.goal or goal
+
+        record = TaskRecord(
+            task_id=task_id,
+            project_name=project_name,
+            project_root=project_root,
+            title=title,
+            goal=goal,
+            created_at=time.strftime("%Y%m%d-%H%M%S"),
+            started_at=time.strftime("%Y%m%d-%H%M%S"),
+            status="active",
+            git=git_state,
+            metadata={"lifecycle": self._lifecycle_metadata()},
+        )
+        try:
+            self._task_store.create(record)
+        except ValueError as exc:
+            if "already exists" in str(exc):
+                self._task_store.update(
+                    task_id,
+                    project_name=project_name,
+                    project_root=project_root,
+                    title=title,
+                    goal=goal,
+                    status="active",
+                    started_at=time.strftime("%Y%m%d-%H%M%S"),
+                    git=git_state,
+                    metadata={"lifecycle": self._lifecycle_metadata()},
+                )
+            else:
+                log.warning("failed to create task record for %s: %s", task_id, exc)
+
+    def _capture_task_git_end(self, task_id: str, outcome: str, status: str) -> bool:
+        """Capture ending Git state for a task and finish the TaskRecord."""
+        if self._task_store is None:
+            return False
+        if not task_id:
+            return False
+
+        record = self._task_store.get(task_id)
+        if record is None and self._change_tracker and self._change_tracker.active:
+            session = self._change_tracker.active
+            project_root = self._project.path if self._project and self._project.path else ""
+            if not project_root:
+                candidate = Path(session.project)
+                project_root = str(candidate) if candidate.is_dir() else ""
+            project_name = self._project.name if self._project and self._project.name != "(none)" else Path(project_root).name or "unknown"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                self._task_store.create(TaskRecord(
+                    task_id=task_id,
+                    project_name=project_name,
+                    project_root=project_root,
+                    title=self._tasks.task_title if self._tasks else task_id,
+                    goal=session.goal,
+                    created_at=session.started_at or stamp,
+                    started_at=session.started_at or stamp,
+                    status="active",
+                    git=GitTaskState(project_root=project_root),
+                    metadata={"lifecycle": self._lifecycle_metadata()},
+                ))
+            except (OSError, TypeError, ValueError) as exc:
+                log.warning("failed to create late task record for %s: %s", task_id, exc)
+            record = self._task_store.get(task_id)
+        if record is None:
+            return False
+
+        if self._change_tracker and self._change_tracker.active:
+            session = self._change_tracker.active
+            record.change_steps = [
+                TaskChangeStep(
+                    tool=step.tool,
+                    args=step.args,
+                    allowed=step.allowed,
+                    executed=step.executed,
+                    success=step.success,
+                    reason=step.reason,
+                    ts=step.ts,
+                    status=getattr(step, "status", ""),
+                    duration_ms=getattr(step, "duration_ms", 0),
+                    exit_code=getattr(step, "exit_code", None),
+                    checkpoint_id=getattr(step, "checkpoint_id", ""),
+                )
+                for step in session.steps
+            ]
+
+        project_root = record.project_root
+        if not project_root:
+            try:
+                self._task_store.update(
+                    task_id,
+                    change_steps=record.change_steps,
+                    metadata={**(record.metadata or {}), "lifecycle": self._lifecycle_metadata()},
+                )
+                return self._task_store.finish(task_id, outcome, status) is not None
+            except Exception as exc:
+                log.warning("could not finish task record for %s: %s", task_id, exc)
+                return False
+
+        git_state = record.git
+
+        # Capture ending Git state
+        try:
+            from tools.git import _git, git_diff, git_status
+            root_path = Path(project_root)
+            if (root_path / ".git").exists():
+                # Ending commit
+                code, out, err = _git(project_root, ["rev-parse", "HEAD"])
+                if code == 0 and out:
+                    git_state.ending_commit = out.strip()
+
+                # Ending branch
+                code, out, err = _git(project_root, ["branch", "--show-current"])
+                if code == 0 and out:
+                    git_state.ending_branch = out.strip()
+                else:
+                    git_state.ending_branch = "(detached)"
+
+                # Final status
+                status_result = git_status(project_root)
+                if status_result.success:
+                    git_state.final_status = status_result.output or ""
+
+                # Net diff stat
+                diff_result = git_diff(project_root, include_staged=False, stat=True)
+                if diff_result.success:
+                    git_state.net_diff_stat = diff_result.output or ""
+
+                # Changed files from porcelain status
+                if git_state.final_status:
+                    import re
+                    for line in git_state.final_status.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("##"):
+                            # Porcelain format: XY path
+                            parts = line.split(maxsplit=1)
+                            if len(parts) == 2 and parts[1] not in git_state.files_changed:
+                                git_state.files_changed.append(parts[1])
+        except Exception as exc:
+            log.warning("failed to capture ending git state for task %s: %s", task_id, exc)
+
+        # Update record with final state
+        try:
+            self._task_store.update(
+                task_id,
+                git=git_state,
+                change_steps=record.change_steps,
+                metadata={**(record.metadata or {}), "lifecycle": self._lifecycle_metadata()},
+            )
+            return self._task_store.finish(task_id, outcome, status) is not None
+        except Exception as exc:
+            log.warning("failed to finish task record for %s: %s", task_id, exc)
+            return False
+
+    def _capture_commit(self, task_id: str, project_root: Optional[str], commit_message: str) -> None:
+        """Capture a commit made during the task and add it to the TaskRecord."""
+        if self._task_store is None:
+            return
+        if not task_id or not project_root:
+            return
+
+        try:
+            from pathlib import Path
+            from tools.git import _git
+
+            root_path = Path(project_root)
+            if not (root_path / ".git").exists():
+                return
+
+            # Get the latest commit hash
+            code, out, err = _git(project_root, ["rev-parse", "HEAD"])
+            if code != 0 or not out:
+                return
+            commit_hash = out.strip()
+
+            # Avoid duplicate recording if commit already recorded
+            record = self._task_store.get(task_id)
+            if record is None:
+                return
+
+            # Check if this commit is already recorded (by hash)
+            existing_hashes = {c.hash for c in record.git.commits_made}
+            if commit_hash in existing_hashes:
+                return
+
+            # Create commit info
+            commit_info = CommitInfo(
+                hash=commit_hash,
+                message=commit_message.strip(),
+                timestamp=time.strftime("%Y%m%d-%H%M%S"),
+            )
+
+            # Append to commits_made
+            record.git.commits_made.append(commit_info)
+
+            # Also update ending_commit to track the latest
+            record.git.ending_commit = commit_hash
+
+            self._task_store.update(task_id, git=record.git)
+            log.info("captured commit %s for task %s", commit_hash[:8], task_id)
+
+        except Exception as exc:
+            log.warning("failed to capture commit for task %s: %s", task_id, exc)
+
+    def _select_model(self, user_input: str):
+        from ai.model_router import estimate_complexity
+        if self._model_name and (
+            getattr(self._provider, "name", "") == "offline"
+            or not self._router.catalog_ok
+            or self._router.is_available(self._model_name)
+        ):
+            self._last_model = type("MC", (), {
+                "name": self._model_name,
+                "mode": "fixed",
+                "to_state_line": lambda self_: f"MODEL: {self._model_name} MODE: fixed SOURCE: explicit",
+                "escalated": False,
+            })()
+            return self._last_model
+        if self._model_name:
+            log.warning("explicit model %s is unavailable or not tool-capable; using adaptive fallback", self._model_name)
+        if not hasattr(self, "_router"):
+            model_name = getattr(getattr(self, "_settings", None), "ai_model", "") or "offline/rule-based"
+            self._last_model = type("MC", (), {
+                "name": model_name,
+                "mode": "fixed",
+                "to_state_line": lambda self_: f"MODEL: {model_name} MODE: fixed SOURCE: fallback",
+                "escalated": False,
+            })()
+            return self._last_model
+        project_pref = ""
+        if self._project and self._project_memory:
+            try:
+                project_pref = self._project_memory.get_preferred_model(self._project.name)
+            except Exception:  # pragma: no cover - defensive
+                project_pref = ""
+        choice = self._router.choose(
+            project_pref=project_pref,
+            complexity=estimate_complexity(user_input),
+            last_verify_failed=not self._router_verify_ok,
+            escalations_used=self._escalations_used,
+        )
+        self._last_model = choice
+        if choice.escalated:
+            self._escalations_used += 1
+        log.info("router: %s", choice.to_state_line())
+        return choice
+
+    def _capture_plan_goal(self, user_input: str) -> None:
+        match = re.search(r"%plan\s*([^\n]*)", user_input)
+        if match:
+            self._pending_goal = match.group(1).strip()
+
+    def _reference_sections(self) -> str:
+        extra = []
+        try:
+            # Same task filtering as rules_summary(): the prompt and the
+            # permission ladder must agree about which rules are in force.
+            rules_text = self._rules_store.render_active(
+                project=self._project.name if self._project else "",
+                task_id=self._tasks.task_id,
+                limit=self._settings.rules_max_active_in_prompt)
+            if rules_text:
+                extra.append(rules_text)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("rules render failed: %s", exc)
+        try:
+            mem_text = self._memory_store.render_active(limit_chars=2500)
+            if mem_text:
+                extra.append(mem_text)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("memory render failed: %s", exc)
+        try:
+            if self._project and self._project_memory:
+                sections = self._project_memory.render_context(self._project.name, max_chars=1200)
+                if sections:
+                    extra.append("#PROJECT PROFILE (state Diablo has inferred or been told)\n" + sections)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("project memory render failed: %s", exc)
+        try:
+            task_history = self.task_history_context()
+            if task_history:
+                extra.append("#PROJECT TASK HISTORY (read-only TaskStore summaries)\n" + task_history)
+        except Exception as exc:
+            log.warning("task history context failed: %s", exc)
+        return "\n\n".join(extra)
+
+    # ------------------------------------------------------------------
+    # M2.12 P2 - durable execution plan
+    #
+    # ExecutionPlan (frozen) is validated intent. ExecutionPlanRecord is the
+    # durable, mutable record persisted on TaskRecord.plan. The plan holds no
+    # task identity: TaskManager.run_id / task_id stay authoritative.
+    # ------------------------------------------------------------------
+
+    @property
+    def active_plan(self) -> ExecutionPlanRecord | None:
+        return getattr(self, "_active_plan", None)
+
+    def _persist_plan(self) -> None:
+        """Mirror the in-flight plan onto its TaskRecord.
+
+        Called on every step transition, so a process death always leaves a
+        record on disk describing the last known step state.
+        """
+        store = getattr(self, "_task_store", None)
+        plan = getattr(self, "_active_plan", None)
+        task_id = getattr(self._tasks, "task_id", "")
+        if store is None or plan is None or not task_id:
+            return
+        try:
+            store.update(task_id, plan=plan)
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not persist execution plan for %s: %s", task_id, exc)
+
+    def _begin_plan(self, plan: ExecutionPlan) -> ExecutionPlanRecord | None:
+        """Create and persist the durable record for a validated plan.
+
+        Any plan already in flight is retired into ``superseded`` first, so
+        re-planning on a later reasoning turn does not erase the record of
+        steps that already ran.
+        """
+        previous = getattr(self, "_active_plan", None)
+        record = ExecutionPlanRecord.from_plan(plan)
+        record.absorb(previous)
+        cycles = record.check_cycles()
+        if cycles:
+            log.warning("plan dependency cycle detected among %s", ", ".join(cycles))
+            self._emit_lifecycle(
+                "plan_invalid",
+                reason="dependency_cycle",
+                step_ids=cycles,
+            )
+            return None
+        self._active_plan = record
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_created",
+            goal=record.goal,
+            plan_version=record.plan_version,
+            steps=len(record.steps),
+        )
+        return record
+
+    def _finalize_plan(self) -> None:
+        """Settle dependency skips, flag abandoned steps, and persist."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return
+        skipped = plan.propagate_skipped()
+        if skipped:
+            self._emit_lifecycle("plan_steps_skipped", step_ids=skipped)
+        # A step still RUNNING here never reached a terminal state: the request
+        # ended underneath it. Flag it rather than leaving it looking active, so
+        # the task cannot be recorded as cleanly finished over an unresolved
+        # side effect.
+        abandoned = [item.step_id for item in plan.steps if item.status is StepStatus.RUNNING]
+        for step in plan.steps:
+            if step.status is StepStatus.RUNNING:
+                step.mark_interrupted()
+        if abandoned:
+            log.warning("plan steps ended while still running: %s", ", ".join(abandoned))
+            self._emit_lifecycle("plan_steps_abandoned", step_ids=abandoned)
+        self._sync_task_metadata()
+        self._persist_plan()
+
+    def _plan_has_unresolved_steps(self) -> list[str]:
+        """Ids of steps that neither succeeded nor reached a terminal state."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return []
+        return [
+            item.step_id
+            for item in plan.steps
+            if item.interrupted or item.status is StepStatus.RUNNING
+        ]
+
+    def _next_plan_step(self) -> PlanStepRecord | None:
+        """Dependency-gated next executable step, or None."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return None
+        return plan.next_step()
+
+    def _plan_step_for(self, step_id: str) -> PlanStepRecord | None:
+        plan = getattr(self, "_active_plan", None)
+        return plan.step(step_id) if plan is not None else None
+
+    def _annotate_step(self, step: PlanStepRecord, outcome: ExecutionOutcome | None = None) -> None:
+        """Fill in the fields the existing architecture can actually supply."""
+        if outcome is not None:
+            data = getattr(outcome, "data", None)
+            if isinstance(data, dict):
+                capability_result = data.get("capability_result")
+                if isinstance(capability_result, dict):
+                    step.capability = str(capability_result.get("capability") or "")
+        verification = getattr(outcome, "verification", None)
+        if verification is not None and hasattr(verification, "state"):
+            state = getattr(verification.state, "value", verification.state)
+            step.verification_state = str(state or "")
+
+    def _step_write_ahead(self, step: PlanStepRecord) -> None:
+        """Persist RUNNING *before* the side effect is dispatched.
+
+        Without this a hard kill leaves a persisted PENDING step whose side
+        effect may already have applied, and any later resume would treat it as
+        untouched work.
+        """
+        step.begin_attempt()
+        self._running_plan_step = step
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_step_started",
+            step_id=step.step_id,
+            tool=step.tool,
+            attempt=step.attempts,
+            side_effect_key=step.side_effect_key,
+        )
+
+    def _step_finalize(
+        self,
+        step: PlanStepRecord,
+        outcome: ExecutionOutcome,
+        status: StepStatus,
+    ) -> None:
+        """Persist the terminal state of a step and record what happened."""
+        detail = str(getattr(outcome, "reason", "") or getattr(outcome, "error", "") or "")
+        summary = _plan_result_summary(outcome)
+        step.finish(status, detail=detail, result_summary=summary)
+        if getattr(self, "_running_plan_step", None) is step:
+            self._running_plan_step = None
+        # FAILED and BLOCKED both leave a step that a later resume could act on.
+        # CANCELLED deliberately gets no hint: cancellation is a user decision,
+        # not a condition to recover from automatically.
+        if status in (StepStatus.FAILED, StepStatus.BLOCKED) and not step.recovery_hint:
+            # Derived from the observed failure, never from user wording.
+            step.recovery_hint = _recovery_hint_for(outcome)
+        self._annotate_step(step, outcome)
+        expected = self._evaluate_expected_result(step, outcome)
+        if expected is not None:
+            step.detail = f"{step.detail} {expected}".strip() if step.detail else expected
+        self._persist_plan()
+        self._emit_lifecycle(
+            "plan_step_finished",
+            step_id=step.step_id,
+            tool=step.tool,
+            status=step.status.value,
+            attempts=step.attempts,
+            detail=step.detail,
+        )
+
+    def _evaluate_expected_result(self, step: PlanStepRecord, outcome: ExecutionOutcome) -> str | None:
+        """Honour PlanStep.expected_result.
+
+        Supports the closed vocabulary the current verifier can actually
+        evaluate. Returns a short note, or None when the step declares no
+        expectation.
+        """
+        expected = step.expected_result
+        if not isinstance(expected, dict) or not expected:
+            return None
+        kind = str(expected.get("type") or "")
+        text = f"{getattr(outcome, 'output', '') or ''}\n{getattr(outcome, 'error', '') or ''}"
+        if kind == "output_contains":
+            needle = str(expected.get("value") or "")
+            return f"expected output {needle!r} {'found' if needle and needle.lower() in text.lower() else 'NOT found'}"
+        if kind == "output_matches":
+            pattern = str(expected.get("value") or "")
+            try:
+                hit = bool(pattern) and re.search(pattern, text, re.I) is not None
+            except re.error:
+                return f"expected_result pattern {pattern!r} is not a valid regex"
+            return f"expected pattern {'matched' if hit else 'did not match'}"
+        if kind == "exit_code":
+            want = expected.get("value")
+            got = getattr(outcome, "exit_code", None)
+            return f"expected exit code {want!r}, got {got!r}"
+        if kind == "file_exists":
+            raw = str(expected.get("path") or "")
+            try:
+                exists = bool(raw) and Path(raw).exists()
+            except OSError:
+                exists = False
+            return f"expected file {raw!r} {'exists' if exists else 'is missing'}"
+        return f"unsupported expected_result type {kind!r}"
+
+    def _step_status(self, outcome: ExecutionOutcome) -> StepStatus:
+        if getattr(outcome, "cancelled", False):
+            return StepStatus.CANCELLED
+        if getattr(outcome, "executed", False) and getattr(outcome, "success", False):
+            return StepStatus.DONE
+        if not getattr(outcome, "executed", False) and not getattr(outcome, "allowed", False):
+            # Structured signals only. A user denial already sets `cancelled`
+            # and `status="cancelled"` in Executor, and the check above catches
+            # it. Matching the reason *text* here would let any unrelated
+            # failure whose message happens to read "Denied by user" be reported
+            # as CANCELLED, inverting the terminal task state. The cross-layer
+            # contract forbids inferring status from error-message wording.
+            if getattr(outcome, "status", "") == "cancelled":
+                return StepStatus.CANCELLED
+            return StepStatus.BLOCKED
+        return StepStatus.FAILED
+
+    def _step_event(self, step: TaskStep, outcome: ExecutionOutcome | None = None) -> None:
+        self._events.emit("task", {
+            **self._event_payload(),
+            "lines": self._tasks.lines(),
+            "step": step.name,
+            "step_status": step.status.value,
+            "state": self._tasks.state.value,
+            "outcome": getattr(outcome, "status", "") if outcome is not None else "",
+        })
+
+    def _record_execution(
+        self,
+        tool: str,
+        args: dict,
+        outcome: ExecutionOutcome,
+        step: TaskStep | None = None,
+    ) -> TaskStep:
+        # The executing plan step is read from _running_plan_step rather than
+        # passed in, so the durable-plan wiring does not change this method's
+        # signature and existing observers/doubles keep working.
+        plan_step = getattr(self, "_running_plan_step", None)
+        if step is None:
+            step = self._tasks.add_step(tool, step_id=plan_step.step_id if plan_step else "")
+        self._tasks.set_status(step, StepStatus.RUNNING)
+        self._step_event(step, outcome)
+        self._persist_tool_observation(tool, outcome)
+        self._project_knowledge_tool(tool, args, outcome)
+        self._note_step(tool, args, outcome)
+        status = self._step_status(outcome)
+        self._tasks.set_status(step, status, str(getattr(outcome, "reason", "") or ""))
+        if getattr(outcome, "executed", False) and status in (StepStatus.FAILED, StepStatus.CANCELLED):
+            self._tasks.invalidate_verification("A later executed operation invalidated prior verification.")
+        if status in (StepStatus.FAILED, StepStatus.BLOCKED, StepStatus.CANCELLED):
+            if getattr(outcome, "executed", False) or any(s.status == StepStatus.DONE for s in self._tasks.steps):
+                self._tasks.mark_partial()
+            # M2.12 P3: model escalation is no longer decided by a bare counter
+            # comparison here. The single RecoveryPolicy decides, and it can
+            # refuse - cancellation, an interrupted step, a non-retryable
+            # category, a terminal step or a spent escalation budget all suppress
+            # escalation.
+            self._apply_recovery_policy(tool, outcome, status, plan_step, phase="escalation")
+        if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED, TaskState.COMPLETED):
+            self._transition(TaskState.EXECUTING)
+        verification = getattr(outcome, "verification", None)
+        if (
+            outcome.success
+            and not outcome.cancelled
+            and isinstance(verification, VerificationResult)
+        ):
+            self._begin_verification()
+            self._record_verification(verification)
+        self._step_event(step, outcome)
+        self._sync_task_metadata()
+        return step
+
+    def _recovery_policy(self) -> RecoveryPolicy:
+        """The single recovery policy, built from existing settings.
+
+        ``max_recovery_attempts`` already bounded the LLM loop and
+        ``models_max_escalations`` already bounded the router, so both limits
+        are reused rather than replaced with new knobs. The escalation ceiling
+        here is the stricter of the two, so recovery can never drive more
+        escalation than the router would allow on its own.
+        """
+        settings = getattr(self, "_settings", None)
+        retries = max(0, int(getattr(settings, "max_recovery_attempts", 3)))
+        router_ceiling = max(0, int(getattr(settings, "models_max_escalations", retries)))
+        return RecoveryPolicy(
+            max_retries=retries,
+            max_escalations=min(router_ceiling, retries) if router_ceiling else retries,
+        )
+
+    def _failure_observation(
+        self,
+        tool: str,
+        outcome,
+        status: StepStatus,
+        plan_step=None,
+    ) -> FailureObservation:
+        """Build the redacted recovery input for one failed execution."""
+        verification = getattr(outcome, "verification", None)
+        entry = self._tasks.ledger.latest
+        state = VerificationState.NOT_RUN
+        evidence: dict = {}
+        if isinstance(verification, VerificationResult):
+            state = verification.state
+        if entry is not None:
+            state = entry.state
+            evidence = dict(entry.evidence)
+        capability = ""
+        if plan_step is not None:
+            capability = str(getattr(plan_step, "capability", "") or "")
+        data = getattr(outcome, "data", None)
+        if not capability and isinstance(data, Mapping):
+            payload = data.get("capability_result")
+            if isinstance(payload, Mapping):
+                capability = str(payload.get("capability") or "")
+        return FailureObservation(
+            category=_failure_category(outcome, status),
+            task_id=str(getattr(self._tasks, "task_id", "") or ""),
+            run_id=str(getattr(self._tasks, "run_id", "") or ""),
+            step_id=str(getattr(plan_step, "step_id", "") or ""),
+            tool=str(tool or ""),
+            capability=capability,
+            error_code=str(getattr(outcome, "status", "") or ""),
+            error_type=str(getattr(outcome, "reason", "") or ""),
+            error_message=str(getattr(outcome, "error", "") or ""),
+            attempt=int(getattr(plan_step, "attempts", 0) or 0),
+            recovery_attempts=int(getattr(self._tasks, "recovery_attempts", 0) or 0),
+            escalations_used=int(self._escalations_used),
+            recovery_exhausted=bool(getattr(self._tasks, "recovery_exhausted", False)),
+            verification_state=state,
+            verification_evidence=evidence,
+            cancelled=bool(getattr(outcome, "cancelled", False)),
+            recovery_hint=str(getattr(plan_step, "recovery_hint", "") or ""),
+            expected_result=getattr(plan_step, "expected_result", None),
+            step_status=status,
+            step_replayable=bool(plan_step.is_replayable) if plan_step is not None else True,
+            interrupted=bool(getattr(plan_step, "interrupted", False)) if plan_step is not None else False,
+        )
+
+    def _apply_recovery_policy(
+        self,
+        tool: str,
+        outcome,
+        status: StepStatus,
+        plan_step=None,
+        phase: str = "",
+    ) -> RecoveryDecision:
+        """Route one failure through the single RecoveryPolicy and apply it.
+
+        The policy decides; this method only carries out the decision by
+        adjusting the signals the existing loop and router already read
+        (``_router_verify_ok`` for escalation). It never dispatches work itself
+        and never bypasses permission, workspace or state-machine enforcement.
+        """
+        observation = self._failure_observation(tool, outcome, status, plan_step)
+        decision = self._recovery_policy().decide(observation)
+        if decision.action is RecoveryAction.ESCALATE_MODEL:
+            # Model *selection* stays with _select_model / ModelRouter. This only
+            # marks verification as not-ok, which is the router's existing input
+            # for escalating.
+            self._router_verify_ok = False
+        if decision.action is RecoveryAction.ABORT:
+            # M2.15.2: an ABORT ends recovery for this task terminally.
+            # Only mark recovery as exhausted if the category is retryable (meaning
+            # the retry budget was exhausted). For non-retryable categories, the
+            # task should just fail without marking recovery as exhausted.
+            if observation.is_retryable:
+                # M2.15.2: an ABORT for a retryable category means the retry budget
+                # was exhausted. Mark exhaustion so it persists across restarts.
+                self._tasks.mark_recovery_exhausted(decision.reason)
+                self._sync_task_metadata()
+            else:
+                # Non-retryable category: task fails but recovery budget is not exhausted
+                pass
+        self._emit_lifecycle(
+            "recovery_decided",
+            phase=phase or "unspecified",
+            action=decision.action.value,
+            reason=decision.reason,
+            category=observation.category.value,
+            step_id=observation.step_id,
+            tool=observation.tool,
+            retries_used=decision.retries_used,
+            escalations_used=decision.escalations_used,
+        )
+        log.info(
+            "recovery policy [%s] %s for %s: %s",
+            phase or "unspecified",
+            decision.action.value,
+            tool,
+            decision.reason,
+        )
+        return decision
+
+    def _plan_step_runnable(self, step: PlanStepRecord) -> bool:
+        """Dependency gate: a step runs only when its dependencies are DONE."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return False
+        index = plan.by_id()
+        if step.dependencies_unsatisfiable(index):
+            return False
+        return step.dependencies_satisfied(index)
+
+    def _annotate_intent_expectations(self, record: ExecutionPlanRecord, intent) -> None:
+        """Populate expected_result where the fast-intent contract knows it.
+
+        These are real, pre-declared assertions the executor can evaluate
+        against the observed outcome, not post-hoc narration.
+        """
+        name = getattr(intent, "name", "")
+        if name == "create_hello_python":
+            for step in record.steps:
+                if step.tool == "python.run_script":
+                    step.expected_result = {"type": "output_contains", "value": "Hello World"}
+        elif name == "open_app":
+            for step in record.steps:
+                if step.tool == "applications.open":
+                    step.expected_result = {"type": "output_contains", "value": "opened"}
+
+    async def _execute_step(
+        self,
+        tool: str,
+        args: dict,
+        plan_step: PlanStepRecord | None = None,
+    ) -> ExecutionOutcome:
+        self._transition(TaskState.EXECUTING)
+        if plan_step is not None:
+            # Write-ahead: the RUNNING state reaches disk before dispatch.
+            self._step_write_ahead(plan_step)
+        # Use internal execution method (can be monkey-patched by tests)
+        outcome = await self._execute_tool(tool, args, self._active_cancellation_token)
+        self._record_execution(tool, args, outcome)
+        if plan_step is not None:
+            self._step_finalize(plan_step, outcome, self._step_status(outcome))
+        return outcome
+
+    async def _execute_tool(
+        self,
+        tool: str,
+        args: dict,
+        cancellation_token: CancellationToken | object | None = None,
+    ) -> ExecutionOutcome:
+        """Internal tool execution - can be monkey-patched by tests via agent._executor.run."""
+        return self._executor.run(tool, args, cancellation_token)
+
+    def _begin_recovery(self, reason: str) -> None:
+        self._tasks.record_recovery()
+        self._transition(TaskState.RECOVERING)
+        self._emit_lifecycle("recovery_started", reason=reason, attempt=self._tasks.recovery_attempts)
+
+    def _force_failed_verification(self, reason: str) -> None:
+        """Record a terminal FAILED verdict through the ledger funnel.
+
+        Persistence and session-reconciliation failures are fail-closed: they may
+        only ever move verification to FAILED, never to PASSED. They still go
+        through ``record_verification`` so the ledger stays the single
+        adjudication authority and the persisted projection cannot end up
+        disagreeing with the authoritative scalar (which is exactly what
+        happened when these four sites called ``set_verification`` directly).
+        """
+        self._tasks.record_verification(
+            VerificationResult(VerificationState.FAILED, reason, "execution")
+        )
+
+    def _mark_failure(self, detail: str) -> None:
+        # Cancellation is terminal: a cancelled task must never be relabelled as
+        # FAILED, and its metadata must not be overwritten by a later failure.
+        if self._tasks.state == TaskState.CANCELLED:
+            return
+        if not any(step.status in (StepStatus.FAILED, StepStatus.BLOCKED) for step in self._tasks.steps):
+            step = self._tasks.add_step("execution")
+            self._tasks.set_status(step, StepStatus.FAILED, detail)
+            self._step_event(step)
+        self._tasks.failure_reason = detail
+        self._transition(TaskState.FAILED)
+        self._sync_task_metadata()
+
+    def _debug_outcome(self, tool: str, args: dict, outcome: ExecutionOutcome) -> None:
+        self._record_execution(tool, args, outcome)
+
+    def _finish_tracking(self, reply: str, status: str | None = None) -> str:
+        tasks = self._tasks
+        status = status or tasks.final_status()
+        # A step abandoned mid-flight means the request ended over a possibly
+        # applied side effect. That is not a clean completion, whatever the
+        # in-memory step statuses imply.
+        unresolved = self._plan_has_unresolved_steps()
+        if unresolved and status == "completed":
+            status = "failed"
+            tasks.failure_reason = (
+                f"Task ended with unresolved plan step(s): {', '.join(unresolved)}."
+            )
+        if status == "cancelled":
+            tasks.invalidate_verification("Task was cancelled before verification completed.")
+        elif status == "failed":
+            if tasks.verification == VerificationState.PASSED:
+                tasks.invalidate_verification("Task execution failed after earlier verification.")
+            if tasks.verification != VerificationState.FAILED:
+                result = VerificationResult(VerificationState.FAILED, "Execution or verification failed.", "execution")
+                if tasks.state == TaskState.FAILED:
+                    # Already terminal: transitioning to VERIFYING would be an
+                    # illegal edge, so record through the ledger directly rather
+                    # than via _begin_verification. Still goes through the funnel.
+                    tasks.record_verification(result)
+                    self._emit_lifecycle("verification_failed", verification=result.state.value, detail=result.detail)
+                else:
+                    self._begin_verification()
+                    self._record_verification(result)
+        elif tasks.verification == VerificationState.NOT_RUN:
+            result = VerificationResult(
+                VerificationState.UNVERIFIED if tasks.any_executed() else VerificationState.NOT_REQUIRED,
+                "No independent verifier was available.",
+                "execution",
+            )
+            self._begin_verification()
+            self._record_verification(result)
+        # M2.14 Phase 10A: settle any terminal NOT_RUN explicitly rather than
+        # leaving it implicit, then assert the terminal verdict invariant once,
+        # here, where the terminal state is actually decided. COMPLETED with a
+        # non-PASSED verdict is legitimate and is NOT forced to FAILED; the
+        # invariant forbids the opposite disagreement only.
+        tasks.synchronize_verification()
+        violation = tasks.terminal_violation()
+        if violation:
+            # Fail closed and loudly. Reaching here means a writer produced a
+            # terminal pair the architecture forbids, which must never be
+            # persisted as-is.
+            log.error("terminal verdict invariant violated for task %s: %s",
+                      tasks.task_id, violation)
+            tasks.failure_reason = violation
+            tasks.set_verification(
+                VerificationState.FAILED,
+                f"Terminal state inconsistency: {violation}",
+            )
+        if status == "cancelled":
+            self._transition(TaskState.CANCELLED)
+        elif status == "failed":
+            self._transition(TaskState.FAILED)
+        elif tasks.state not in (TaskState.FAILED, TaskState.CANCELLED):
+            self._transition(TaskState.COMPLETED)
+        self._sync_task_metadata()
+        task_id = tasks.task_id
+        tracker = getattr(self, "_change_tracker", None)
+        persistence_ok = True
+        if tracker is not None and tracker.active is not None:
+            active_id = tracker.active.id
+            persistence_ok = self._capture_task_git_end(active_id, reply, status)
+            if not persistence_ok:
+                status = "failed"
+                tasks.failure_reason = "Task persistence failed."
+                tasks.state = TaskState.FAILED
+                self._force_failed_verification(tasks.failure_reason)
+            if tracker.finish(reply, status) is None:
+                persistence_ok = False
+                status = "failed"
+                tasks.failure_reason = "Coding session persistence failed."
+                tasks.state = TaskState.FAILED
+                self._force_failed_verification(tasks.failure_reason)
+                try:
+                    record = self._task_store.get(active_id)
+                    if record is not None:
+                        self._task_store.update(
+                            active_id,
+                            metadata={**(record.metadata or {}), "lifecycle": self._lifecycle_metadata()},
+                        )
+                        self._task_store.finish(active_id, tasks.failure_reason, "failed")
+                except Exception as exc:
+                    log.warning("could not reconcile task after tracker failure: %s", exc)
+            tracker.clear_active()
+            task_id = active_id
+        elif self._task_store is not None and task_id:
+            record = self._task_store.get(task_id)
+            if record is None:
+                persistence_ok = False
+            else:
+                try:
+                    self._task_store.update(task_id, metadata={**(record.metadata or {}), "lifecycle": self._lifecycle_metadata()})
+                    persistence_ok = self._task_store.finish(task_id, reply, status) is not None
+                except Exception as exc:
+                    log.warning("failed to persist final task %s: %s", task_id, exc)
+                    persistence_ok = False
+        if not persistence_ok:
+            status = "failed"
+            tasks.failure_reason = tasks.failure_reason or "Task persistence failed."
+            self._transition(TaskState.FAILED)
+            self._force_failed_verification(tasks.failure_reason)
+        # M2.14: final projection, after the authoritative record is settled.
+        # Placed here so the graph observes the *terminal* status, plan,
+        # ledger and Git state exactly as TaskStore persisted them. Purely
+        # additive and non-fatal; see _project_knowledge_live.
+        self._project_knowledge_live()
+        if not getattr(self, "_terminal_event_emitted", False):
+            self._terminal_event_emitted = True
+            event = {
+                "completed": "task_completed",
+                "failed": "task_failed",
+                "cancelled": "task_cancelled",
+            }.get(status, "task_failed")
+            self._emit_lifecycle(
+                event,
+                status=status,
+                outcome=reply,
+                verification=tasks.verification.value,
+                task_succeeded=tasks.task_succeeded(),
+                partial=tasks.partial,
+            )
+        return status
+
+    def greet_response(self) -> str:
+        from core.constants import GREETING
+        return GREETING
+
+    # ═════════════════════════════════════════════════ M2.17 resume
+
+    def resume(self, goal_id: str = "", task_id: str = "") -> Any:
+        """Continue durable work after a restart, refusing what is unsafe.
+
+        M2.17. This is the capability the repository's own contract document had
+        been pointing at: ``core/windows/__init__.py`` said "``Agent.resume()`` and
+        cross-restart autonomy are M2.17 and likewise absent", and
+        ``docs/contracts/cross_layer_execution_contracts.md`` had pinned the rule
+        for how it must read state: *through* ``terminal_verdict(state,
+        verification)``, never by inferring from ``status == "completed"``.
+
+        The nine steps the milestone asks for, and where each happens:
+
+        1. load durable state          - ``_task_store`` / ``GoalStore`` records
+        2. reconcile interrupted work   - ``_reconcile_interrupted_tasks`` ran in
+                                         ``__init__``; steps left RUNNING are marked
+                                         ``interrupted`` with their status untouched
+        3. inspect the execution plan   - ``record.plan``
+        4. inspect the verification     - ``VerificationLedger.from_dict`` restore,
+                                         which production never did before
+        5. inspect recovery state       - ``_restore_recovery_state``
+        6. determine what is resumable - ``_classify_resume``
+        7. refuse uncertain replay      - a side-effecting interrupted step is
+                                         never re-dispatched
+        8. reconstruct model context    - a normal RequestContext and the ordinary
+                                         system prompt
+        9. continue through the normal  - ``_execute_step``, i.e. the same
+           TaskManager/Executor path     permission-checked path as any request
+
+        Returns a :class:`core.autonomy.ResumeReport`. It never raises: a resume
+        that cannot proceed is a *reported outcome*, not an exception, because the
+        caller is usually a scheduler that must keep running.
+        """
+        from core.autonomy import ResumeReport
+
+        report = ResumeReport(goal_id=str(goal_id or ""),
+                              task_id=str(task_id or ""))
+        # Deliberately no "is the agent closed" check: Agent has no close()
+        # and no closed flag, and inventing one here would be a second lifecycle
+        # concept sitting next to the existing one. What resume needs is for the
+        # durable record to exist and for the request context to be rebuildable,
+        # both of which are checked below.
+
+        record = None
+        if task_id:
+            record = self._task_store.get(str(task_id))
+        elif goal_id:
+            report.reason = (
+                "resume by goal_id requires a current task; the goal's task is "
+                "selected by the scheduler, which owns goal state")
+            report.action = ResumeReport.REFUSED
+            return report
+        else:
+            report.reason = "resume needs a goal_id or a task_id"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        if record is None:
+            report.reason = f"no durable task record for {task_id!r}"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        # Steps 4 and 5: restore the ledger and the recovery counters *before*
+        # deciding anything, so the decision is made against real durable state.
+        restored_ledger = self._restore_verification_ledger(record)
+        report.ledger_entries = restored_ledger
+        restored_recovery = self._restore_recovery_state(record)
+        report.recovery_restored = restored_recovery
+
+        # A task that reached a terminal state is not resumed. Read through
+        # terminal_verdict, never from ``status == "completed"``: a reloaded
+        # COMPLETED + UNVERIFIED means the work was never checked, and resuming it
+        # as though it were done is exactly the rounding-up this must not do.
+        lifecycle = record.metadata.get("lifecycle") or {}
+        prior_state = str(lifecycle.get("state") or record.status or "")
+        prior_verification = str(lifecycle.get("verification") or "")
+        from core.task_manager import terminal_verdict
+
+        verdict = terminal_verdict(prior_state, prior_verification)
+        report.prior_verdict = getattr(verdict, "value", str(verdict))
+        if report.prior_verdict in ("completed", "cancelled"):
+            report.reason = f"task already {report.prior_verdict}"
+            report.action = ResumeReport.NOOP
+            return report
+        if report.prior_verdict == "failed":
+            report.reason = "task previously failed; recovery decides, not resume"
+            report.action = ResumeReport.REFUSED
+            return report
+
+        # Step 6 and 7: classify, and refuse uncertain side effects.
+        resumable, refused, reason = self._classify_resume(record)
+        report.refused_steps = refused
+        report.reason = reason
+        if refused:
+            # A single uncertain mutation blocks automatic resumption of the whole
+            # task. Partial replay would leave the durable plan describing a world
+            # that never existed.
+            report.action = ResumeReport.BLOCKED
+            self._emit_lifecycle("resume_refused", task_id=report.task_id,
+                                 reason=reason, refused_steps=list(refused))
+            return report
+        if not resumable:
+            # Apply restored recovery state even when there are no resumable steps,
+            # so the recovery budget is correctly carried forward for future attempts.
+            # Begin task first so task_id is set for the registry lookup.
+            self._tasks.begin_task(record.title or record.goal or "resumed task",
+                                   task_id=record.task_id)
+            self._apply_restored_recovery_state()
+            self._exhausted_task_ids = {}
+            report.action = ResumeReport.NOOP
+            self._emit_lifecycle("resume_noop", task_id=report.task_id,
+                                 reason=reason)
+            return report
+
+        # Step 8 and 9: rebuild normal request state and continue through the
+        # ordinary execution path.
+        plan = getattr(record, "plan", None)
+        self._begin_request_context()
+        self._active_cancellation_token = None
+        self._terminal_event_emitted = False
+        self._router_verify_ok = True
+        self._escalations_used = 0
+        self._offline_fallback_used = False
+        self._provider_failures = []
+        self._recovered_task_ids = []
+        # Begin the task first so task_id is set, then apply restored recovery state.
+        self._tasks.begin_task(record.title or record.goal or "resumed task",
+                               task_id=record.task_id)
+        self._apply_restored_recovery_state()
+        self._exhausted_task_ids = {}
+        self._recovered_task_ids = []
+        if plan is not None:
+            self._active_plan = plan
+        self._transition(TaskState.EXECUTING)
+        self._emit_lifecycle("resume_started", task_id=report.task_id,
+                             goal_id=report.goal_id,
+                             steps=len(resumable))
+        report.action = ResumeReport.RESUMED
+        report.resumable_steps = list(resumable)
+        return report
+
+    def _restore_verification_ledger(self, record: Any) -> int:
+        """Rebuild the ledger from its persisted projection.
+
+        Until M2.17 this was write-only in production:
+        ``VerificationLedger.from_dict`` existed and was exercised only by tests,
+        and ``docs/contracts/cross_layer_execution_contracts.md`` recorded that as a
+        known gap. A resume that could not see prior evidence would re-verify work
+        that had already been verified, or worse, trust a terminal state with an
+        empty ledger.
+        """
+        lifecycle = getattr(record, "metadata", {}).get("lifecycle") or {}
+        payload = lifecycle.get("verification_ledger")
+        if not isinstance(payload, Mapping):
+            return 0
+        from core.verification_ledger import VerificationLedger
+
+        try:
+            ledger = VerificationLedger.from_dict(payload)
+        except Exception as exc:  # noqa: BLE001 - a hostile payload degrades
+            log.warning("verification ledger restore failed: %s", exc)
+            return 0
+        count = len(ledger)
+        try:
+            self._tasks.ledger = ledger
+        except Exception:  # noqa: BLE001
+            return 0
+        return count
+
+    def _classify_resume(self, record: Any) -> tuple[list[str], list[str], str]:
+        """Decide which steps may be re-dispatched. ``(resumable, refused, reason)``.
+
+        The rule that matters: an interrupted step whose side effect may already
+        have applied is **never** re-dispatched automatically. ``PlanStepRecord``
+        already encodes this - ``mark_interrupted`` leaves the status RUNNING and
+        sets ``interrupted``, and ``is_replayable`` is False for any side-effecting
+        step. This method applies that rule to a whole task.
+        """
+        plan = getattr(record, "plan", None)
+        if plan is None:
+            return [], [], "task has no durable execution plan"
+        steps = list(getattr(plan, "steps", []) or [])
+        if not steps:
+            return [], [], "plan has no steps"
+
+        resumable: list[str] = []
+        refused: list[str] = []
+        for step in steps:
+            if step.status is StepStatus.DONE:
+                continue
+            if step.status in (StepStatus.FAILED, StepStatus.CANCELLED,
+                               StepStatus.BLOCKED, StepStatus.SKIPPED):
+                refused.append(step.step_id)
+                continue
+            if step.status is StepStatus.RUNNING or getattr(step, "interrupted", False):
+                # RUNNING at shutdown means the effect may or may not have applied.
+                if step.is_replayable:
+                    resumable.append(step.step_id)
+                else:
+                    refused.append(step.step_id)
+                continue
+            resumable.append(step.step_id)
+
+        if refused:
+            return resumable, refused, (
+                "refusing to replay steps whose side effects are uncertain: "
+                + ",".join(refused))
+        if not resumable:
+            return [], [], "no step is executable"
+        return resumable, [], ""
+
+    async def _execute_resume_step(self, step_id: str) -> Any:
+        """Dispatch one already-classified-resumable step through the normal path.
+
+        Split out from :meth:`resume` so a caller can advance one step at a time and
+        observe each result, rather than having resume silently run work.
+        """
+        plan = self._active_plan
+        if plan is None:
+            return None
+        step = plan.step(step_id)
+        if step is None or not step.is_replayable:
+            return None
+        return await self._execute_step(step.tool, step.args, plan_step=step)
+
+    def respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
+        """Handle one user request inside its own RequestContext.
+
+        Admission is governed by :class:`BoundedRequestGate`. P1 ships with
+        ``max_concurrent_requests = 1``, so requests are still handled one at a
+        time; the gate exists so a later task can raise the limit without
+        redesigning the request state.
+
+        The gate guards genuinely *shared* Agent state — the change tracker's
+        single active session, the conversation transcript,
+        ``PermissionManager.last_decision`` and the ``tools.runtime_context``
+        singleton. Request state itself is per-context.
+        """
+        gate = getattr(self, "_request_gate", None)
+        if gate is None:
+            gate = BoundedRequestGate(self.max_concurrent_requests)
+            self._request_gate = gate
+        with gate:
+            return asyncio.run(self._respond(user_input, cancellation_token))
+
+    def _begin_request_context(self) -> RequestContext:
+        """Install a fresh RequestContext for the request about to run.
+
+        Any recovery ids discovered while reconciling interrupted tasks are
+        carried over from the previous context and drained there, so they are
+        still reported exactly once by the next request.
+        """
+        previous = self.request_context
+        context = RequestContext()
+        context.inherit_pending_recoveries(previous)
+        self._request_context = context
+        self._active_plan = None
+        # M2.16.UI.1: desktop routing is per-request. Reset here so a correction
+        # budget spent on one turn cannot be spent again by the next, and a stale
+        # intent cannot be reported against an unrelated request.
+        routing = getattr(self, "_desktop_routing", None)
+        if routing is not None:
+            routing.reset()
+        return context
+
+    async def _respond(self, user_input: str, cancellation_token: CancellationToken | object | None = None) -> str:
+        user_input = (user_input or "").strip()
+        self._begin_request_context()
+        self._active_cancellation_token = cancellation_token
+        self._terminal_event_emitted = False
+        self._router_verify_ok = True
+        self._escalations_used = 0
+        self._offline_fallback_used = False
+        self._provider_failures = []
+        self._tasks.begin_task(user_input)
+        self._capture_plan_goal(user_input)
+        self._events.emit_status("state", "thinking")
+        self._emit_lifecycle("task_started", status="created", goal=user_input)
+        for recovered_task_id in list(getattr(self, "_recovered_task_ids", [])):
+            self._emit_lifecycle("task_recovered", recovered_task_id=recovered_task_id, status="failed")
+        #: M2.15.2. Recovery state restored from durable task records at startup, keyed
+        #: by task id, applied to whichever task the next turn begins. Not global
+        #: mutable recovery policy - it is the per-task durable state that
+        #: ``begin_task`` would otherwise reset to zero.
+        self._exhausted_task_ids: dict[str, dict] = {}
+        self._recovered_task_ids = []
+        self._apply_restored_recovery_state()
+        reply = ""
+        try:
+            self._create_run_record()
+            self._transition(TaskState.PLANNING)
+            self._emit_lifecycle("planning", status="planning", goal=user_input)
+            if cancellation_requested(cancellation_token):
+                self._transition(TaskState.CANCELLED)
+                reply = "Task cancelled."
+            elif self._planner_agent.planner.matches_greeting(user_input):
+                reply = self.greet_response()
+            else:
+                intent = self._planner_agent.planner.fast_intent(user_input)
+                if intent is not None:
+                    reply = await self._run_intent(intent)
+                elif self._planner_agent.planner.coding_intent(user_input) == "debug":
+                    reply = self._run_debug(user_input)
+                else:
+                    reply = await self._llm_loop(user_input)
+            if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED, TaskState.COMPLETED):
+                if any(step.status == StepStatus.CANCELLED for step in self._tasks.steps):
+                    self._transition(TaskState.CANCELLED)
+                elif self._tasks.any_failed():
+                    self._transition(TaskState.FAILED)
+                else:
+                    if self._tasks.verification == VerificationState.NOT_RUN:
+                        state = VerificationState.UNVERIFIED if self._tasks.any_executed() else VerificationState.NOT_REQUIRED
+                        self._begin_verification()
+                        self._record_verification(VerificationResult(state, "No independent verifier was available."))
+                    self._transition(TaskState.COMPLETED)
+        except CancellationRequested:
+            self._transition(TaskState.CANCELLED)
+            reply = "Task cancelled."
+        except Exception as exc:
+            log.error("Agent request failed: %s", exc, exc_info=True)
+            if self._tasks.state == TaskState.CANCELLED:
+                # Cancellation dominates: do not relabel a cancelled task as FAILED.
+                reply = "Task cancelled."
+            else:
+                self._mark_failure(f"{type(exc).__name__}: {exc}")
+                reply = f"Task failed: {exc}"
+        finally:
+            self._finalize_plan()
+            self._append_to_conversation(user_input, reply)
+            status = self._finish_tracking(reply)
+            self._events.emit_status("state", "idle")
+            self._events.emit("task_done", {
+                **self._event_payload(),
+                "steps": self._tasks.lines(),
+                "status": status,
+                "outcome": reply,
+                "verification": self._tasks.verification.value,
+                "task_succeeded": self._tasks.task_succeeded(),
+                "partial": self._tasks.partial,
+                "plan": self._plan_public_summary(),
+            })
+            self._active_cancellation_token = None
+        return reply
+
+    def _plan_public_summary(self) -> dict | None:
+        """Small plan digest for the task_done event. No args, ever."""
+        plan = getattr(self, "_active_plan", None)
+        if plan is None:
+            return None
+        return {
+            "plan_version": plan.plan_version,
+            "counts": plan.counts(),
+            "is_complete": plan.is_complete,
+            "interrupted_step_ids": [item.step_id for item in plan.interrupted_steps()],
+        }
+
+    async def _run_intent(self, intent) -> str:
+        try:
+            plan = ExecutionPlan.from_intent(intent, goal=intent.summary or intent.name)
+            plan.validate(self._registry)
+        except (PlanValidationError, ValueError) as exc:
+            self._mark_failure(f"Invalid execution plan: {exc}")
+            return f"Task failed: invalid execution plan ({exc})."
+
+        record = self._begin_plan(plan)
+        if record is None:
+            self._mark_failure("Invalid execution plan: dependency cycle.")
+            return "Task failed: invalid execution plan (dependency cycle)."
+        self._annotate_intent_expectations(record, intent)
+
+        outcomes = []
+        for step in record.steps:
+            if step.status is StepStatus.SKIPPED:
+                continue
+            if not self._plan_step_runnable(step):
+                continue
+            if cancellation_requested(self._active_cancellation_token):
+                self._transition(TaskState.CANCELLED)
+                step.finish(StepStatus.CANCELLED, detail="Cancelled before dispatch.")
+                break
+            outcome = await self._execute_step(step.tool, step.args, plan_step=step)
+            outcomes.append(outcome)
+            if self._tasks.verification == VerificationState.FAILED or self._tasks.state == TaskState.FAILED:
+                break
+            if not outcome.success or outcome.cancelled:
+                break
+        self._finalize_plan()
+
+        intent_name = getattr(intent, "name", "")
+        if intent_name == "open_app":
+            if not outcomes:
+                return "Opening cancelled."
+            outcome = outcomes[0]
+            app = intent.steps[0][1].get("app", "application")
+            if outcome.success:
+                return f"Opening {app}."
+            if outcome.cancelled:
+                return f"Opening {app} cancelled."
+            return f"Could not open {app}: {outcome.error or outcome.reason}"
+
+        if intent_name == "create_hello_python":
+            path = Path(intent.steps[0][1]["path"])
+            if len(outcomes) < 2:
+                if outcomes and outcomes[0].cancelled:
+                    return "File creation cancelled."
+                return "Task stopped before verification."
+            write_out, run_out = outcomes
+            if not write_out.success:
+                return f"Failed to create the file: {write_out.error or write_out.reason}"
+            if not run_out.success:
+                return f"File was created but running it failed: {run_out.error or run_out.reason}"
+            self._begin_verification()
+            exists, detail = self._verifier.check_file(path)
+            output_ok = self._verifier.check_output(run_out.output, "Hello World")
+            # M2.12 P3: PASSED needs real, observed evidence. Both halves of the
+            # claim are observable here, so record them rather than asserting.
+            evidence = {
+                "path": str(path),
+                "exists": exists,
+                "size": path.stat().st_size if path.is_file() else 0,
+                "expected_output": "Hello World",
+                "output_matched": output_ok,
+                "exit_code": run_out.exit_code,
+            }
+            if exists and output_ok:
+                self._record_verification(VerificationResult(VerificationState.PASSED, detail, "file_and_output", evidence))
+                return f"Created {path}, executed and verified. Output: Hello World"
+            detail = detail if not exists else "Expected output was not found."
+            self._record_verification(VerificationResult(VerificationState.FAILED, detail, "file_and_output", evidence))
+            return "File was created and executed but the output could not be verified."
+
+        if intent_name == "system_info":
+            outcome = outcomes[0] if outcomes else None
+            if outcome is None:
+                return "Could not read system information: task cancelled."
+            # The claim is "system information was returned", so the returned
+            # text *is* the evidence. Success alone is not evidence, so an empty
+            # observation must not be reported as PASSED.
+            observed = str(getattr(outcome, "output", "") or "").strip()
+            if outcome.success and observed:
+                self._begin_verification()
+                self._record_verification(VerificationResult(
+                    VerificationState.PASSED,
+                    "System information was returned.",
+                    "tool_observation",
+                    {
+                        "tool": "system_info",
+                        "output_chars": len(observed),
+                        "output_excerpt": observed[:280],
+                        "exit_code": outcome.exit_code,
+                    },
+                ))
+                return f"System check: {observed}"
+            if outcome.success:
+                return "Could not read system information: the tool reported success but returned no output."
+            return f"Could not read system information: {outcome.error or outcome.reason}"
+
+        return "; ".join(o.display for o in outcomes) if outcomes else "Done."
+
+    def _offline_response(self, messages: list[dict], specs: list) -> object:
+        from ai.offline_provider import OfflineProvider
+
+        offline = OfflineProvider(scratch_dir=self._settings.scratch_dir)
+        response = offline.chat(messages, tools=specs, model=offline.model_label)
+        self._offline_fallback_used = True
+        self._last_model = type("MC", (), {
+            "to_state_line": lambda self_: f"MODEL: {offline.model_label} MODE: fallback SOURCE: offline",
+            "escalated": False,
+        })()
+        return response
+
+    def _record_provider_failure(self, exc: Exception, model: str, next_model: str = "") -> dict:
+        """M2.13.0: make a swallowed provider failure observable.
+
+        The fallback chain used to discard the exception entirely, so an offline
+        answer was indistinguishable from a real one after the fact. The
+        structured fields let recovery and routing tell a timeout (this model is
+        too slow for this request) from a malformed response (this model cannot
+        do this task) from a missing model (the configuration is wrong).
+        """
+        from ai.provider import AIProviderError, FailureCategory
+
+        if isinstance(exc, AIProviderError):
+            detail = exc.to_dict()
+        else:
+            detail = {
+                "category": FailureCategory.UNKNOWN,
+                "model": model,
+                "latency": 0.0,
+                "retryable": False,
+                "status": 0,
+                "message": str(exc)[:300],
+            }
+        detail["model"] = detail.get("model") or model
+        detail["next_model"] = next_model
+        detail["exception"] = type(exc).__name__
+        self._provider_failures.append(detail)
+        return detail
+
+    @property
+    def provider_failures(self) -> list[dict]:
+        """Model degradations observed during the current request, oldest first."""
+        return list(self._provider_failures)
+
+    def _chat_with_fallback(self, messages: list[dict], specs: list, choice) -> object:
+        try:
+            return self._provider.chat(messages, tools=specs, model=choice.name)
+        except Exception as primary:
+            fallback = self._router.fallback_name(exclude=choice.name)
+            if not fallback or fallback == choice.name:
+                self._record_provider_failure(primary, getattr(choice, "name", ""), "offline")
+                self._emit_lifecycle(
+                    "model_offline_fallback",
+                    model=getattr(choice, "name", ""),
+                    reason="no alternative model available",
+                )
+                return self._offline_response(messages, specs)
+            self._begin_recovery(f"provider unavailable for {choice.name}")
+            try:
+                response = self._provider.chat(messages, tools=specs, model=fallback)
+            except Exception as secondary:
+                detail = self._record_provider_failure(
+                    primary, getattr(choice, "name", ""), fallback
+                )
+                self._record_provider_failure(secondary, fallback, "offline")
+                self._emit_lifecycle(
+                    "model_offline_fallback",
+                    model=fallback,
+                    reason="fallback model also failed",
+                    category=detail.get("category", ""),
+                )
+                return self._offline_response(messages, specs)
+            detail = self._record_provider_failure(
+                primary, getattr(choice, "name", ""), fallback
+            )
+            self._last_model = type("MC", (), {"to_state_line": lambda self_: f"MODEL: {fallback} MODE: {choice.mode} SOURCE: provider-fallback", "escalated": False})()
+            self._emit_lifecycle(
+                "model_fallback",
+                **{"from": getattr(choice, "name", ""), "to": fallback, **detail},
+            )
+            return response
+
+    def _desktop_mismatch_correction(self, plan: Any) -> str | None:
+        """Detect a wrong-tool selection and, if systematic, ask once more.
+
+        M2.16.UI.1, bounded semantic mismatch recovery.
+
+        The failure this exists for is concrete: the request asked to *interact*
+        with an application, and the model answered with ``applications.open``,
+        which can only start a program. Executing that would silently do the wrong
+        thing - or nothing - and report success for a step it never performed.
+
+        Three deliberate limits:
+
+        * **Correct only a systematic mismatch.** One mismatched tool among several
+          that collectively make sense is not a routing failure, and rewriting it
+          would discard a partly-correct plan. Correction requires *every* desktop
+          step in the plan to mismatch the request's family.
+        * **Bounded by a budget, not by a loop condition.** The budget lives in
+          settings and is spent per request, so this cannot become an unbounded
+          retry even if the model keeps making the same mistake.
+        * **Never bypasses anything.** A correction only re-asks the model with the
+          full registry still authoritative. No tool is dispatched, no permission
+          is implied, no target is fabricated.
+
+        Returns the corrective message to append, or None to proceed as planned.
+        Telemetry is emitted either way - a mismatch that was tolerated is still
+        the fact worth recording.
+        """
+        try:
+            from core.desktop_intent import detect_tool_mismatch
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        routing = self._desktop_routing_state()
+        intent = routing.intent
+        if intent is None or not intent.is_desktop:
+            return None
+        steps = [s for s in getattr(plan, "steps", ()) or () if getattr(s, "tool", "")]
+        if not steps:
+            return None
+
+        mismatches = []
+        for step in steps:
+            found = detect_tool_mismatch(intent, step.tool)
+            if found is not None:
+                mismatches.append(found)
+        if not mismatches:
+            return None
+
+        for found in mismatches:
+            self._desktop_routing_state().record(found)
+        systematic = len(mismatches) == len(steps)
+        self._emit_lifecycle(
+            "desktop_tool_mismatch",
+            intent_family=intent.family.value,
+            intent_confidence=intent.confidence,
+            selected_tools=[s.tool for s in steps],
+            mismatched_tools=[m.selected_tool for m in mismatches],
+            expected_tools=list(intent.expected_tools),
+            systematic=systematic,
+            selected_at=time.strftime("%Y%m%d-%H%M%S"),
+        )
+
+        if not systematic:
+            return None
+
+        routing = self._desktop_routing_state()
+        used = int(routing.corrections_used)
+        budget = max(0, int(getattr(self._settings, "desktop_mismatch_corrections", 1)))
+        if used >= budget:
+            # Budget spent. The plan proceeds as the model wrote it; if it was
+            # wrong, the normal failure and verification paths report that. This
+            # milestone does not get to invent a stronger outcome.
+            log.info(
+                "desktop tool mismatch correction budget spent (%d/%d); proceeding",
+                used, budget,
+            )
+            return None
+        routing.corrections_used = used + 1
+
+        tools_list = ", ".join(intent.expected_tools)
+        self._emit_lifecycle(
+            "desktop_tool_mismatch_corrected",
+            attempt=used + 1,
+            budget=budget,
+            intent_family=intent.family.value,
+        )
+        log.info(
+            "desktop tool mismatch: %s cannot serve %s; asking once more (attempt %d/%d)",
+            ",".join(sorted({m.selected_tool for m in mismatches})),
+            intent.family.value, used + 1, budget,
+        )
+        return (
+            f"None of the tools you just chose can carry out this request: "
+            f"{', '.join(sorted({m.selected_tool for m in mismatches}))} "
+            f"cannot perform a '{intent.family.value}' request. Use the appropriate "
+            f"tools instead: {tools_list}. If you need a window or control to act "
+            f"on, find it first and reuse the context it returns."
+        )
+
+    def _desktop_intent(self, user_input: str) -> Any:
+        """Classify the request into a desktop intent family (M2.16.UI.1).
+
+        Recorded on the request context so the tool selector, the mismatch check
+        and telemetry all read the *same* classification. Classifying once and
+        reusing it is what stops routing and diagnostics from disagreeing.
+        """
+        try:
+            from core.desktop_intent import classify_desktop_intent
+
+            intent = classify_desktop_intent(user_input)
+        except Exception:  # pragma: no cover - defensive
+            intent = None
+        routing = self._desktop_routing_state()
+        if intent is not None:
+            routing.intent = intent
+        return intent
+
+    def _desktop_routing_state(self):
+        """The Agent-owned desktop routing record for the current request.
+
+        Deliberately not on `RequestContext`: that dataclass has a pinned
+        nine-field contract whose assertion reads "new state belongs elsewhere".
+        Routing decisions already live beside `_tool_context_decision` here.
+        """
+        state = getattr(self, "_desktop_routing", None)
+        if state is None:
+            from core.desktop_intent import DesktopRoutingState
+
+            state = DesktopRoutingState()
+            self._desktop_routing = state
+        return state
+
+    def _tool_context(self, user_input: str) -> tuple[list, Any]:
+        """Select which tool specs to present to the model for this turn.
+
+        Presentation only. The full registry stays authoritative: tool calls are
+        still validated and dispatched against every registered tool, and
+        permissions are unchanged. The decision is recorded for diagnostics and
+        any failure degrades to the full registry.
+        """
+        selector = getattr(self, "_tool_selector", None)
+        if selector is None:
+            from core.tool_context import ToolContextSelector
+
+            selector = ToolContextSelector(self._registry)
+            self._tool_selector = selector
+        settings = getattr(self, "_settings", None)
+        # Classified before the branch so telemetry has the intent even when the
+        # full registry is forced by settings.
+        intent = self._desktop_intent(user_input)
+        families = (intent.family.value,) if (intent and intent.is_desktop) else ()
+        # Focus is requested only for a confident desktop classification. Below the
+        # threshold the request keeps the normal widened set, because a shaky
+        # classification is exactly when narrowing would be wrong.
+        focus = bool(
+            intent and intent.is_desktop
+            and intent.confidence >= float(
+                getattr(settings, "desktop_focus_min_confidence", 0.6) or 0.0)
+        )
+        if getattr(settings, "tools_full_context", False):
+            decision = selector.select(full=True)
+        else:
+            try:
+                planner_class = self._planner_agent.planner.coding_intent(user_input) or ""
+            except Exception:  # pragma: no cover - defensive
+                planner_class = ""
+            # Observed tools for this request: the strongest structured signal
+            # available, because it is what the agent actually did, not text.
+            used = [step.name for step in getattr(self._tasks, "steps", [])]
+            decision = selector.select(
+                user_text=user_input,
+                planner_class=planner_class,
+                used_tool_names=used,
+                capabilities=self._requested_capabilities(user_input),
+                families=families,
+                focus_families=focus,
+            )
+        specs = selector.specs_for(decision)
+        self._tool_context_decision = decision
+        presented = tuple(spec.name for spec in specs)
+        self._emit_lifecycle(
+            "tool_context_selected",
+            tool_count=decision.tool_count,
+            total_tools=decision.total_tools,
+            reduction=decision.reduction_ratio,
+            capabilities=list(decision.capabilities),
+            reason=decision.reason,
+            degraded=decision.degraded,
+            # M2.16.UI.1 selection telemetry. Structured, bounded and free of user
+            # prose: an intent family and a count, never the request text.
+            desktop_intent=intent.family.value if intent else "",
+            desktop_confidence=intent.confidence if intent else 0.0,
+            desktop_expected_tools=list(intent.expected_tools) if intent else [],
+            desktop_tools_presented=sorted(
+                name for name in presented if name.startswith(("desktop.", "applications."))),
+        )
+        log.info(
+            "tool context: %d/%d tools (%.0f%% withheld) via %s%s",
+            decision.tool_count, decision.total_tools,
+            decision.reduction_ratio * 100, decision.reason,
+            f" [desktop={intent.family.value}]" if intent and intent.is_desktop else "",
+        )
+        return specs, decision
+
+    def _requested_capabilities(self, user_text: str) -> tuple[str, ...]:
+        """Capabilities the request explicitly names, from structured signals.
+
+        Derived from the planner's own classification and the active project's
+        detected profile rather than by scanning the sentence for keywords, so
+        an unrelated word in a path or a file name cannot widen or narrow the
+        tool set.
+        """
+        found: list[str] = []
+        try:
+            klass = self._planner_agent.planner.coding_intent(user_text) or ""
+        except Exception:  # pragma: no cover - defensive
+            klass = ""
+        if klass == "debug":
+            found.append("debugging")
+        elif klass == "develop":
+            found.append("coding")
+
+        project = getattr(self, "_project", None)
+        path = str(getattr(project, "path", "") or "")
+        if path:
+            try:
+                from coding.commands import detect_commands
+
+                commands = detect_commands(Path(path))
+                # A project that has its own version control or CI surface is
+                # far more likely to need it than an arbitrary request.
+                if commands.build.exists or commands.install.exists:
+                    found.append("version_control")
+            except Exception:  # pragma: no cover - detect_commands never raises
+                pass
+        return tuple(dict.fromkeys(found))
+
+    async def _llm_loop(self, user_input: str) -> str:
+        specs = self._tool_context(user_input)[0]
+        messages = [
+            {"role": "system", "content": build_system_prompt(
+                self._provider.model_label,
+                self._project,
+                str(getattr(self._settings, "workspace_root", "") or ""),
+            )},
+        ]
+        extra = self._reference_sections()
+        if extra:
+            messages[0]["content"] += "\n\n" + extra
+        for prior in self._messages[-self._settings.max_conversation_turns * 2:]:
+            if prior.get("role") in ("user", "assistant"):
+                messages.append(prior)
+        messages.append({"role": "user", "content": user_input})
+        max_turns = max(1, int(getattr(self._settings, "max_turns", 4)))
+        max_tool_calls = max(1, int(getattr(self._settings, "max_tool_calls", 32)))
+        tool_call_count = 0
+
+        for _ in range(max_turns):
+            if cancellation_requested(self._active_cancellation_token):
+                self._transition(TaskState.CANCELLED)
+                return "Task cancelled."
+            choice = self._select_model(user_input)
+            try:
+                response = self._chat_with_fallback(messages, specs, choice)
+            except Exception as exc:
+                self._mark_failure(f"AI backend error: {exc}")
+                return f"AI backend error: {exc}"
+            calls = list(getattr(response, "tool_calls", []) or [])
+            messages.append({"role": "assistant", "content": getattr(response, "text", "") or "", "tool_calls": _to_api_calls(calls)})
+            if not calls:
+                if self._offline_fallback_used and self._tasks.any_executed():
+                    detail = "AI backend became unavailable after tool execution; offline fallback could not verify completion."
+                    self._mark_failure(detail)
+                    return f"Task failed: {detail}"
+                # Always go through verification phase when verification hasn't run,
+                # regardless of current task state. The state machine allows
+                # PLANNING -> VERIFYING and EXECUTING -> VERIFYING.
+                if self._tasks.verification == VerificationState.NOT_RUN:
+                    self._begin_verification()
+                    state = VerificationState.UNVERIFIED if self._tasks.any_executed() else VerificationState.NOT_REQUIRED
+                    self._record_verification(VerificationResult(state, "No independent verifier was available."))
+                if self._tasks.state not in (TaskState.FAILED, TaskState.CANCELLED):
+                    self._transition(TaskState.COMPLETED)
+                return getattr(response, "text", "") or "Understood."
+
+            try:
+                plan = ExecutionPlan.from_tool_calls(calls, goal=user_input)
+                plan.validate(self._registry)
+            except (PlanValidationError, ValueError) as exc:
+                self._mark_failure(f"Invalid execution plan: {exc}")
+                return f"Task failed: invalid execution plan ({exc})."
+
+            # M2.16.UI.1: bounded wrong-tool recovery. Runs *before* anything is
+            # dispatched, so a mismatched plan costs nothing.
+            correction = self._desktop_mismatch_correction(plan)
+            if correction is not None:
+                messages.append({"role": "assistant", "content": correction})
+                continue
+
+            record = self._begin_plan(plan)
+            if record is None:
+                self._mark_failure("Invalid execution plan: dependency cycle.")
+                return "Task failed: invalid execution plan (dependency cycle)."
+
+            for step in record.steps:
+                if step.status is StepStatus.SKIPPED:
+                    continue
+                if not self._plan_step_runnable(step):
+                    continue
+                if cancellation_requested(self._active_cancellation_token):
+                    self._transition(TaskState.CANCELLED)
+                    step.finish(StepStatus.CANCELLED, detail="Cancelled before dispatch.")
+                    self._persist_plan()
+                    return "Task cancelled."
+                if tool_call_count >= max_tool_calls:
+                    self._mark_failure(f"Tool call limit reached ({max_tool_calls}).")
+                    return "Task stopped at the tool call limit."
+                tool_call_count += 1
+                outcome = await self._execute_step(step.tool, step.args, plan_step=step)
+                messages.append({"role": "tool", "content": f"[{step.tool}] {outcome.display}"})
+                if outcome.cancelled:
+                    self._transition(TaskState.CANCELLED)
+                    self._finalize_plan()
+                    return "Task cancelled."
+                if not outcome.success:
+                    # M2.12 P3: the bounded-retry decision is made by the single
+                    # RecoveryPolicy, not by an inline counter comparison. The
+                    # branch structure and user-visible wording are preserved.
+                    decision = self._apply_recovery_policy(
+                        step.tool, outcome, self._step_status(outcome), plan_step=step, phase="llm_loop"
+                    )
+                    if decision.action is RecoveryAction.RETRY_STEP:
+                        self._begin_recovery(outcome.error or outcome.reason or f"{step.tool} failed")
+                        break
+                    if not outcome.executed:
+                        self._mark_failure(outcome.error or outcome.reason or "Tool was blocked.")
+                        self._finalize_plan()
+                        return "Task stopped because a tool was blocked."
+                    self._mark_failure(outcome.error or outcome.reason or "Tool failed repeatedly.")
+                    self._finalize_plan()
+                    if decision.action is RecoveryAction.ESCALATE_MODEL:
+                        return "Task stopped after bounded recovery attempts; a stronger model may be required."
+                    return "Task stopped after bounded recovery attempts."
+            self._finalize_plan()
+            log.debug("agent loop: %d tool call(s) executed this turn", tool_call_count)
+
+        if self._tasks.verification is VerificationState.PASSED:
+            # The reasoning budget ran out, but the work was already verified
+            # with observed evidence. A resource limit must not overwrite an
+            # adjudicated verdict: reporting this as a failure would discard
+            # real evidence and tell the user a working project had failed.
+            self._transition(TaskState.COMPLETED)
+            log.info("turn limit reached after successful verification; reporting completion")
+            return (
+                "Stopped at the reasoning turn limit, but the work was already "
+                "verified."
+            )
+
+        step = self._tasks.add_step("max_turns_reached")
+        self._tasks.set_status(step, StepStatus.FAILED, "Reasoning turn limit reached.")
+        self._mark_failure("Reasoning turn limit reached.")
+        return "Task reached the maximum number of reasoning turns. Stopping."
+
+    def _run_debug(self, user_input: str) -> str:
+        ctx = self._debug_context(user_input)
+        from core.debug_loop import DebugLoop
+        choice = self._select_model(user_input)
+        before_steps = len(self._tasks.steps)
+        loop = DebugLoop(
+            lambda messages, tools=None, model=None: self._chat_with_fallback(messages, tools or [], choice),
+            self._executor_agent._async_executor,
+            self._settings,
+            tracker=self._change_tracker,
+            registry=self._registry,
+            auto_verify=ctx.get("test_command", ""),
+            verify_dir=str(Path(ctx["project_path"])) if ctx.get("project_path") else "",
+            model_name=choice.name,
+            on_outcome=self._debug_outcome,
+            cancellation_token=getattr(self, "_active_cancellation_token", None),
+        )
+        report = loop.diagnose(user_input, ctx)
+        if len(self._tasks.steps) == before_steps:
+            for item in report.steps:
+                step = self._tasks.add_step(item.action)
+                self._tasks.set_status(step, StepStatus.DONE if item.success else StepStatus.FAILED, item.detail)
+        failed_attempts = [item for item in report.steps if not item.success]
+        if getattr(report, "cancelled", False):
+            self._transition(TaskState.CANCELLED)
+        elif getattr(self, "_offline_fallback_used", False) and self._tasks.any_executed() and not report.verified:
+            self._mark_failure("AI backend fell back to offline mode after execution without independent verification.")
+        elif report.exhausted:
+            self._mark_failure(report.exhausted)
+        elif failed_attempts and not report.verified:
+            self._mark_failure("Debug execution did not produce a successful final attempt.")
+        verification_state = getattr(report, "verification_state", VerificationState.UNVERIFIED.value)
+        try:
+            verification_state = VerificationState(verification_state)
+        except ValueError:
+            verification_state = VerificationState.UNVERIFIED
+        if report.verified and verification_state == VerificationState.PASSED:
+            self._begin_verification()
+            # Evidence comes from the auto-verify run itself. Without it the
+            # ledger refuses PASSED, because "debug verification passed" on its
+            # own is a claim, not evidence.
+            self._record_verification(VerificationResult(
+                VerificationState.PASSED,
+                "Debug verification passed.",
+                "debug",
+                dict(getattr(report, "verification_evidence", {}) or {}),
+            ))
+        elif not report.exhausted:
+            self._begin_verification()
+            state = VerificationState.FAILED if self._tasks.state == TaskState.FAILED else verification_state
+            self._record_verification(VerificationResult(
+                state,
+                getattr(report, "final_message", "") or "Debug completed without independent verification.",
+                "debug",
+            ))
+        self._router_verify_ok = bool(report.verified and not report.exhausted)
+        if not report.verified and report.steps:
+            log.info("debug verifier incomplete; next LLM call may escalate model")
+        return report.to_context()
+
+    def _debug_context(self, user_input: str) -> dict:
+        ctx = {"mission": "Systematically diagnose the reported problem and fix it with targeted patches.",
+               "goal": self._pending_goal or user_input[:80]}
+        project = self._project
+        if not project or not project.path:
+            return ctx
+        if not Path(project.path).is_dir():
+            return ctx
+        try:
+            cache = self._settings.sessions_dir / "project-index"
+            from coding.profile import build_profile
+            from coding.project_index import index_cached
+            from coding.relevance import pick_relevant
+            profile = build_profile(Path(project.path), cache_dir=cache)
+            ctx["project"] = profile.to_context(1400)
+            ctx["project_name"] = profile.name
+            records = index_cached(Path(project.path), cache_dir=cache)
+            files = pick_relevant(Path(project.path), user_input, records=records, cache_dir=cache, max_files=6, max_lines=120)
+            ctx["files"] = "\n\n".join(f.to_context() for f in files)[:4000]
+            ctx["project_path"] = str(Path(project.path))
+            if profile.commands.test and profile.commands.test.exists:
+                ctx["test_command"] = profile.commands.test.command
+                ctx["mission"] += f"\nAfter fixing, verify with: {profile.commands.test.command}"
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("debug context build failed: %s", exc)
+        return ctx
+
+    def _append_to_conversation(self, user_input: str, reply: str) -> None:
+        self._messages.append({"role": "user", "content": user_input})
+        self._messages.append({"role": "assistant", "content": reply})
+        if self._conversation is not None:
+            try:
+                self._conversation.append_user(user_input)
+                self._conversation.append_assistant(reply)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("Could not persist conversation: %s", exc)
+
+
+def _failure_category(outcome, status: StepStatus) -> FailureCategory:
+    """Classify one failed execution into the shared recovery vocabulary.
+
+    Reuses the ratified ``CapabilityStatus`` and ``StepStatus`` meanings rather
+    than inferring a category from error-message wording. In particular it never
+    pattern-matches the error *text* to decide a status, which the cross-layer
+    contract forbids.
+    """
+    if bool(getattr(outcome, "cancelled", False)) or status is StepStatus.CANCELLED:
+        return FailureCategory.CANCELLED
+    if status is StepStatus.BLOCKED or not getattr(outcome, "executed", False):
+        return FailureCategory.NOT_EXECUTED
+    if bool(getattr(outcome, "allowed", True)) is False:
+        return FailureCategory.PERMISSION_DENIED
+    code = str(getattr(outcome, "status", "") or "").strip().lower()
+    if code in {"permission_required", "blocked", "denied"}:
+        return FailureCategory.PERMISSION_DENIED
+    if code in {"invalid_request"}:
+        return FailureCategory.INVALID_REQUEST
+    if code in {"unavailable", "timeout"}:
+        return FailureCategory.UNAVAILABLE
+    verification = getattr(outcome, "verification", None)
+    if isinstance(verification, VerificationResult) and verification.state == VerificationState.FAILED:
+        return FailureCategory.VERIFICATION_FAILED
+    return FailureCategory.EXECUTION_FAILED
+
+
+def _ledger_snapshot(tasks) -> dict:
+    """Bounded verification-ledger projection, tolerant of partial task doubles.
+
+    ``_lifecycle_metadata`` is called on every task sync, and tests substitute
+    lightweight stand-ins for the task object. A missing ledger must degrade to
+    an empty projection rather than break persistence.
+    """
+    snapshot = getattr(tasks, "verification_ledger_snapshot", None)
+    if not callable(snapshot):
+        return {}
+    try:
+        return snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("could not snapshot verification ledger: %s", exc)
+        return {}
+
+
+def _plan_result_summary(outcome: ExecutionOutcome) -> str:
+    """Compact, persistence-safe record of what a step produced."""
+    status = str(getattr(outcome, "status", "") or "")
+    exit_code = getattr(outcome, "exit_code", None)
+    output = str(getattr(outcome, "output", "") or "").strip().splitlines()
+    tail = output[-1][:160] if output else ""
+    parts = [p for p in (status, f"exit={exit_code}" if exit_code is not None else "", tail) if p]
+    return " | ".join(parts)[:280]
+
+
+def _recovery_hint_for(outcome: ExecutionOutcome) -> str:
+    """Derive a resume hint from the observed failure, not from user wording."""
+    error = str(getattr(outcome, "error", "") or "").strip()
+    reason = str(getattr(outcome, "reason", "") or "").strip()
+    if not getattr(outcome, "executed", False):
+        return f"Step did not execute ({reason or error or 'blocked'}). Re-check preconditions before retrying."
+    if getattr(outcome, "cancelled", False):
+        return "Step was cancelled. Confirm intent before retrying."
+    if exit_code := getattr(outcome, "exit_code", None):
+        return f"Step failed with exit code {exit_code}. Inspect the failing command before retrying."
+    if error:
+        return f"Previous attempt failed: {error[:180]}"
+    return f"Previous attempt failed: {reason[:180]}" if reason else "Previous attempt failed."
+
+
+def _to_api_calls(calls: list[ToolCall]) -> list[dict] | None:
+    if not calls:
+        return None
+    return [
+        {"function": {"name": c.name, "arguments": _as_dict(c.arguments)}}
+        for c in calls
+    ]
+
+
+def _as_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}

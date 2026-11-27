@@ -1,0 +1,172 @@
+# DIABLO default configuration.
+# Values here can be overridden through environment variables / .env.
+
+[ai]
+provider = "ollama"
+
+[ollama]
+host = "http://localhost:11434"
+allow_remote = false
+preferred_models = ["qwen3:8b", "qwen3:14b", "qwen3:latest"]
+
+[project]
+workspace_root = "C:/PROJECTS"
+
+[paths]
+sessions_dir = "data/sessions"
+
+[agent]
+max_turns = 4
+max_tool_calls = 32
+max_recovery_attempts = 3
+# M2.16.UI.1: how many times one request may be asked again when the model picks
+# a tool that cannot serve the classified desktop intent. 0 = telemetry only.
+desktop_mismatch_corrections = 1
+# Narrow the presented tool set to the desktop family only at or above this
+# classifier confidence. Below it the normal widened set is used.
+desktop_focus_min_confidence = 0.6
+
+[memory]
+max_conversation_turns = 20
+write_policy = "explicit"
+
+[rules]
+max_active_in_prompt = 8
+
+[tools]
+max_result_chars = 8000
+# Present every tool every turn. Off by default: the bounded tool-context selector
+# is what keeps a turn readable for a small model.
+full_context = false
+# Per-tool execution timeout in seconds. 0 or negative disables the timeout.
+# These bounds protect against runaway tools and are enforced by the executor.
+# Individual tools (terminal, python) may have their own internal timeouts.
+terminal_timeout = 120
+python_timeout = 300
+blender_timeout = 600
+generic_tool_timeout = 60
+
+[context]
+max_tokens = 8000
+relevant_files = 8
+excerpt_lines = 200
+
+[debug]
+max_attempts = 3
+max_steps = 12
+
+[models]
+default_mode = "auto"              # auto | force8b | force14b | project
+fast_model = "qwen3:8b"
+strong_model = "qwen3:14b"
+complexity_threshold = 0.6
+max_attempts_before_escalate = 1
+max_escalations = 1
+
+[resources]
+check_enabled = false              # placeholder until a reliable local check exists
+
+[git]
+push = "blocked"
+restore = "blocked"
+branch = "blocked"
+
+[filesystem]
+allowed_roots = ["C:/PROJECTS"]
+
+[terminal]
+auto_allow_patterns = [
+  "git status",
+  "git diff",
+  "git log",
+  "git branch",
+  "git help",
+  "python --version",
+  "python3 --version",
+  "node --version",
+  "npm --version",
+  "pip --version",
+  "pip list",
+  "pytest",
+  "dir",
+  "ls",
+  "where",
+  "Get-ChildItem",
+  "Get-Process",
+  "Get-StartApps",
+]
+blocklist = [
+  "format",
+  "diskpart",
+  "bcdedit",
+  "shutdown",
+  "reboot",
+  "restart",
+  "deltree",
+  "rd /s",
+  "rmdir /s",
+  "remove-item -recurse",
+  "remove-item -r",
+  "del /s",
+  "del /f /s",
+  "clear-content",
+  "erase",
+  "rm -rf",
+  "rm -fr",
+  "mkfs",
+  "reg delete",
+  "cipher /w",
+  "wmic volume",
+]
+
+[apps.whitelist]
+calculator = "calc"
+notepad = "notepad"
+"file explorer" = "explorer"
+chrome = "chrome"
+edge = "msedge"
+"vs code" = "code"
+blender = "blender"
+
+[apps.known_paths]
+# Absolute paths for applications that are installed machine-wide. Keep this list
+# machine-independent: an absolute path here embeds one Windows user's profile and
+# stops working for everyone else.
+#
+# There is deliberately no "vs code" entry. VS Code is normally installed per-user,
+# where the executable is neither on PATH nor in a machine-wide directory, so its
+# real location depends on the profile of whoever is logged in. It is discovered
+# instead - see DISCOVERY_CANDIDATES in tools/applications.py, which probes
+# %LOCALAPPDATA%, %PROGRAMFILES% and %PROGRAMFILES(X86)% and takes the first hit,
+# in the same way blender/controller.py detects Blender. To pin a path yourself,
+# add the key here; a configured path still takes precedence over discovery.
+blender = "C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"
+
+[voice]
+enabled = false
+stt_model = "base"
+stt_device = "auto"
+stt_compute_type = "int8"
+stt_model_path = ""
+microphone_device = 0
+wake_word_enabled = false
+wake_word_type = "mock"
+wake_word_phrase = "diablo"
+vad_enabled = true
+vad_method = "energy"
+vad_threshold = 0.01
+vad_silence_timeout = 2.0
+max_recording_duration = 30.0
+sample_rate = 16000
+output_dir = "voice_recordings"
+tts_interruptible = true
+
+[logging]
+level = "INFO"
+[autonomy]
+# Ceilings on persistent autonomous work. These bound how much may happen; they
+# grant nothing. Permission, cancellation and verification are unchanged.
+max_active_goals = 3
+max_tasks = 32
+max_concurrent = 1
+min_interval_seconds = 60
